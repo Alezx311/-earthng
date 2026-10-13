@@ -16,9 +16,10 @@ import zipfile
 
 from PIL import Image, ImageDraw
 
+import fast_photo as photo
 import fast_style as style
 
-VERSION = 'v5'
+VERSION = 'v7'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 
@@ -74,13 +75,16 @@ FLAT = {   # kind: (toon colour, model colour)
     'ground': ((126, 196, 112), (226, 228, 222)), 'forest': ((84, 150, 90), (200, 204, 198)),
     'paved': ((190, 184, 176), (220, 220, 220)), 'water': ((96, 176, 220), (180, 200, 214)),
     'roof': ((120, 96, 92), (210, 210, 210)), 'curb': ((240, 240, 240), (250, 250, 250)),
+    'park': ((126, 196, 112), (226, 228, 222)), 'roof_tile': ((176, 84, 62), (200, 200, 200)),
+    'roof_metal': ((96, 120, 116), (205, 205, 205)), 'parapet': ((200, 196, 190), (236, 236, 236)),
 }
 PACKS = ('real', 'toon', 'model', 'synth')
-MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap')
+MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap', 'opacityMap')
 # synthwave: dark violet surfaces, neon lines glowing (emissive), a striped sun at the horizon
 SYNTH = {
     'road': (22, 16, 44), 'road_major': (26, 18, 52), 'sidewalk': (44, 30, 78), 'paved': (30, 20, 60),
     'water': (14, 10, 46), 'roof': (34, 22, 62), 'ground': (20, 8, 40), 'forest': (16, 6, 34),
+    'roof_tile': (40, 20, 60), 'roof_metal': (30, 22, 60), 'parapet': (36, 22, 64),
 }
 SYNTH_GLOW = {'mark': (0.0, 1.0, 1.0), 'curb': (1.0, 0.1, 0.8)}   # emissive lines on the roads
 NEON = (255, 40, 200)       # grid magenta
@@ -150,6 +154,50 @@ def facade(name, pack):
     return im.transpose(Image.FLIP_TOP_BOTTOM)
 
 
+def stylised(name, pack, glow=False):
+    """A photo wall's stand-in in a flat pack: its window cell tiled over the wall's repeat
+    (2 x 2 cells for 6 m, 11 x 11 for the 33 m loggia sheet), upside down like facade()."""
+    family, colour, metres = photo.PHOTO_WALLS[name]
+    kind = None if family.startswith('end_') else ('panel' if family in ('panel', 'loggia') else 'window')
+    if glow:
+        cell = Image.new('RGB', (PX, PX), (0, 0, 0))
+    elif pack == 'toon':
+        cell = Image.new('RGB', (PX, PX), tuple(round(c * 255) for c in colour))
+    elif pack == 'synth':
+        cell = Image.new('RGB', (PX, PX), (24, 14, 46))
+    else:
+        cell = Image.new('RGB', (PX, PX), (238, 238, 236))
+    if kind:
+        draw_windows(cell, kind, 'synth' if glow else pack)
+    if glow:
+        mask = cell.point(lambda v: 255 if v > 200 else 0).convert('L')
+        cell = Image.new('RGB', (PX, PX), (0, 0, 0))
+        cell.paste(Image.new('RGB', (PX, PX), CYAN), mask=mask)
+    n = max(1, round(metres / CELL))
+    size = 2048 if n > 4 else PX
+    step = size // n
+    small = cell.resize((step, step), Image.LANCZOS)
+    out = Image.new('RGB', (size, size))
+    for i in range(n):
+        for j in range(n):
+            out.paste(small, (i * step, j * step))
+    return out.resize((size, size)).transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def photo_real(name):
+    """(colour, normal or None) of a photo wall for the 'real' pack, upside down like facade():
+    texture v grows with height. A flipped normal map's green (tangent y) is inverted too."""
+    im, nm = photo.wall_image(name, LAYERS[0] if LAYERS else None)
+    im = im.transpose(Image.FLIP_TOP_BOTTOM)
+    if nm is not None:
+        r, g, b = nm.transpose(Image.FLIP_TOP_BOTTOM).split()
+        nm = Image.merge('RGB', (r, g.point(lambda v: 255 - v), b))
+    return im, nm
+
+
+LAYERS = []
+
+
 def synth_glow(name):
     """Emissive map for a synthwave facade: only the neon window frames light up."""
     im = Image.new('RGB', (PX, PX), (0, 0, 0))
@@ -197,19 +245,22 @@ def pack_fields(pack, base):
             w = kind[5:]
             f['baseColorMap'] = f'{base}/{pack}/{w}.color.png'
             if pack == 'real':
-                f['normalMap'] = style.TEXTURES[w].get('normalMap', '')
+                f.update(style.real_stage(kind))
             if pack == 'synth':
                 f['emissiveMap'] = f'{base}/synth/{w}.glow.png'; f['emissiveFactor'] = '1 1 1'
             f['baseColorFactor'] = '1 1 1 1'
         elif pack == 'real':
-            if tex:
+            if kind in style.PHOTO_GROUND:
+                f.update(style.real_stage(kind))
+                f['baseColorFactor'] = '1 1 1 1'
+            elif tex:
                 f.update(style.TEXTURES[tex])
                 f['baseColorFactor'] = colour([c * 255 for c in style.TINT.get(kind, [1, 1, 1])[:3]])
             else:
                 f['baseColorFactor'] = colour([c * 255 for c in fallback[:3]])
         elif pack == 'synth':
-            if kind in ('ground', 'forest', 'paved'):
-                f['baseColorMap'] = f'{base}/synth/grid_{kind}.color.png'
+            if kind in ('ground', 'forest', 'paved', 'park'):
+                f['baseColorMap'] = f'{base}/synth/grid_{"ground" if kind == "park" else kind}.color.png'
                 f['emissiveMap'] = f'{base}/synth/grid.glow.png'; f['emissiveFactor'] = '1 1 1'
                 f['baseColorFactor'] = '1 1 1 1'
             elif kind in SYNTH_GLOW:
@@ -260,12 +311,41 @@ def warm_defs(pack, fields):
 
 
 def ensure(user):
-    """Write the facade textures and packs.json once (~1 s); returns the art root path."""
+    """The art in the user folder (the game reads it from there): copied from the shared
+    build in data/art/<VERSION>, which is written once (~20 s: photo facades and ground
+    sheets). Returns the art root path in the user folder."""
+    import shutil
+    import paths
     r = root(user)
-    done = r / 'packs.json'
-    if done.exists():
+    if (r / 'packs.json').exists():
         return r
+    shared = prebuild()
+    # file by file, packs.json last (the marker): renaming a whole folder inside the profile is
+    # refused while the game watches it (WinError 5, vis-02-akadem)
+    for src in sorted(shared.rglob('*')):
+        if src.is_file() and src.name != 'packs.json':
+            dst = r / src.relative_to(shared)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+    tmp = r / 'packs.json.tmp'
+    shutil.copyfile(shared / 'packs.json', tmp)
+    os.replace(tmp, r / 'packs.json')
+    return r
+
+
+def prebuild():
+    """The shared art build (data/art/<VERSION>), written when missing; returns its path."""
+    import paths
+    shared = paths.PROJECT / 'data' / 'art' / VERSION
+    if not (shared / 'packs.json').exists():
+        build(shared)
+    return shared
+
+
+def build(r):
+    """Write the facade textures, ground sheets and packs.json into r."""
     base = '/e2r_stream/fast-art/' + VERSION
+    done = r / 'packs.json'
     for pack in PACKS:
         (r / pack).mkdir(parents=True, exist_ok=True)
         for name in FACADES:
@@ -273,10 +353,53 @@ def ensure(user):
             facade(name, pack).save(path)
             if pack == 'synth':
                 synth_glow(name).save(r / pack / f'{name}.glow.png')
+        for name in photo.PHOTO_WALLS:
+            if pack == 'real':
+                if not LAYERS:
+                    LAYERS.append(photo.panel_atlas())
+                im, nm = photo_real(name)
+                im.save(r / pack / f'{name}.color.png')
+                if nm is not None:
+                    nm.save(r / pack / f'{name}.normal.png')
+            else:
+                stylised(name, pack).save(r / pack / f'{name}.color.png')
+                if pack == 'synth':
+                    stylised(name, pack, glow=True).save(r / pack / f'{name}.glow.png')
+    for kind in style.PHOTO_GROUND:
+        im, nm = photo.ground_sheet(kind)
+        im.save(r / 'real' / f'ground_{kind}.color.png'); nm.save(r / 'real' / f'ground_{kind}.normal.png')
+    # footpaths: ambientCG photos as they are (normal green flipped for BeamNG)
+    for name, src in (('paving', 'paving'), ('trodden', 'photo_trodden')):
+        Image.open(photo.TEXTURES / src / 'albedo.jpg').convert('RGB').resize((1024, 1024), Image.LANCZOS).save(r / 'real' / f'{name}.color.png')
+        rr, g, b = Image.open(photo.TEXTURES / src / 'normal.jpg').convert('RGB').resize((1024, 1024), Image.LANCZOS).split()
+        Image.merge('RGB', (rr, g.point(lambda v: 255 - v), b)).save(r / 'real' / f'{name}.normal.png')
+    # parked cars: one cell per paint colour, then glass and tyre (fast.CAR_COLOURS)
+    import fast
+    cars = Image.new('RGB', (32 * fast.CAR_ATLAS, 32))
+    d = ImageDraw.Draw(cars)
+    for k, rgb in enumerate(fast.CAR_COLOURS + [(36, 44, 52), (22, 22, 22)]):
+        d.rectangle([32 * k, 0, 32 * k + 31, 31], fill=rgb)
+    cars.save(r / 'real' / 'cars.color.png')
+    # the PO-2 concrete fence: one 2.5 m x 2 m slab... laid over a 2.5 m repeat, the slab in the
+    # lower 0.8 of it (fences are 2 m tall), upside down like the facades
+    slab = Image.open(photo.TEXTURES / 'panelka_fence/albedo.jpg').convert('RGB')
+    fence = Image.new('RGB', (1024, 1024), (150, 150, 146))
+    fence.paste(slab.resize((1024, 820), Image.LANCZOS), (0, 1024 - 820))
+    fence.transpose(Image.FLIP_TOP_BOTTOM).save(r / 'real' / 'fence_po2.color.png')
     for kind in ('ground', 'forest', 'paved'):
         synth_grid(SYNTH[kind]).save(r / 'synth' / f'grid_{kind}.color.png')
     synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')
     synth_sun().save(r / 'synth' / 'sun.color.png')
+    # every map as a BC1 DDS with its mips, the PNG removed: the game reads '<name>.png' from
+    # '<name>.dds' as it does its own assets, and does not cook (vis-08-centre showed checker
+    # placeholders for ~30 s while ~70 PNGs cooked one by one)
+    import fast_dds
+    from concurrent.futures import ThreadPoolExecutor
+    def to_dds(png):
+        fast_dds.save(Image.open(png), png.with_suffix('.dds'))
+        png.unlink()
+    with ThreadPoolExecutor(6) as pool:
+        list(pool.map(to_dds, sorted(r.rglob('*.png'))))
     fields = {p: pack_fields(p, base) for p in PACKS}
     tmp = r / 'packs.json.tmp'
     sun = {'e2rf_synth_sun': {'name': 'e2rf_synth_sun', 'mapTo': 'e2rf_synth_sun', 'class': 'Material', 'version': 1.5,
@@ -285,7 +408,7 @@ def ensure(user):
                               'doubleSided': True,
                               'Stages': [{'baseColorMap': f'{base}/synth/sun.color.png', 'emissiveMap': f'{base}/synth/sun.color.png',
                                           'emissiveFactor': [1, 1, 1]}, {}, {}, {}]}}
-    tmp.write_text(json.dumps({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
-                               'environment': {p: environment(p) for p in PACKS}, 'extra': sun}), encoding='utf8')
+    tmp.write_text(json.dumps(style.dds({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
+                               'environment': {p: environment(p) for p in PACKS}, 'extra': sun})), encoding='utf8')
     os.replace(tmp, done)
     return r

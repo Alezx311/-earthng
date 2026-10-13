@@ -3,7 +3,10 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import heapq
 import json
+import os
 import math
+
+import numpy as np
 from pathlib import Path
 import threading
 import time
@@ -11,6 +14,18 @@ import traceback
 
 import fast
 import fast_sources as sources
+
+
+FAR_R = float(os.environ.get('EARTHNG_FAR_R', 3000))   # m round the car: the far city (fast_far)
+
+
+FAR_FAST = 25.0    # m/s: above it the far city shrinks to FAR_R_FAST (the churn of far tiles at
+FAR_R_FAST = 1800. # 300 km/h doubled be:reloadCollision, vis-replay-01)
+
+
+def far_radius(pose):
+    """Far tiles to build round the pose: none at speed (the game loads none then either)."""
+    return 0. if math.hypot(pose.get('vx',0),pose.get('vy',0))>FAR_FAST else FAR_R
 
 
 def percentile(values, fraction=.99, default=4.):
@@ -76,8 +91,15 @@ def server_class(base):
             self.desired={}
             self.next_schedule=0
             self.generation=0
+            self.far_covered={}
             self.preparer=ThreadPoolExecutor(1)
             super().__init__(args)
+            # the art (photo facades, ground sheets) is built once in data/art: ~20 s the first
+            # time, alongside the index of the first landing instead of before it. It is copied
+            # into the user folder only at the landing: the game's first start in a new profile
+            # moves unknown files out of it (vis-01-akadem lost the whole art folder)
+            import fast_art
+            self.art=ThreadPoolExecutor(1).submit(fast_art.prebuild)
 
         def region_boxes(self):
             """Tile cells merged into rectangles (runs per row, then equal runs of adjacent
@@ -108,7 +130,7 @@ def server_class(base):
             with self.lock:
                 self.generation+=1
                 generation=self.generation
-                self.stream=None; self.pose=None; self.desired={}
+                self.stream=None; self.pose=None; self.desired={}; self.far_covered={}
                 self.landing={'seq':req['seq'],'lat':req['lat'],'lon':req['lon'],'at':time.monotonic()}
             self.set_job(id=f'fast-{generation}',seq=req['seq'],lat=req['lat'],lon=req['lon'],
                          state='working',stage='Індекс джерел',progress=.02,message=None)
@@ -116,10 +138,11 @@ def server_class(base):
 
         def prepare_landing(self,req,generation):
             try:
-                import fast_art
-                fast_art.ensure(self.user)          # facades and texture packs, ~0.3 s once
                 directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,
                                               emit=lambda msg: print(msg,flush=True),point=(req['lon'],req['lat']))
+                self.art.result()                   # facades and texture packs (started with the server)
+                import fast_art
+                fast_art.ensure(self.user)
                 frame=sources.Frame(); i,j=frame.tile_of(req['lon'],req['lat'])
                 # Connections stay on scheduler thread; preparation owns no persistent SQLite reader.
                 with self.lock:
@@ -128,7 +151,7 @@ def server_class(base):
                     self.frame=frame
                     self.landing['tile']=[i,j]
                     dest=self.user/'e2r_stream'/meta['id']/'tiles'
-                    ready={}; scenes={}
+                    ready={}; scenes={}; far={}
                     for p in dest.glob('*.json'):
                         if p.name.endswith('.mats.json'):
                             continue
@@ -139,11 +162,11 @@ def server_class(base):
                             if not all((self.user/it['shape'].lstrip('/')).exists() for it in m['items']):
                                 continue
                             key='_'.join(map(str,m['tile']))
-                            (scenes if m['layer']=='scene' else ready)[key]=1
+                            {'scene':scenes,'far':far}.get(m['layer'],ready)[key]=1
                         except (OSError,ValueError,KeyError):
                             continue
                     self.stream={'region':meta['id'],'dir':str(directory),'tile':sources.TILE,
-                                 'ready':ready,'scenes':scenes,'inflight':{},'failed':{},'queued':0,
+                                 'ready':ready,'scenes':scenes,'far':far,'inflight':{},'failed':{},'queued':0,
                                  'built':0,'buildSeconds':0.,'bounds':meta['bbox'],'generator':sources.GEOMETRY}
                     self.out_of_region=set(); self.next_schedule=0
                 self.set_job(region=meta['id'],tileSize=sources.TILE,tile=[i,j],
@@ -168,7 +191,7 @@ def server_class(base):
                     st['inflight'].pop(job,None)
                     try:
                         result=future.result()
-                        (st['ready'] if layer=='road' else st['scenes'])[key]=1
+                        st[{'road':'ready','scene':'scenes','far':'far'}[layer]][key]=1
                         st['built']+=1; st['buildSeconds']+=result['timings']['total']
                         if layer=='road':
                             self.history.append(result['timings']['total'])
@@ -211,7 +234,7 @@ def server_class(base):
                         else:
                             self.set_job(state='ready',progress=1,stage='Завантаження доріг',
                                 manifest=f'/e2r_stream/{st["region"]}/tiles/{landing_key}.json',
-                                timings={'first_tile':elapsed})
+                                timings={'first_tile':elapsed},horizonZ=self.horizon_z(m['spawn']['pos']))
                 # No unbounded executor backlog. Scene work can consume at most one worker.
                 pending=[]
                 for key,(deadline,i,j) in self.desired.items():
@@ -226,10 +249,37 @@ def server_class(base):
                             px,py=st['pose']['x'],st['pose']['y']
                             distance=math.hypot((i+.5)*sources.TILE-px,(j+.5)*sources.TILE-py)
                             pending.append((999 if key==landing_key and not self.pose else 1000+distance,i,j,key,'scene'))
+                # the far city: one job at a time while no road is waiting, nearest first,
+                # for tiles within FAR_R that have no scene yet
+                far_running=sum(v[3]=='far' for v in self.future_jobs.values())
+                # one worker always stays free for a road (a far job at the start of a 300 km/h
+                # replay delayed one past its deadline, vis-replay-05)
+                if not any(x[4]=='road' for x in pending) and far_running==0 and len(self.future_jobs)<self.workers-1:
+                    px,py=st['pose']['x'],st['pose']['y']
+                    far_r=far_radius(st['pose'])
+                    n=int(far_r//sources.TILE)+1; ci,cj=int(px//sources.TILE),int(py//sources.TILE)
+                    best=None
+                    for i in range(ci-n,ci+n+1):
+                        for j in range(cj-n,cj+n+1):
+                            key=f'{i}_{j}'
+                            if key in st['far'] or key in st['scenes'] or st['failed'].get(key+':far',0)>=2 or key+':far' in self.future_jobs:
+                                continue
+                            d=math.hypot((i+.5)*sources.TILE-px,(j+.5)*sources.TILE-py)
+                            if d>far_r or (best and d>=best[0]):
+                                continue
+                            if key not in self.far_covered:
+                                self.far_covered[key]=self.fast_store.covered(self.frame.rect(i,j))
+                            if self.far_covered[key]:
+                                best=(d,i,j,key)
+                    if best:
+                        pending.append((5000+best[0],best[1],best[2],best[3],'far'))
                 st['queued']=len(pending)
                 for _,i,j,key,layer in sorted(pending):
                     if len(self.future_jobs)>=self.workers or (layer=='scene' and scene_running):
-                        break
+                        if layer=='far' and len(self.future_jobs)<self.workers:
+                            pass
+                        else:
+                            break
                     task=key+':'+layer
                     center=(self.landing['lon'],self.landing['lat']) if key==landing_key else None
                     future=self.builders.submit(fast.run,st['dir'],i,j,str(self.work),
@@ -239,11 +289,23 @@ def server_class(base):
                     if layer=='scene':
                         scene_running+=1
 
+        def horizon_z(self,pos):
+            """Height of the plane under the whole world (the land beyond the far city): the
+            lowest ground within 9 km, so it never covers a valley nearer than the horizon."""
+            try:
+                g=np.linspace(-9000,9000,13)
+                pts=np.array([(pos[0]+a,pos[1]+b) for a in g for b in g if math.hypot(a,b)<=9000])
+                h=self.fast_store.terrain.sample(pts)
+                h=h[np.isfinite(h)]
+                return float(h.min())-5 if len(h) else float(pos[2])-40
+            except Exception:
+                return float(pos[2])-40
+
         def stream_status(self):
             status=super().stream_status()
             if status:
                 st=self.stream
-                status.update(generator=sources.GEOMETRY,scenes=dict(st['scenes']),
+                status.update(generator=sources.GEOMETRY,scenes=dict(st['scenes']),far=dict(st['far']),farRadius=FAR_R,farRadiusFast=min(FAR_R,FAR_R_FAST),farFast=FAR_FAST,
                     wanted={k:v[0] for k,v in self.desired.items()},
                     buildP99=percentile(self.history),horizonSeconds=st.get('horizonSeconds',12),
                     loadRadius=st.get('loadRadius',1000),startupSeconds=time.monotonic()-self.landing['at'])

@@ -56,6 +56,10 @@ C:/js/Earth2Road/.venv/Scripts/python.exe earthng/region.py --pbf <ukraine-26091
 | `earthng/seams.py`, `earthng/route.py` | перевірка швів між сусідніми тайлами; маршрут для автопілота тесту |
 | `earthng/direct.py` | прямий шлях збірки в шматки без DAE/ZIP (`StreamSink`) |
 | `earthng/osm_tiles.py` | нарізка OSM-пакета на статичні тайли (сітка 0,05°, буфер 0,01°) |
+| `earthng/fast.py`, `earthng/fast_far.py` | генератор `fast`: дороги, сцена (будівлі, ґрунт, доріжки, паркани, дерева, авто), далекий план |
+| `earthng/fast_style.py`, `earthng/fast_photo.py`, `earthng/fast_art.py` | вигляд: матеріали, вибір фасаду за тегами OSM, фото-фасади й ґрунт, текстур-паки |
+| `earthng/fast_dds.py` | кодер BC1 DDS з mip-ланцюгом і sRGB-заголовком (гра не «готує» PNG) |
+| `data/textures`, `data/art/<версія>` | CC0-фото (Panelka pack, ambientCG) і зібраний з них арт, не в git |
 | `earthng/s1.py`, `earthng/e2rstream.lua` | спайки S1–S3 (рантайм-тайли, ProceduralMesh, колізія) |
 | `earthng/build_mod.py`, `earthng/test_world.py` | збирання мода; наскрізний тест в ізольованому профілі |
 | `earthng/profile_land.py`, `earthng/compare_worlds.py` | заміри висадки; побайтовий оракул для прискорень |

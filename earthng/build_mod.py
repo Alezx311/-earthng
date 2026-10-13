@@ -37,8 +37,8 @@ SKY = [
                   {'texDirection': [0.2, 0.9], 'texScale': 0.75, 'texSpeed': 0.005},
                   {'texDirection': [0.1, 0.4], 'texScale': 0.95, 'texSpeed': 0.0065}]},
     {'class': 'LevelInfo', 'name': 'theLevelInfo', 'canvasClearColor': [0.58, 0.66, 0.76, 255], 'fogAtmosphereHeight': 700,
-     'fogColor': [0.62, 0.68, 0.76, 1], 'fogDensity': 9e-05, 'globalEnviromentMap': 'BNG_Sky_02_cubemap', 'gravity': -9.81,
-     'visibleDistance': 4000},
+     'fogColor': [0.66, 0.71, 0.77, 1], 'fogDensity': 0.00019, 'globalEnviromentMap': 'BNG_Sky_02_cubemap', 'gravity': -9.81,
+     'visibleDistance': 7000},
 ]
 
 

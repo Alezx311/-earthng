@@ -28,10 +28,11 @@ local PRESETS = {
 }
 
 local S = {
+  widgetHidden = false, pickerOpen = false,
   state = 'off', center = {lat = 50.4501, lon = 30.5234}, zoom = 11, marker = nil,
   seq = 0, viewDirty = true, lastViewAt = -1, tex = nil, texView = nil, status = nil,
   statusReadAt = -1, landSeq = nil, landAt = nil, now = 0, frames = {},
-  tiles = {}, queue = {}, poseAt = -1, collisionDirty = false, collisionAt = -1, knownMats = {},
+  tiles = {}, far = {}, queue = {}, poseAt = -1, collisionDirty = false, collisionAt = -1, knownMats = {},
 }
 local coordBuf = im.ArrayChar(64)
 local test, result = nil, {status = 'waiting', shots = {}}
@@ -106,6 +107,7 @@ local function land()
   S.landSeq = request({type = 'land', lat = S.marker.lat, lon = S.marker.lon})
   S.landAt = S.now
   S.landTimer = hptimer()
+  S.pickerOpen = false
   S.state = 'generating'
   result.landRequestedAt = S.now
   saveResult()
@@ -177,6 +179,7 @@ local function spawnItem(it, group, pause)
     obj:setField('decalType', 0, it.decal or 'None')
     obj.useInstanceRenderData = true
     obj:setPosRot(it.pos[1], it.pos[2], it.pos[3], it.rot[1], it.rot[2], it.rot[3], it.rot[4])
+    if it.scale then obj:setScale(vec3(it.scale, it.scale, it.scale)) end
     obj:registerObject(it.name)
     group:addObject(obj)
   end
@@ -200,6 +203,38 @@ local function dropGroup(name)
   if g then
     g:deleteAllObjects()
     g:delete()
+  end
+end
+
+-- A decoration group (trees, lamps, lines, the far city) goes a few dozen objects a frame: a
+-- scene tile holds up to ~900 trees, and deleting them in one frame stalled it.
+local GRAVE_PER_FRAME = 60
+local function buryGroup(name)
+  local g = scenetree.findObject(name)
+  if not g then return end
+  -- out of the way at once (a renamed group cannot be found again by a new tile of that key)
+  g:setName('')
+  S.graves = S.graves or {}
+  table.insert(S.graves, g)
+end
+
+local function digGraves()
+  local graves = S.graves
+  if not graves or #graves == 0 then return end
+  local left = GRAVE_PER_FRAME
+  while left > 0 and #graves > 0 do
+    local g = graves[1]
+    local n = g:getCount()
+    if n == 0 then
+      g:delete()
+      table.remove(graves, 1)
+    else
+      for _ = 1, math.min(left, n) do
+        local o = g:getObject(g:getCount() - 1)
+        if o then o:delete() end
+        left = left - 1
+      end
+    end
   end
 end
 
@@ -372,7 +407,7 @@ local function updateTiles()
     local cx, cy = tileCentre(tile.i, tile.j)
     local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
     if d > unloadR or behind(cx, cy, d) then
-      dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key)
+      dropGroup('E2RT_' .. key); buryGroup('E2RD_' .. key)
       S.tiles[key] = nil
       tile.dropped = true
       S.collisionDirty = true
@@ -406,9 +441,51 @@ local function updateTiles()
     end
   end
   if fast then
-    -- Reprioritize pending work when direction changes; no scene object can block roads.
+    -- the far city (earthng/fast_far.py): a tile without its own scene, within farRadius, gets
+    -- its far layer; the far layer goes when the scene is in or the car is far away
+    local farR = st.farRadius or 3000
+    -- at speed no new far tile starts (their churn at 300 km/h doubled be:reloadCollision,
+    -- vis-replay-01); the ones there stay until they are far behind
+    local farLoadR = speed > (st.farFast or 25) and 0 or farR
+    for key, far in pairs(S.far) do
+      local cx, cy = tileCentre(far.i, far.j)
+      local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
+      local near = S.tiles[key]
+      if d > farR + 500 or (near and near.sceneComplete) then
+        buryGroup('E2RF_' .. key)
+        far.dropped = true
+        S.far[key] = nil
+      end
+    end
+    if #S.queue < 60 then
+      local bestF, bestFD
+      for key in pairs(st.far or {}) do
+        local near = S.tiles[key]
+        if not S.far[key] and not (near and near.sceneComplete) then
+          local i, j = key:match('^(-?%d+)_(-?%d+)$')
+          i, j = tonumber(i), tonumber(j)
+          local cx, cy = tileCentre(i, j)
+          local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
+          if d <= farLoadR and (not bestFD or d < bestFD) then bestF, bestFD = {key, i, j}, d end
+        end
+      end
+      if bestF then
+        local key, i, j = bestF[1], bestF[2], bestF[3]
+        local ok, manifest = pcall(jsonReadFile, string.format('/e2r_stream/%s/tiles/%s.far.json', S.stream.region, key))
+        if ok and type(manifest) == 'table' and manifest.source == S.stream.region then
+          loadNewMaterials(manifest.materials)
+          local far = {i = i, j = j, left = #manifest.items, group = tileGroup('E2RF_' .. key, true), far = true}
+          S.far[key] = far
+          for _, it in ipairs(manifest.items) do table.insert(S.queue, {tile = far, key = key, item = it, far = true}) end
+        end
+      end
+    end
+    -- Reprioritize pending work when direction changes; no scene object can block roads, no far
+    -- object a scene.
+    local function rank(job) return job.far and 2 or (job.scene and 1 or 0) end
     table.sort(S.queue, function(a, b)
-      if (not not a.scene) ~= (not not b.scene) then return not a.scene end
+      local ra, rb = rank(a), rank(b)
+      if ra ~= rb then return ra < rb end
       return ((st.wanted or {})[a.key] or math.huge) < ((st.wanted or {})[b.key] or math.huge)
     end)
   end
@@ -425,7 +502,7 @@ local function stepQueue()
       while job and job.tile.dropped do job = table.remove(S.queue, 1) end
       if not job then break end
       S.job = job
-      local group = job.item.decor and job.tile.decor or job.tile.group
+      local group = (job.far and job.tile.group) or (job.item.decor and job.tile.decor) or job.tile.group
       S.co = coroutine.create(function(p) spawnItem(job.item, group, p) end)
     end
     -- a resume far over the budget: is it the collector (Lua heap shrinks inside it)?
@@ -442,9 +519,12 @@ local function stepQueue()
     if not ok then
       log('E', logTag, tostring(err))
       result.errors = (result.errors or 0) + 1
-      S.job.tile.failed = true
+      if not S.job.far then S.job.tile.failed = true end
     end
-    if coroutine.status(S.co) == 'dead' then
+    if coroutine.status(S.co) == 'dead' and S.job.far then
+      S.co = nil
+      S.job.tile.left = S.job.tile.left - 1
+    elseif coroutine.status(S.co) == 'dead' then
       S.co = nil
       local tile = S.job.tile
       tile.left = tile.left - 1
@@ -591,16 +671,38 @@ local function cameraOver(height)
   core_camera.setPosRot(0, p.x, p.y, p.z, q.x, q.y, q.z, q.w)
 end
 
+-- The land beyond the far city: one plane 40 km wide under the whole world at the lowest ground
+-- round the landing (horizonZ from the companion), in the ground material, without collision.
+local function makeHorizon(z, cx, cy)
+  local old = scenetree.findObject('e2r_horizon')
+  if old then old:delete() end
+  if not z then return end
+  local R, k = 20000, 1 / 24
+  local verts = {{x = -R, y = -R, z = 0}, {x = R, y = -R, z = 0}, {x = R, y = R, z = 0}, {x = -R, y = R, z = 0}}
+  local up = {x = 0, y = 0, z = 1}
+  local uvs = {}
+  for n, v in ipairs(verts) do uvs[n] = {u = v.x * k, v = v.y * k} end
+  local faces = {}
+  for _, v in ipairs({0, 2, 1, 0, 3, 2}) do table.insert(faces, {v = v, n = v, u = v}) end
+  local obj = createObject('ProceduralMesh')
+  obj:registerObject('e2r_horizon')
+  obj.canSave = false
+  obj:createMesh({{{verts = verts, normals = {up, up, up, up}, uvs = uvs, faces = faces, material = 'e2rf_ground'}}})
+  obj:setPosition(vec3(cx, cy, z))
+end
+
 local function beginArrival(job)
   local manifest = jsonReadFile(job.manifest)
   if not manifest then return end
   -- leave the previous region
   for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true end
-  S.tiles, S.queue, S.co = {}, {}, nil
+  for key, far in pairs(S.far) do dropGroup('E2RF_' .. key); far.dropped = true end
+  S.tiles, S.far, S.queue, S.co = {}, {}, {}, nil
   S.stream = {region = job.region, tile = job.tileSize, generator = job.generator}
   S.landing = manifest
   S.knownMats = {}
   loadNewMaterials(manifest.materials)
+  if manifest.spawn then pcall(makeHorizon, job.horizonZ, manifest.spawn.pos[1], manifest.spawn.pos[2]) end
   if manifest.packs and FS:fileExists(manifest.packs) then
     local okP, packs = pcall(jsonReadFile, manifest.packs)
     S.packs = okP and packs and packs.fields or nil
@@ -799,21 +901,27 @@ local function autopilotStep(dt)
 end
 
 -- --- UI ------------------------------------------------------------------------------------------
-local function drawMap()
+local function drawMap(width, height)
+  width, height = width or W, height or H
+  if not S.tex then im.Text('Завантаження мапи...') end
+  if S.texView and (S.texView.missingTiles or 0) > 0 then
+    im.TextWrapped('Не вдалося завантажити частину мапи. Перевірте інтернет.')
+    if im.Button('Повторити завантаження') then S.viewDirty = true end
+  end
   local cx, cy = merc(S.center.lat, S.center.lon, S.zoom)
   if S.tex and S.texView.zoom == S.zoom then
     local ix, iy = merc(S.texView.lat, S.texView.lon, S.zoom)
     local dx, dy = (cx - ix) / W, (cy - iy) / H
-    im.Image(S.tex.texId, im.ImVec2(W, H), im.ImVec2(dx, dy), im.ImVec2(1 + dx, 1 + dy))
+    im.Image(S.tex.texId, im.ImVec2(width, height), im.ImVec2(dx, dy), im.ImVec2(1 + dx, 1 + dy))
   elseif S.tex then
-    im.Image(S.tex.texId, im.ImVec2(W, H), im.ImVec2(0, 0), im.ImVec2(1, 1))
+    im.Image(S.tex.texId, im.ImVec2(width, height), im.ImVec2(0, 0), im.ImVec2(1, 1))
   else
-    im.Dummy(im.ImVec2(W, H))
+    im.Dummy(im.ImVec2(width, height))
   end
   local rmin, hovered = im.GetItemRectMin(), im.IsItemHovered()
   local io = im.GetIO()
   local mp = im.GetMousePos()
-  local px, py = mp.x - rmin.x, mp.y - rmin.y
+  local px, py = (mp.x - rmin.x) * W / width, (mp.y - rmin.y) * H / height
   if hovered and io.MouseWheel ~= 0 then
     local lat, lon = unmerc(cx + px - W / 2, cy + py - H / 2, S.zoom)
     local nz = math.max(3, math.min(17, S.zoom + (io.MouseWheel > 0 and 1 or -1)))
@@ -826,7 +934,7 @@ local function drawMap()
     if im.IsMouseDown(0) then
       local d = im.GetMouseDragDelta(0, 0)
       if d.x ~= 0 or d.y ~= 0 then
-        S.center.lat, S.center.lon = unmerc(cx - d.x, cy - d.y, S.zoom)
+        S.center.lat, S.center.lon = unmerc(cx - d.x * W / width, cy - d.y * H / height, S.zoom)
         S.dragMoved = S.dragMoved + math.abs(d.x) + math.abs(d.y)
         im.ResetMouseDragDelta(0)
         S.viewDirty = true
@@ -849,9 +957,17 @@ local function countTiles()
 end
 
 local function drawWindow()
-  if S.state == 'driving' then
-    im.SetNextWindowSize(im.ImVec2(300, 0), im.Cond_Always)
+  if S.widgetHidden then
+    im.Begin('Earth2Road##restore', nil, im.WindowFlags_AlwaysAutoResize)
+    if im.Button('Показати мапу') then S.widgetHidden = false; S.viewDirty = true end
+    im.End()
+    return
+  end
+  if S.state == 'driving' and not S.pickerOpen then
+    im.SetNextWindowSize(im.ImVec2(392, 0), im.Cond_Always)
     im.Begin('Earth2Road##mini', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
+    if im.Button('Приховати') then S.widgetHidden = true end
+    drawMap(360, 220)
     local loaded, loading = countTiles()
     local st = S.status and S.status.stream
     im.Text(string.format('Тайли: %d у грі, %d вантажаться', loaded, loading))
@@ -876,13 +992,18 @@ local function drawWindow()
         if im.Button(p[2] .. (S.pack == p[1] and ' *' or '')) then applyPack(p[1]) end
       end
     end
-    if im.Button('Обрати інше місце') then S.state = 'pick' end
+    if im.Button('Обрати інше місце') then S.pickerOpen = true; S.viewDirty = true end
     im.End()
     return
   end
   im.SetNextWindowSize(im.ImVec2(W + 32, 0), im.Cond_Always)
   im.Begin('Earth2Road - планета##picker', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
-  if S.state == 'pick' then
+  if im.Button('Приховати') then S.widgetHidden = true end
+  if S.pickerOpen then
+    im.SameLine()
+    if im.Button('Повернутися до їзди') then S.pickerOpen = false end
+  end
+  if S.state == 'pick' or S.pickerOpen then
     im.Text('Колесо - масштаб, перетягування - рух, клік - точка висадки.')
     drawMap()
     for k, p in ipairs(PRESETS) do
@@ -1089,7 +1210,49 @@ local function runTest()
   elseif S.packShot and S.now - S.overviewTaken > 1 then
     shot('7-pack-' .. S.packShot)
     S.packShot = nil
-  elseif S.overviewTaken and not (S.packQueue and #S.packQueue > 0) and not S.packShot and S.now - S.overviewTaken > 1 then
+  elseif test.gallery and S.overviewTaken and not S.galleryDone and not (S.packQueue and #S.packQueue > 0) and not S.packShot
+      and S.now - S.overviewTaken > (S.gallery and 1 or (test.galleryWait or 1)) then
+    -- fixed views round the car for before/after comparisons of the look (test.gallery)
+    if not S.gallery then
+      local veh = getPlayerVehicle(0)
+      local p, d = veh:getPosition(), veh:getDirectionVector()
+      local f = vec3(d.x, d.y, 0):normalized()
+      local r = vec3(f.y, -f.x, 0)
+      local function at(back, side, up) return vec3(p.x - f.x * back + r.x * side, p.y - f.y * back + r.y * side, p.z + up) end
+      S.gallery = {
+        {'g1-street', at(7, 0, 1.9), at(-45, 0, 1.2)},
+        {'g2-left', at(0, -1.5, 1.7), at(-18, -30, 7)},
+        {'g3-right', at(0, 1.5, 1.7), at(-18, 30, 7)},
+        {'g4-low', at(45, 8, 22), at(-60, 0, 0)},
+        {'g5-high', at(220, 30, 140), at(-180, 0, 0)},
+      }
+      for _, v in ipairs(test.views or {}) do
+        table.insert(S.gallery, {'v-' .. v.name, vec3(v.cam[1], v.cam[2], v.cam[3]), vec3(v.at[1], v.at[2], v.at[3])})
+      end
+      S.galleryIdx, S.galleryAt = 0, S.now - 10
+      -- the game's HUD (dashboard, camera help) off for the pictures
+      pcall(function() extensions.ui_visibility.setCef(false) end)
+    end
+    if S.galleryPending and S.now - S.galleryAt > 1.6 then
+      shot(S.galleryPending)
+      S.galleryPending = nil
+      S.galleryAt = S.now
+    elseif not S.galleryPending and S.now - S.galleryAt > 0.3 then
+      S.galleryIdx = S.galleryIdx + 1
+      local v = S.gallery[S.galleryIdx]
+      if not v then
+        S.galleryDone = true
+        pcall(function() extensions.ui_visibility.setCef(true) end)
+        S.overviewTaken = S.now - 2
+      else
+        local q = quatFromDir(v[3] - v[2], vec3(0, 0, 1))
+        commands.setFreeCamera()
+        core_camera.setPosRot(0, v[2].x, v[2].y, v[2].z, q.x, q.y, q.z, q.w)
+        S.galleryPending, S.galleryAt = v[1], S.now
+      end
+    end
+  elseif S.overviewTaken and not (S.packQueue and #S.packQueue > 0) and not S.packShot and S.now - S.overviewTaken > 1
+      and (not test.gallery or S.galleryDone) then
     result.status = #result.failures == 0 and 'passed' or 'failed'
     saveResult()
     shutdown(0)
@@ -1183,7 +1346,11 @@ function M.tick(dt)
   placeSun()
   readStatus()
   replayStep(dt)
-  if S.state == 'pick' and S.viewDirty and S.now - S.lastViewAt > 0.25 and not (test and test.skipMap) then requestView() end
+  -- UI visibility never changes the simulation state. skipMap only skips the automated
+  -- initial picker; a manual driver always gets a working map after landing.
+  local mapVisible = not S.widgetHidden and (S.state == 'pick' or S.state == 'driving')
+  local skipInitialMap = test and test.skipMap and S.state == 'pick' and not S.testLanded
+  if mapVisible and S.viewDirty and S.now - S.lastViewAt > 0.5 and not skipInitialMap then requestView() end
   if S.state == 'generating' then
     local job = S.status and S.status.job
     if job and job.seq == S.landSeq and job.state == 'ready' then beginArrival(job) end
@@ -1205,7 +1372,7 @@ function M.tick(dt)
     -- createMesh and the render they reached 98 ms (fast-oblast-replay-01)
     local reloaded = updateCollision()
     local tColl = timer:stopAndReset()
-    if not reloaded then stepQueue() end
+    if not reloaded then stepQueue(); digGraves() end
     local tQueue = timer:stopAndReset()
     if tPose + tTiles + tQueue + tColl > 50 then
       result.slow = result.slow or {}

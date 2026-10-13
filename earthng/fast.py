@@ -10,12 +10,14 @@ import math
 import os
 from pathlib import Path
 import time
+import zlib
 
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon, box
 from shapely.ops import substring
 
+import fast_photo
 import fast_profile
 import fast_sources as sources
 import fast_style as style
@@ -27,7 +29,7 @@ MATERIALS = style.MATERIALS
 MAJOR = {'motorway', 'trunk', 'primary', 'secondary'}
 WALKS = {'primary', 'secondary', 'tertiary', 'residential', 'living_street', 'unclassified'}
 SIDEWALK = 2.0    # m each side, flush with the road
-DECOR = {'mark', 'curb', 'roof'}   # no collision needed: spawned outside the MissionGroup
+DECOR = {'mark', 'curb', 'roof', 'roof_tile', 'roof_metal', 'parapet', 'fence_wall', 'fence_mesh', 'car'}   # no collision needed: spawned outside the MissionGroup
 CURB = 0.25       # m of the sidewalk next to the road drawn as a curb band
 LAMP_EVERY = 30.0 # m between street lamps (sidewalk side)
 ZEBRA = {'primary', 'secondary', 'tertiary', 'residential', 'unclassified', 'living_street'}
@@ -36,7 +38,7 @@ _STORES = OrderedDict()
 
 def is_wall(kind):
     """Vertical faces: keep their facing, keep hard edges, UV along the wall."""
-    return kind.startswith('wall_')
+    return kind.startswith('wall_') or kind in ('parapet','fence_wall','fence_mesh','car')
 
 
 def store_at(directory):
@@ -157,9 +159,10 @@ class Mesh:
                 'n':normals.ravel().tolist(),
                 't':(given[first] if given is not None else uv(kind,verts,normals)).ravel().tolist(),'i':idx}
 
-    def write(self, dest, region, key, layer):
+    def write(self, dest, region, key, layer, all_decor=False):
         """Pieces of up to PIECE triangles, each holding submeshes of several kinds: every
-        kind its own object made be:reloadCollision 78 ms (fast-replay-game-04)."""
+        kind its own object made be:reloadCollision 78 ms (fast-replay-game-04). all_decor: the
+        whole tile is decoration (the far layer)."""
         items=[]; subs=[]; tris=0; mats=[]
         def flush(decor=False):
             nonlocal subs,tris,mats
@@ -177,7 +180,7 @@ class Mesh:
         # static collision, which grew to 90 ms with them (fast-replay-game-07)
         for decor in (False,True):
             for kind, faces in sorted(self.faces.items()):
-                if (kind in DECOR)!=decor:
+                if (all_decor or kind in DECOR)!=decor:
                     continue
                 for offset in range(0,len(faces),750):
                     batch=faces[offset:offset+750]
@@ -514,9 +517,26 @@ def build_road(store, rect, center=None):
     return mesh,spawn
 
 
+CENTRE=(30.5234,50.4501)     # Maidan: the old town round it is plaster and brick, not panels
+CENTRE_RADIUS=2600.
+
+
+def overlay(op, a, b):
+    """A GEOS overlay that falls back to a 1 mm precision grid, then gives None."""
+    try:
+        return op(a,b)
+    except shapely.errors.GEOSException:
+        try:
+            return op(a,b,grid_size=.001)
+        except shapely.errors.GEOSException:
+            return None
+
+
 def build_scene(store,rect):
     mesh=Mesh(rect)
-    ground_holes=[]; lands={}; blocked=[]
+    cx,cy=store.frame.local(*CENTRE)
+    centre=math.hypot((rect[0]+rect[2])/2-float(cx),(rect[1]+rect[3])/2-float(cy))<CENTRE_RADIUS
+    ground_holes=[]; lands={}; blocked=[]; parking=[]; rows=[]; streets=[]; osm_points=[]
     pad=SHOULDER+1
     entries=store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad))+store.scenery(rect)
     for fid,kind,data,geom in entries:
@@ -524,6 +544,7 @@ def build_scene(store,rect):
             surf=road_surface(store,data)
             ground_holes.append(surf[1])
             place_lamps(mesh,rect,data,surf)
+            streets.extend(street_tree_spots(rect,data,surf))
         elif kind=='junction' and data['raise']==0:
             ground_holes.append(junction_polygon(data).union(junction_verge(store,data,0.,SIDEWALK if junction_walks(store,data) else 0.)[1]))
         elif kind=='water':
@@ -532,36 +553,33 @@ def build_scene(store,rect):
             p=geom.representative_point()
             h=float(store.terrain.sample([[p.x,p.y]])[0])-.5
             mesh.polygon('water',geom.intersection(box(*rect)),h)
-        elif kind in ('paved','forest','park'):
+        elif kind in ('paved','forest','park','residential'):
             lands.setdefault(kind,[]).append(geom)
+            if data['tags'].get('amenity')=='parking':
+                parking.append(geom)
         elif kind=='building':
             blocked.append(geom)
-            tags=data['tags']; p=geom.representative_point()
-            base=float(store.terrain.sample([[p.x,p.y]])[0])
-            height=max(2.5,min(250,sources.number(tags.get('height'),sources.number(tags.get('building:levels'),3)*3)))
-            mesh.polygon('roof',geom.intersection(box(*rect)),base+height)
-            walls=[]
-            top=height/style.KINDS['wall_panel'][3]
-            # exterior rings counter-clockwise: every wall quad then faces out of the building.
-            # u runs along the outline (windows continue round corners), v counts floors.
-            for poly in shapely.get_parts(shapely.orient_polygons(geom)):
-                if poly.geom_type!='Polygon':
-                    continue
-                for ring in [poly.exterior,*poly.interiors]:
-                    u=0.
-                    for p,q in zip(list(ring.coords),list(ring.coords)[1:]):
-                        du=math.dist(p[:2],q[:2])/style.KINDS['wall_panel'][3]
-                        quad=np.array([[*p[:2],base,u,0],[*q[:2],base,u+du,0],[*q[:2],base+height,u+du,top],[*p[:2],base+height,u,top]])
-                        walls.extend([quad[[0,1,2]],quad[[0,2,3]]])
-                        u+=du
-            mesh.add_many(style.wall(tags,height,fid),walls)
+            add_building(store,mesh,rect,fid,data['tags'],geom,centre)
+        elif kind=='path':
+            # a footpath is ground cover like a car park: cut into the same cells, flush with them
+            w=style.PATHS.get(data['tags'].get('highway'),1.5)
+            w=sources.number(data['tags'].get('width'),w)
+            lands.setdefault(style.path_kind(data['tags']),[]).append(geom.buffer(min(max(w,1.),6.)/2,cap_style=2,quad_segs=2))
+        elif kind=='fence':
+            add_fence(store,mesh,rect,data['tags'],geom)
+        elif kind=='tree_row':
+            rows.append(geom)
+        elif kind in ('stop','signal'):
+            osm_points.append((fid,kind,geom))
     holes=shapely.union_all(ground_holes)
     # landuse splits the ground cells (paved first): same cell heights, so seams do not move
     cover=[]
-    for k in ('paved','forest'):
+    for k in ('paved','footway_asphalt','footway','trodden','forest','park'):
         if k in lands:
-            u=shapely.union_all(lands[k]).intersection(box(*rect))
-            for prev in cover: u=u.difference(prev[1])
+            # on a 1 mm grid: many thin footpath buffers made GEOS overlays fail ("Unable to
+            # determine overlay result geometry dimension", vis-06-akadem)
+            u=shapely.set_precision(shapely.union_all(lands[k]).intersection(box(*rect)),.001)
+            for prev in cover: u=overlay(shapely.difference,u,prev[1]) or u
             if not u.is_empty:
                 shapely.prepare(u); cover.append((k,u))
     # Fixed 25 m grid (20 intervals/tile); vector sample once, then interpolate planar cells.
@@ -576,12 +594,337 @@ def build_scene(store,rect):
                 return (heights[j,i]*(1-u)+heights[j,i+1]*u)*(1-v)+(heights[j+1,i]*(1-u)+heights[j+1,i+1]*u)*v
             for k,u in cover:
                 if shapely.intersects(u,cell):
-                    part=square.intersection(u)
-                    if not part.is_empty:
-                        mesh.polygon(k,part,at); square=square.difference(u)
+                    part=overlay(shapely.intersection,square,u)
+                    if part is not None and not part.is_empty:
+                        rest=overlay(shapely.difference,square,u)
+                        if rest is None:
+                            continue
+                        mesh.polygon(k,part,at); square=rest
             mesh.polygon('ground',square,at)
-    plant_trees(store,mesh,rect,lands,shapely.union_all([holes,*blocked]))
+    free=shapely.union_all([holes,*blocked])
+    plant_trees(store,mesh,rect,lands,free,streets,rows)
+    if parking:
+        add_parked_cars(store,mesh,rect,parking,shapely.union_all(blocked).buffer(1.) if blocked else None)
+    if osm_points:
+        add_street_points(store,mesh,rect,osm_points)
     return mesh
+
+
+def static(shape, x, y, z, yaw):
+    return {'kind':'static','shape':shape,'pos':[float(x),float(y),float(z)],
+            'rot':[0,0,math.sin(yaw/2),math.cos(yaw/2)],'collision':'None','decal':'None','triangles':0}
+
+
+def add_street_points(store, mesh, rect, points):
+    """Bus shelters and traffic lights where OSM puts them. A shelter stands beyond the curb of
+    the nearest road, its front to the road; a light stands at the mouth of every road that meets
+    at a signal node, on the right of the traffic coming in, facing it."""
+    placed=[]
+    for fid,kind,geom in sorted(points,key=lambda x:x[0],reverse=True):
+        p=np.array(geom.coords[0])
+        roads=[r for r in store.query((p[0]-60,p[1]-60,p[0]+60,p[1]+60),{'road'})
+               if r[2]['tags'].get('bridge') in (None,'no') and r[2]['tags'].get('tunnel') in (None,'no')]
+        if not roads:
+            continue
+        if kind=='stop':
+            if not (rect[0]<=p[0]<rect[2] and rect[1]<=p[1]<rect[3]):
+                continue
+            if any(math.dist(p,q)<30 for q in placed):
+                continue           # a platform and its stop position: one shelter
+            _,_,data,_=min(roads,key=lambda r:LineString(r[2]['xy']).distance(geom))
+            line=LineString(data['xy']); at=line.project(geom)
+            a=np.array(line.interpolate(max(0,at-1)).coords[0]); b=np.array(line.interpolate(min(line.length,at+1)).coords[0])
+            t=(b-a)/max(np.linalg.norm(b-a),1e-9); n=np.array([-t[1],t[0]])
+            q=np.array(line.interpolate(at).coords[0])
+            side=np.sign(np.dot(p-q,n)) or -1.
+            if np.linalg.norm(p-q)<data['width']/2+.5:
+                side=-1.               # a stop on the carriageway: the right-hand side of the way
+            walk=SIDEWALK if ('left' if side>0 else 'right') in walk_sides(data['tags']) else 0
+            pos=q+n*side*(data['width']/2+walk+1.4)
+            # its front (shape +y after BUS_STOP_YAW) toward the road
+            face=-n*side
+            yaw=math.atan2(face[0],face[1])+style.BUS_STOP_YAW
+            mesh.statics.append(static(style.BUS_STOP,pos[0],pos[1],float(ground_z(store,[pos])[0])+.25,yaw))
+            placed.append(p)
+        else:
+            nid=-fid-10**12
+            for _,_,data,_ in roads:
+                if nid not in data['nodes']:
+                    continue
+                line=LineString(data['xy'])
+                end=0 if data['nodes'][0]==nid else 1
+                if data['tags'].get('oneway') in ('yes','1') and end==0:
+                    continue           # the one-way leaves this junction: no light for it
+                cut=data['cuts'][end]+1.5
+                if line.length<cut+2:
+                    continue
+                at=cut if end==0 else line.length-cut
+                q=np.array(line.interpolate(at).coords[0])
+                o=np.array(line.interpolate(at+(1 if end==0 else -1)).coords[0])
+                inward=(q-o)/max(np.linalg.norm(q-o),1e-9)        # travel toward the junction
+                right=np.array([inward[1],-inward[0]])
+                pos=q+right*(data['width']/2+.7)
+                if not (rect[0]<=pos[0]<rect[2] and rect[1]<=pos[1]<rect[3]):
+                    continue
+                face=-inward          # the lamps look at the traffic coming in
+                yaw=math.atan2(face[0],face[1])+style.TRAFFIC_LIGHT_YAW
+                z=np.interp(at,*data['prof'])
+                mesh.statics.append(static(style.TRAFFIC_LIGHT,pos[0],pos[1],z,yaw))
+
+
+PARAPET=0.9        # m of facade above a flat roof
+PARAPET_T=0.25     # parapet thickness
+EAVE=0.45          # pitched roof overhang, m
+
+
+def wall_quads(ring, z0, z1, base, scale, u0=0.):
+    """Wall quads round a ring (counter-clockwise faces out) with u along it and v in floors from
+    the building base (so windows sit on storeys). Returns (triangles per edge, end u)."""
+    out=[]; u=u0; top=(z1-base)/scale; bottom=(z0-base)/scale
+    for p,q in zip(ring,ring[1:]):
+        du=math.dist(p[:2],q[:2])/scale
+        quad=np.array([[*p[:2],z0,u,bottom],[*q[:2],z0,u+du,bottom],[*q[:2],z1,u+du,top],[*p[:2],z1,u,top]])
+        out.append([quad[[0,1,2]],quad[[0,2,3]]])
+        u+=du
+    return out,u
+
+
+def add_building(store, mesh, rect, fid, tags, geom, centre):
+    """Walls from below the lowest ground under the footprint (no floating corners on slopes),
+    photo facades with blank end walls, a parapet round flat roofs, a gabled roof on houses."""
+    p=geom.representative_point()
+    height=max(2.5,min(250,sources.number(tags.get('height'),sources.number(tags.get('building:levels'),3)*3+(.5 if 'building:levels' in tags else 0))))
+    if 'roof:levels' in tags:
+        height+=sources.number(tags.get('roof:levels'),0)*2.5
+    min_h=sources.number(tags.get('min_height'),0.)
+    ring_xy=np.vstack([np.asarray(r.coords)[:,:2] for r in [g.exterior for g in shapely.get_parts(geom) if g.geom_type=='Polygon']] or [np.zeros((1,2))])
+    ground=ground_z(store,ring_xy)
+    base=float(store.terrain.sample([[p.x,p.y]])[0])
+    bottom=float(ground.min())-.3 if min_h<=0 else base+min_h
+    top=base+height
+    kind=style.wall(tags,height,fid,centre)
+    end=style.end_wall(kind)
+    scale=style.KINDS[kind][3]
+    area=geom.area
+    gable=style.pitched(tags,height,area) and gable_roof(mesh,geom,top,kind,scale,base,tags)
+    flat=not gable
+    parapet=flat and height>=7.5 and area>60
+    wall_top=top+(PARAPET if parapet else 0.)
+    walls={}
+    shop=style.shopfront(tags,height,fid,centre,kind) if min_h<=0 else None
+    split=base+style.SHOP_HEIGHT if shop else bottom
+    for poly in shapely.get_parts(shapely.orient_polygons(geom)):
+        if poly.geom_type!='Polygon':
+            continue
+        for k,ring in enumerate([poly.exterior,*poly.interiors]):
+            coords=list(ring.coords)
+            mask=fast_photo.end_walls(coords[:-1]) if k==0 and end!=kind else [False]*(len(coords)-1)
+            quads,_=wall_quads(coords,split,wall_top,base,scale)
+            for m,q in zip(mask,quads):
+                walls.setdefault(end if m else kind,[]).extend(q)
+            if shop:
+                # the storefront band: v from the base too, so its picture sits on the street
+                low,_=wall_quads(coords,bottom,split,base,style.KINDS[shop][3])
+                for m,q in zip(mask,low):
+                    walls.setdefault(end if m else shop,[]).extend(q)
+    for k,tris in walls.items():
+        mesh.add_many(k,tris)
+    if flat:
+        roof_geom=geom
+        if parapet:
+            inner=geom.buffer(-PARAPET_T,join_style=2)
+            if not inner.is_empty and inner.area>area*.3:
+                cap=geom.difference(inner)
+                mesh.polygon('roof',cap.intersection(box(*rect)),wall_top)
+                for poly in shapely.get_parts(shapely.orient_polygons(inner)):
+                    if poly.geom_type!='Polygon':
+                        continue
+                    for ring in [poly.exterior,*poly.interiors]:
+                        # the inner face looks into the roof: the ring walked backwards
+                        quads,_=wall_quads(list(ring.coords)[::-1],top,wall_top,top,3.)
+                        mesh.add_many('parapet',[t for q in quads for t in q])
+                roof_geom=inner
+        mesh.polygon('roof',roof_geom.intersection(box(*rect)),top)
+        p=geom.representative_point()
+        if parapet and height>=24 and area>300 and rect[0]<=p.x<rect[2] and rect[1]<=p.y<rect[3]:
+            add_roof_boxes(mesh,geom,top,kind)
+
+
+def gable_roof(mesh, geom, eave, kind, scale, base, tags):
+    """A gabled roof over the footprint's minimum rectangle, ridge along its long side, when the
+    footprint is near that rectangle; gable ends in the facade. False when it does not fit."""
+    if geom.geom_type!='Polygon' or len(geom.interiors):
+        return False
+    mrr=shapely.orient_polygons(shapely.minimum_rotated_rectangle(geom))   # counter-clockwise: gables face out
+    if mrr.geom_type!='Polygon' or mrr.area<=0 or geom.area/mrr.area<.82:
+        return False
+    c=np.asarray(mrr.exterior.coords)[:4,:2]
+    e1,e2=c[1]-c[0],c[2]-c[1]
+    if np.linalg.norm(e1)<np.linalg.norm(e2):
+        c=np.roll(c,-1,axis=0); e1,e2=c[1]-c[0],c[2]-c[1]
+    long_,wide=np.linalg.norm(e1),np.linalg.norm(e2)
+    if wide<3 or wide>18:
+        return False
+    a=e1/long_; b=e2/wide
+    pitch=math.radians(35 if tags.get('building') in style.HOUSE else 28)
+    rise=min(wide/2*math.tan(pitch),6.)
+    o=EAVE
+    drop=o*math.tan(pitch)
+    # eave corners pushed out by the overhang, the ridge over the middle of the short side
+    A=c[0]-a*o-b*o; B=c[1]+a*o-b*o; C=c[2]+a*o+b*o; D=c[3]-a*o+b*o
+    R0=(c[0]+c[3])/2-a*o; R1=(c[1]+c[2])/2+a*o
+    z0=eave-drop; zr=eave+rise
+    P=lambda xy,z: [float(xy[0]),float(xy[1]),z]
+    material='roof_tile' if tags.get('roof:material') not in ('metal','tin') and (zlib.crc32(str(geom.centroid.wkb).encode())%4) else 'roof_metal'
+    mesh.add_many(material,[np.array([P(A,z0),P(B,z0),P(R1,zr)]),np.array([P(A,z0),P(R1,zr),P(R0,zr)]),
+                            np.array([P(C,z0),P(D,z0),P(R0,zr)]),np.array([P(C,z0),P(R0,zr),P(R1,zr)])])
+    # gable triangles on the two short sides, in the facade (u along the side, v in floors)
+    g=[]
+    for p,q,m in ((c[1],c[2],(c[1]+c[2])/2),(c[3],c[0],(c[3]+c[0])/2)):
+        w=math.dist(p,q)/scale
+        g.append(np.array([[*p,eave,0,(eave-base)/scale],[*q,eave,w,(eave-base)/scale],[*m,zr,w/2,(zr-base)/scale]]))
+    mesh.add_many(kind,g)
+    return True
+
+
+# --- parked cars and roof boxes -----------------------------------------------------------------
+# cars.color.png (fast_art): CAR_COLOURS cells left to right, then glass and tyre
+CAR_COLOURS=[(232,232,228),(190,192,194),(120,122,126),(28,30,34),(150,24,22),(34,64,126),(40,72,52),(196,180,150)]
+CAR_WEIGHTS=[.24,.2,.14,.16,.07,.08,.05,.06]
+CAR_CELLS=len(CAR_COLOURS)+2
+CAR_ATLAS=16      # cells across the texture: a power of two wide (320 px was never cooked)
+
+
+def car_uv(cell):
+    return ((cell+.5)/CAR_ATLAS,.5)
+
+
+def box_faces(lo, hi, top_lo=None, top_hi=None, skip_bottom=True):
+    """Faces of a (possibly tapered) box: lo/hi the bottom corners, top_lo/top_hi the top ones
+    (x, y at the top; z from hi). Returns (name, quad of four 3D points) per face."""
+    (x0,y0,z0),(x1,y1,z1)=lo,hi
+    tx0,ty0=top_lo or (x0,y0); tx1,ty1=top_hi or (x1,y1)
+    b=[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)]
+    t=[(tx0,ty0,z1),(tx1,ty0,z1),(tx1,ty1,z1),(tx0,ty1,z1)]
+    faces=[('top',t),('front',[b[1],b[2],t[2],t[1]]),('back',[b[3],b[0],t[0],t[3]]),
+           ('left',[b[2],b[3],t[3],t[2]]),('right',[b[0],b[1],t[1],t[0]])]
+    if not skip_bottom:
+        faces.append(('bottom',b))
+    return faces
+
+
+def car_parts(colour):
+    """(quad, uv cell) of a low car in its own frame: x forward, 4.3 m long, 1.76 m wide."""
+    glass,tyre=len(CAR_COLOURS),len(CAR_COLOURS)+1
+    parts=[]
+    for name,q in box_faces((-2.15,-.88,.32),(2.15,.88,.86)):
+        parts.append((q,colour))
+    for name,q in box_faces((-1.25,-.8,.86),(.85,.8,1.4),(-1.0,-.72),(.3,.72)):
+        parts.append((q,colour if name=='top' else glass))
+    for name,q in box_faces((-1.55,-.84,.0),(1.55,.84,.32)):
+        if name!='top':
+            parts.append((q,tyre))
+    return parts
+
+
+def car_triangles(x, y, z, yaw, colour):
+    """Triangles (x, y, z, u, v rows) of one car, every face wound to look out of it."""
+    c,s_=math.cos(yaw),math.sin(yaw)
+    out=[]
+    for quad,cell in car_parts(colour):
+        q=np.array(quad,dtype=float)
+        centre=q.mean(axis=0)
+        n=np.cross(q[1]-q[0],q[2]-q[0])
+        out_dir=centre-np.array([0,0,.6])
+        if np.dot(n,out_dir)<0:
+            q=q[::-1]
+        w=np.column_stack([x+q[:,0]*c-q[:,1]*s_,y+q[:,0]*s_+q[:,1]*c,z+q[:,2]])
+        u,v=car_uv(cell)
+        rows=np.column_stack([w,np.full(4,u),np.full(4,v)])
+        out+=[rows[[0,1,2]],rows[[0,2,3]]]
+    return out
+
+
+def add_parked_cars(store, mesh, rect, parking, buildings):
+    """Cars in the car parks of OSM: rows across the lot's long side (2.7 m stalls, 5.5 m deep,
+    every third row an aisle), about two stalls in three taken. A car belongs to the tile
+    holding its centre; the stall grid is the lot's own, so the same in every tile."""
+    tris=[]
+    for lot in parking:
+        if lot.area<120 or not lot.intersects(box(*rect)):
+            continue
+        mrr=shapely.minimum_rotated_rectangle(lot)
+        if mrr.geom_type!='Polygon':
+            continue
+        c=np.asarray(mrr.exterior.coords)[:4]
+        e1,e2=c[1]-c[0],c[2]-c[1]
+        if np.linalg.norm(e1)<np.linalg.norm(e2):
+            c=np.roll(c,-1,axis=0); e1,e2=c[1]-c[0],c[2]-c[1]
+        L,W=np.linalg.norm(e1),np.linalg.norm(e2)
+        a,b=e1/L,e2/W
+        inner=lot.buffer(-1.3)
+        if inner.is_empty:
+            continue
+        us=np.arange(1.35,L-1.3,2.7); vs=np.arange(2.75,W-2.7,5.5)
+        if not len(us) or not len(vs):
+            continue
+        U,V=np.meshgrid(us,vs); row=np.meshgrid(us,np.arange(len(vs)))[1]
+        U,V,row=U.ravel(),V.ravel(),row.ravel()
+        xy=c[0]+np.outer(U,a)+np.outer(V,b)
+        ok=(row%3!=1)&shapely.contains_xy(inner,xy[:,0],xy[:,1])
+        ok&=(xy[:,0]>=rect[0])&(xy[:,0]<rect[2])&(xy[:,1]>=rect[1])&(xy[:,1]<rect[3])
+        if buildings is not None:
+            ok&=~shapely.contains_xy(buildings,xy[:,0],xy[:,1])
+        taken=unit_at(xy[:,0],xy[:,1],21)<.66
+        xy=xy[ok&taken]
+        if not len(xy):
+            continue
+        z=ground_z(store,xy)
+        base_yaw=math.atan2(b[1],b[0])
+        flip=unit_at(xy[:,0],xy[:,1],23)<.5; tone=unit_at(xy[:,0],xy[:,1],25)
+        cum=np.cumsum(CAR_WEIGHTS)
+        for k,(x,y) in enumerate(xy):
+            colour=int(np.searchsorted(cum,tone[k]*cum[-1]))
+            yaw=base_yaw+(math.pi if flip[k] else 0)+(tone[k]-.5)*.08
+            tris+=car_triangles(float(x),float(y),float(z[k])+.02,yaw,min(colour,len(CAR_COLOURS)-1))
+        if len(tris)>12000:
+            break
+    mesh.add_many('car',tris)
+
+
+def add_roof_boxes(mesh, geom, top, scale_kind):
+    """Lift machine rooms on a tall flat roof: a box per ~25 m section along the block."""
+    if geom.geom_type!='Polygon':
+        return
+    mrr=shapely.minimum_rotated_rectangle(geom)
+    if mrr.geom_type!='Polygon' or geom.area/mrr.area<.7:
+        return
+    c=np.asarray(mrr.exterior.coords)[:4]
+    e1,e2=c[1]-c[0],c[2]-c[1]
+    if np.linalg.norm(e1)<np.linalg.norm(e2):
+        c=np.roll(c,-1,axis=0); e1,e2=c[1]-c[0],c[2]-c[1]
+    L,W=np.linalg.norm(e1),np.linalg.norm(e2)
+    if W<8:
+        return
+    a,b=e1/L,e2/W
+    n=max(1,int(round(L/26)))
+    tris=[]; roofs=[]
+    for k in range(n):
+        centre=c[0]+a*(L*(k+.5)/n)+b*(W/2)
+        hx,hy=2.6,1.8
+        corners=[centre-a*hx-b*hy,centre+a*hx-b*hy,centre+a*hx+b*hy,centre-a*hx+b*hy]
+        if not geom.buffer(-1).contains(Polygon(corners)):
+            continue
+        z0,z1=top,top+2.8
+        ring=corners+[corners[0]]
+        if Polygon(corners).exterior.is_ccw is False:
+            ring=ring[::-1]
+        quads,_=wall_quads([(float(p[0]),float(p[1])) for p in ring],z0,z1,z0,3.)
+        tris+=[t for q in quads for t in q]
+        roofs+=[np.array([[*corners[0],z1],[*corners[1],z1],[*corners[2],z1]]),np.array([[*corners[0],z1],[*corners[2],z1],[*corners[3],z1]])]
+    mesh.add_many('parapet',tris)
+    mesh.add_many('roof',roofs)
+
 
 
 def place_lamps(mesh, rect, data, surf):
@@ -615,35 +958,134 @@ def place_lamps(mesh, rect, data, surf):
                                  'rot':[0,0,math.sin(yaw/2),math.cos(yaw/2)],'collision':'None','decal':'None','triangles':0})
 
 
-def plant_trees(store, mesh, rect, lands, blocked):
-    """Trees in woods and parks on a global jittered lattice: a tree near a tile seam belongs
-    to exactly one tile (x in [x0, x1)), the same one every time."""
-    key=mesh.rect
-    for kind in ('forest','park'):
-        if kind not in lands or len(mesh.statics)>=style.TREES_PER_TILE:
-            continue
-        sp=style.TREE_SPACING[kind]
-        gi,gj=np.meshgrid(np.arange(math.floor(rect[0]/sp),math.ceil(rect[2]/sp)),
-                          np.arange(math.floor(rect[1]/sp),math.ceil(rect[3]/sp)))
-        gi,gj=gi.ravel().astype(np.int64),gj.ravel().astype(np.int64)
-        h=((gi*73856093)^(gj*19349663)^int(sp*1000))&0xffffffff
-        r=lambda k: ((h*(2654435761+k*40503)+k*97)&0xffffffff)/2**32
-        x=(gi+.5+(r(1)-.5)*.8)*sp; y=(gj+.5+(r(2)-.5)*.8)*sp
+def lattice(rect, sp, salt):
+    """A global jittered lattice of spacing sp: (x, y, hash function) of the points in rect."""
+    gi,gj=np.meshgrid(np.arange(math.floor(rect[0]/sp),math.ceil(rect[2]/sp)),
+                      np.arange(math.floor(rect[1]/sp),math.ceil(rect[3]/sp)))
+    gi,gj=gi.ravel().astype(np.int64),gj.ravel().astype(np.int64)
+    h=((gi*73856093)^(gj*19349663)^int(sp*1000+salt))&0xffffffff
+    r=lambda k: ((h*(2654435761+k*40503)+k*97)&0xffffffff)/2**32
+    x=(gi+.5+(r(1)-.5)*.8)*sp; y=(gj+.5+(r(2)-.5)*.8)*sp
+    return x,y,r
+
+
+def unit_at(x, y, k):
+    """A stable 0..1 number for a point (tile independent)."""
+    h=((np.round(np.asarray(x)*10).astype(np.int64)*73856093)^(np.round(np.asarray(y)*10).astype(np.int64)*19349663)^k)&0xffffffff
+    return ((h*2654435761+k*97)&0xffffffff)/2**32
+
+
+STREET_TREES={'residential','tertiary','secondary','primary','unclassified','living_street'}
+STREET_TREE_EVERY=9.0
+
+
+def street_tree_spots(rect, data, surf):
+    """Points for trees beside a street, beyond the sidewalk, every STREET_TREE_EVERY m from the
+    segment start (the same in every tile), away from the junctions."""
+    tags=data['tags']
+    if tags.get('highway','').replace('_link','') not in STREET_TREES or tags.get('bridge') not in (None,'no'):
+        return []
+    _,_,xy,z,tangent,knots,*_=surf
+    a,b=knots[0]+12,knots[-1]-12
+    if b<=a:
+        return []
+    ss=np.arange(math.ceil(a/STREET_TREE_EVERY)*STREET_TREE_EVERY,b,STREET_TREE_EVERY)
+    if not len(ss):
+        return []
+    p=np.column_stack([np.interp(ss,knots,xy[:,0]),np.interp(ss,knots,xy[:,1])])
+    t=np.column_stack([np.interp(ss,knots,tangent[:,0]),np.interp(ss,knots,tangent[:,1])])
+    t/=np.maximum(np.linalg.norm(t,axis=1)[:,None],1e-9)
+    nrm=np.column_stack([-t[:,1],t[:,0]])
+    sides=walk_sides(tags); out=[]
+    for side,sign in (('left',1),('right',-1)):
+        off=data['width']/2+(SIDEWALK if side in sides else 0)+1.8
+        q=p+nrm*sign*off
+        out.extend(map(tuple,q))
+    return out
+
+
+def plant_trees(store, mesh, rect, lands, blocked, streets=(), rows=()):
+    """Trees beside streets, in tree rows, yards, parks and woods. Every tree stands on a point
+    fixed in the world (a lattice or a distance along its OSM way), so a tree near a tile seam
+    belongs to exactly one tile (x in [x0, x1)), the same one every time."""
+    spots=[]   # (x, y, kind)
+    clear=blocked.buffer(1.5) if blocked is not None and not blocked.is_empty else None
+    paved=shapely.union_all(lands['paved']) if 'paved' in lands else None
+    def keep(x, y, kind, room=None):
+        x=np.asarray(x,dtype=float); y=np.asarray(y,dtype=float)
         ok=(x>=rect[0])&(x<rect[2])&(y>=rect[1])&(y<rect[3])
-        area=shapely.union_all(lands[kind])
-        ok&=shapely.contains_xy(area,x,y)
-        if blocked is not None and not blocked.is_empty:
-            ok&=~shapely.contains_xy(blocked.buffer(1.5),x,y)
-        idx=np.flatnonzero(ok)[:style.TREES_PER_TILE-len(mesh.statics)]
-        if not len(idx):
+        if room is not None and not room.is_empty:
+            ok&=~shapely.contains_xy(room,x,y)
+        elif clear is not None:
+            ok&=~shapely.contains_xy(clear,x,y)
+        if paved is not None:
+            ok&=~shapely.contains_xy(paved,x,y)
+        spots.extend((float(a),float(b),kind) for a,b in zip(x[ok],y[ok]))
+    if len(streets):
+        st=np.asarray(streets,dtype=float)
+        sel=unit_at(st[:,0],st[:,1],11)<.72
+        keep(st[sel,0],st[sel,1],'street')
+    for line in rows:
+        n=max(1,int(line.length//7))
+        pts=shapely.get_coordinates(shapely.line_interpolate_point(line,np.arange(n+1)*line.length/max(n,1)))
+        keep(pts[:,0],pts[:,1],'row')
+    # yards: open ground between the blocks (landuse=residential, else 45 m round any building),
+    # kept clear of walls by 4 m and of paths by 1.2 m. Kyiv's yards are full of grown trees.
+    if 'residential' in lands:
+        area=shapely.union_all(lands['residential']).intersection(box(*rect))
+    elif blocked is not None and not blocked.is_empty:
+        area=blocked.buffer(45.,quad_segs=2).intersection(box(*rect))
+    else:
+        area=None
+    if area is not None and not area.is_empty:
+        x,y,r=lattice(rect,9.,7)
+        inside=shapely.contains_xy(area,x,y)&(r(5)<.6)
+        room=blocked.buffer(4.,quad_segs=2) if blocked is not None and not blocked.is_empty else None
+        for k in ('footway','trodden','footway_asphalt'):
+            if k in lands and room is not None:
+                room=room.union(shapely.union_all(lands[k]).buffer(1.2,quad_segs=2))
+        keep(x[inside],y[inside],'yard',room)
+    for kind in ('park','forest'):
+        if kind not in lands:
             continue
-        z=ground_z(store,np.column_stack([x[idx],y[idx]]))
-        for n,k in enumerate(idx):
-            yaw=r(3)[k]*2*math.pi
-            mesh.statics.append({'kind':'static','shape':style.TREES[int(r(4)[k]*len(style.TREES))%len(style.TREES)],
-                                 'pos':[float(x[k]),float(y[k]),float(z[n])],
-                                 'rot':[0,0,math.sin(yaw/2),math.cos(yaw/2)],
-                                 'collision':'None','decal':'None','triangles':0})
+        x,y,r=lattice(rect,style.TREE_SPACING[kind],0)
+        area=shapely.union_all(lands[kind])
+        inside=shapely.contains_xy(area,x,y)
+        keep(x[inside],y[inside],kind)
+    spots=spots[:style.TREES_PER_TILE]
+    if not spots:
+        return
+    xy=np.array([(a,b) for a,b,_ in spots])
+    z=ground_z(store,xy)
+    pick=unit_at(xy[:,0],xy[:,1],3); turn=unit_at(xy[:,0],xy[:,1],5); size=unit_at(xy[:,0],xy[:,1],9)
+    for n,(x,y,kind) in enumerate(spots):
+        shapes=style.TREE_SETS[kind]
+        yaw=turn[n]*2*math.pi
+        mesh.statics.append({'kind':'static','shape':shapes[int(pick[n]*len(shapes))%len(shapes)],
+                             'pos':[x,y,float(z[n])],'rot':[0,0,math.sin(yaw/2),math.cos(yaw/2)],
+                             'scale':round(.85+.35*float(size[n]),3),
+                             'collision':'None','decal':'None','triangles':0})
+
+
+def add_fence(store, mesh, rect, tags, line):
+    """A fence along an OSM barrier: vertical quads following the ground (samples every 4 m),
+    the Soviet PO-2 concrete slab for walls and concrete fences, chain link for the rest."""
+    concrete=tags.get('barrier')=='wall' or tags.get('fence_type') in ('concrete','brick','stone')
+    kind='fence_wall' if concrete else 'fence_mesh'
+    height=min(3.,sources.number(tags.get('height'),2.0 if concrete else 1.6))
+    if line.length<1 or not line.intersects(box(*rect)):
+        return
+    n=max(1,int(math.ceil(line.length/4.)))
+    pts=shapely.get_coordinates(shapely.line_interpolate_point(line,np.linspace(0,line.length,n+1)))
+    z=ground_z(store,pts)-.05
+    scale=style.KINDS[kind][3]
+    u=np.r_[0,np.cumsum(np.linalg.norm(np.diff(pts,axis=0),axis=1))]/scale
+    tris=[]
+    for k in range(n):
+        q=np.array([[*pts[k],z[k],u[k],0],[*pts[k+1],z[k+1],u[k+1],0],
+                    [*pts[k+1],z[k+1]+height,u[k+1],height/scale],[*pts[k],z[k]+height,u[k],height/scale]])
+        tris+=[q[[0,1,2]],q[[0,2,3]]]
+    mesh.add_many(kind,tris)
 
 
 def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
@@ -653,22 +1095,27 @@ def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
     if layer=='road':
         local=tuple(float(v) for v in store.frame.local(*center)) if center else None
         mesh,spawn=build_road(store,rect,local)
+    elif layer=='far':
+        import fast_far
+        mesh,spawn=fast_far.build_far(store,rect),None
     else:
         mesh,spawn=build_scene(store,rect),None
     geometry=time.perf_counter()-started
     region=store.meta['id']; dest=Path(dest_root)/region; key=f'{i}_{j}'
-    items=mesh.write(dest,region,key,layer)
+    items=mesh.write(dest,region,key,layer,all_decor=layer=='far')
     for n,it in enumerate(mesh.statics):
-        items.append(dict(it,name=f'e2rf_{key}_{layer}_static_{n}',layer=layer))
+        # trees and lamps have no collision: outside the MissionGroup, so be:reloadCollision does
+        # not walk them (thousands of yard trees took it from 59 to 140 ms, vis-replay-01)
+        items.append(dict(it,name=f'e2rf_{key}_{layer}_static_{n}',layer=layer,decor=True))
     mat=dest/'tiles'/f'{key}.{layer}.mats.json'; mat.parent.mkdir(parents=True,exist_ok=True)
     mat.write_text(json.dumps(MATERIALS),encoding='utf8'); warm(mat)
     manifest={'version':1,'generator':sources.GEOMETRY,'source':region,'layer':layer,'tile':[i,j],
               'rect':rect,'lift':sources.LIFT,'materials':f'/e2r_stream/{region}/tiles/{mat.name}',
               'mats':list(MATERIALS),'items':items,'spawn':spawn,
               'drivable':bool(mesh.faces.get('road') or mesh.faces.get('road_major')),
-              'warmShapes':style.TREES+[style.LAMP],'packs':style.ART+'/packs.json',
+              'warmShapes':style.ALL_TREES+[style.LAMP,style.BUS_STOP,style.TRAFFIC_LIGHT],'packs':style.ART+'/packs.json',
               'triangles':sum(it['triangles'] for it in items)}
-    suffix='' if layer=='road' else '.scene'
+    suffix='' if layer=='road' else '.'+layer
     final=dest/'tiles'/f'{key}{suffix}.json'; tmp=final.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(manifest,separators=(',',':')),encoding='utf8'); os.replace(tmp,final); warm(final)
     timings={'geometry':geometry,'deliver':time.perf_counter()-started-geometry,'total':time.perf_counter()-started}

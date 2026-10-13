@@ -92,6 +92,9 @@ class Server:
         self.status_writes = 0
         self.status = {'server': 'up', 'started': time.time(), 'tilesSource': self.index['source'],
                        'coverage': self.region_boxes(), 'job': None, 'view': None, 'stream': None}
+        self.view_worker = ThreadPoolExecutor(1)
+        self.view_future = None
+        self.pending_view = None
         self.pool = ThreadPoolExecutor(6)       # map pictures
         self.builders = ProcessPoolExecutor(self.workers, initializer=warm,
                                            initargs=(getattr(args, 'generator', 'v2'),))
@@ -169,6 +172,23 @@ class Server:
             path.write_bytes(data)
         return Image.open(path).convert('RGB')
 
+    def queue_view(self, req):
+        # Only retain the newest pan/zoom request while a map is downloading.
+        self.pending_view = req
+
+    def pump_view(self):
+        if self.view_future is not None:
+            if not self.view_future.done():
+                return
+            try:
+                self.view_future.result()
+            except Exception:
+                traceback.print_exc()
+            self.view_future = None
+        if self.pending_view is not None:
+            req, self.pending_view = self.pending_view, None
+            self.view_future = self.view_worker.submit(self.render_view, req)
+
     def render_view(self, req):
         z = int(req['zoom'])
         w, h = int(req['w']), int(req['h'])
@@ -178,11 +198,14 @@ class Server:
         keys = [(tx, ty) for tx in range(math.floor(x0 / 256), math.floor((x0 + w) / 256) + 1)
                 for ty in range(math.floor(y0 / 256), math.floor((y0 + h) / 256) + 1)]
         futures = {k: self.pool.submit(self.map_tile, z, *k) for k in keys}
+        missing = 0
         for (tx, ty), f in futures.items():
             try:
                 tile = f.result()
             except Exception:
                 tile = None
+            if tile is None:
+                missing += 1
             if tile:
                 img.paste(tile, (round(tx * 256 - x0), round(ty * 256 - y0)))
         over = Image.new('RGBA', (w, h), (0, 0, 0, 0))
@@ -210,7 +233,7 @@ class Server:
             old.unlink(missing_ok=True)
         with self.lock:
             self.status['view'] = {'seq': req['seq'], 'file': f'/e2r_world/{name}', 'lat': req['lat'],
-                                   'lon': req['lon'], 'zoom': z, 'w': w, 'h': h}
+                                   'lon': req['lon'], 'zoom': z, 'w': w, 'h': h, 'missingTiles': missing}
         self.write_status()
 
     # --- landing and streaming --------------------------------------------------------------------
@@ -399,13 +422,14 @@ class Server:
                 print('request', req, flush=True)
                 try:
                     if req.get('type') == 'view':
-                        self.render_view(req)
+                        self.queue_view(req)
                     elif req.get('type') == 'land':
                         self.land(req)
                 except Exception as e:
                     traceback.print_exc()
                     if req.get('type') == 'land':
                         self.set_job(seq=req['seq'], state='error', message=str(e))
+            self.pump_view()
             self.read_pose()
             try:
                 self.schedule()

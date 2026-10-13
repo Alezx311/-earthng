@@ -16,11 +16,11 @@ import numpy as np
 from PIL import Image
 import pyproj
 import shapely
-from shapely.geometry import LineString, MultiPoint, shape
+from shapely.geometry import LineString, MultiPoint, Point, shape
 from shapely.ops import transform
 
 VERSION = 'fast-8'          # source index format (keys fast-index/<id>)
-GEOMETRY = 'fast-24'         # mesh/material semantics; bump to reject tiles built by older code
+GEOMETRY = 'fast-29'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
@@ -402,17 +402,35 @@ class Store:
             raise ValueError(f'no_osm scenery coverage: {bbox}')
         key,entry=hit
         if key not in self.scenes:
-            found={}; factory=osmium.geom.GeoJSONFactory()
+            found={}; lines={}; factory=osmium.geom.GeoJSONFactory()
+            import fast_style
             class Reader(osmium.SimpleHandler):
                 def area(self,a):
                     kind='building' if a.tags.get('building') not in (None,'no') else (
                         'water' if a.tags.get('natural')=='water' or a.tags.get('waterway')=='riverbank' else None)
                     if kind is None:
-                        import fast_style
                         kind=fast_style.ground_kind(a.tags)
                     if kind and a.id not in found:
                         found[a.id]=(kind,dict(a.tags),shape(json.loads(factory.create_multipolygon(a))))
+                def node(self,n):
+                    # bus stops and traffic signals where OSM has them (way nodes keep their tags
+                    # in the source tiles); keyed apart from areas and ways
+                    kind=fast_style.point_kind(n.tags)
+                    if kind and n.location.valid():
+                        lines[-(10**12+n.id)]=(kind,dict(n.tags),Point(n.location.lon,n.location.lat))
+                def way(self,w):
+                    # footpaths, fences, tree rows: lines, not areas (an area id is 2 x way id,
+                    # so a line keys as -way id to stay apart)
+                    kind=fast_style.line_kind(w.tags)
+                    if kind and -w.id not in lines:
+                        try:
+                            coords=[(n.lon,n.lat) for n in w.nodes]
+                        except osmium.InvalidLocationError:
+                            return
+                        if len(coords)>=2:
+                            lines[-w.id]=(kind,dict(w.tags),LineString(coords))
             Reader().apply_file(str(Path(self.meta['source'])/entry['file']),locations=True)
+            found.update(lines)
             ordered=sorted(found.items())
             geoms=shapely.make_valid(shapely.transform([v[1][2] for v in ordered],self.frame.local,interleaved=False))
             records=[(fid,kind,{'tags':tags},geom) for (fid,(kind,tags,_)),geom in zip(ordered,geoms)]

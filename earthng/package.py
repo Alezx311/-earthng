@@ -88,6 +88,10 @@ def main():
         rel = d.relative_to(a.dem)
         (pkg / 'data' / 'dem' / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(d, pkg / 'data' / 'dem' / rel)
+    # the art (photo facades and ground in BC1 DDS, texture packs): built here once, shipped
+    # ready, so a tester's first landing does not spend ~40 s on it
+    import fast_art
+    shutil.copytree(fast_art.prebuild(), pkg / 'data' / 'art' / fast_art.VERSION)
     for name in ('start.ps1', 'start.bat', 'ІНСТРУКЦІЯ.txt'):
         shutil.copy2(HERE / 'package' / name, pkg / name)
 
@@ -95,7 +99,8 @@ def main():
     env = dict(os.environ, EARTH2ROAD=str(pkg / 'none'), PYTHONNOUSERSITE='1')
     env.pop('PYTHONPATH', None)
     check = ("import sys, json; sys.path.insert(0, 'earthng');"
-             "import world_server, fast_server, fast, fast_art;"
+             "import world_server, fast_server, fast, fast_art, fast_far;"
+             "import paths; assert (paths.PROJECT / 'data' / 'art' / fast_art.VERSION / 'packs.json').exists(), 'art missing';"
              "import fast_sources as S;"
              "assert not any('Earth2Road' in (getattr(m,'__file__','') or '') for m in sys.modules.values()), 'Earth2Road imported';"
              "print('imports ok, python', sys.version.split()[0])")

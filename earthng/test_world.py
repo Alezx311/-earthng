@@ -36,6 +36,9 @@ def main():
     p.add_argument('--speed', type=float, default=13.0, help='autopilot cruise speed, m/s')
     p.add_argument('--drive-seconds', type=float, default=8)
     p.add_argument('--packs', action='store_true', help='after the drive: an overview shot in every texture pack')
+    p.add_argument('--gallery', action='store_true', help='after the drive: fixed views round the car (e2r-g*.png)')
+    p.add_argument('--gallery-wait', type=float, default=1, help='seconds before the gallery (far tiles keep loading)')
+    p.add_argument('--view', action='append', default=[], help='extra gallery view name:x,y,z:tx,ty,tz (world metres)')
     p.add_argument('--manual', action='store_true', help='land, then hand the car to the player; runs until the game is closed')
     p.add_argument('--min-distance', type=float, default=20, help='physics test fails below this, m')
     p.add_argument('--workers', type=int, default=8)
@@ -75,6 +78,11 @@ def main():
         test['replay'] = True
     if a.packs:
         test['packs'] = True
+    if a.gallery:
+        test['gallery'] = True
+        test['galleryWait'] = a.gallery_wait
+        test['views'] = [{'name': v.split(':')[0], 'cam': [float(c) for c in v.split(':')[1].split(',')],
+                          'at': [float(c) for c in v.split(':')[2].split(',')]} for v in a.view]
     if a.manual:
         test['manual'] = True
         a.timeout = 10**9
