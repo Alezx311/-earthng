@@ -1,0 +1,227 @@
+"""Deadline scheduler for the experimental fast generator."""
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import heapq
+import json
+import math
+from pathlib import Path
+import threading
+import time
+import traceback
+
+import fast
+import fast_sources as sources
+
+
+def percentile(values, fraction=.99, default=4.):
+    return sorted(values)[min(len(values)-1, math.ceil(len(values)*fraction)-1)] if values else default
+
+
+def candidates(store, pose, horizon, speed):
+    """All near directions, then graph distance along every reachable road branch.
+
+    No future route is needed. Deadline uses distance to the tile's *boundary*.
+    Graph searches are capped by horizon; capacity overflow is reported, not hidden.
+    """
+    x,y=pose['x'],pose['y']; tile=sources.TILE
+    out={}
+    def add_rect(rect, arrival):
+        for i in range(math.floor(rect[0]/tile),math.floor(rect[2]/tile)+1):
+            for j in range(math.floor(rect[1]/tile),math.floor(rect[3]/tile)+1):
+                key=f'{i}_{j}'
+                dx=max(i*tile-x,0,x-(i+1)*tile); dy=max(j*tile-y,0,y-(j+1)*tile)
+                deadline=max(0,min(arrival,math.hypot(dx,dy)/speed))
+                if key not in out or deadline<out[key][0]:
+                    out[key]=(deadline,i,j)
+    # 750 m guaranteed turning reserve around current pose; larger branch reserve follows.
+    add_rect((x-750,y-750,x+750,y+750),0)
+    initial=store.query((x-150,y-150,x+150,y+150),{'road'})
+    queue=[]; best={}
+    for _,_,data,_ in initial:
+        for nid in data['nodes']:
+            n=store.node(nid)
+            d=math.hypot(n['xy'][0]-x,n['xy'][1]-y)
+            if d<best.get(nid,math.inf):
+                best[nid]=d; heapq.heappush(queue,(d,nid))
+    visited=set()
+    while queue:
+        distance,nid=heapq.heappop(queue)
+        if distance != best[nid] or distance>speed*horizon:
+            continue
+        for (sid,) in store.db.execute('SELECT segment FROM links WHERE node=?',(nid,)):
+            if sid in visited:
+                continue
+            visited.add(sid)
+            row=store.db.execute('SELECT data FROM features WHERE id=?',(sid,)).fetchone()
+            d=json.loads(row[0]); pts=d['xy']; along=distance
+            if d['nodes'][1]==nid:
+                pts=pts[::-1]
+            for a,b in zip(pts,pts[1:]):
+                if along>speed*horizon:
+                    break
+                add_rect((min(a[0],b[0])-20,min(a[1],b[1])-20,max(a[0],b[0])+20,max(a[1],b[1])+20),along/speed)
+                along+=math.dist(a,b)
+            other=d['nodes'][1] if d['nodes'][0]==nid else d['nodes'][0]
+            if along<best.get(other,math.inf):
+                best[other]=along; heapq.heappush(queue,(along,other))
+    return out
+
+
+def server_class(base):
+    class FastServer(base):
+        def __init__(self,args):
+            self.history=deque(maxlen=256)
+            self.future_jobs={}
+            self.fast_store=None
+            self.desired={}
+            self.next_schedule=0
+            self.generation=0
+            self.preparer=ThreadPoolExecutor(1)
+            super().__init__(args)
+
+        def region_boxes(self):
+            return [v['coverage'] for v in self.index['tiles'].values()]
+
+        def land(self,req):
+            with self.lock:
+                self.generation+=1
+                generation=self.generation
+                self.stream=None; self.pose=None; self.desired={}
+                self.landing={'seq':req['seq'],'lat':req['lat'],'lon':req['lon'],'at':time.monotonic()}
+            self.set_job(id=f'fast-{generation}',seq=req['seq'],lat=req['lat'],lon=req['lon'],
+                         state='working',stage='Індекс джерел',progress=.02,message=None)
+            self.preparer.submit(self.prepare_landing,dict(req),generation)
+
+        def prepare_landing(self,req,generation):
+            try:
+                directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,
+                                              emit=lambda msg: print(msg,flush=True))
+                frame=sources.Frame(); i,j=frame.tile_of(req['lon'],req['lat'])
+                # Connections stay on scheduler thread; preparation owns no persistent SQLite reader.
+                with self.lock:
+                    if generation!=self.generation:
+                        return
+                    self.frame=frame
+                    self.landing['tile']=[i,j]
+                    dest=self.user/'e2r_stream'/meta['id']/'tiles'
+                    ready={}; scenes={}
+                    for p in dest.glob('*.json'):
+                        if p.name.endswith('.mats.json'):
+                            continue
+                        try:
+                            m=json.loads(p.read_text())
+                            if m.get('source')!=meta['id'] or m.get('generator')!=sources.GEOMETRY:
+                                continue
+                            if not all((self.user/it['shape'].lstrip('/')).exists() for it in m['items']):
+                                continue
+                            key='_'.join(map(str,m['tile']))
+                            (scenes if m['layer']=='scene' else ready)[key]=1
+                        except (OSError,ValueError,KeyError):
+                            continue
+                    self.stream={'region':meta['id'],'dir':str(directory),'tile':sources.TILE,
+                                 'ready':ready,'scenes':scenes,'inflight':{},'failed':{},'queued':0,
+                                 'built':0,'buildSeconds':0.,'bounds':meta['bbox'],'generator':sources.GEOMETRY}
+                    self.out_of_region=set(); self.next_schedule=0
+                self.set_job(region=meta['id'],tileSize=sources.TILE,tile=[i,j],
+                             stage='Дороги і стартовий запас',progress=.2,generator=sources.GEOMETRY)
+            except Exception as e:
+                traceback.print_exc()
+                if generation==self.generation:
+                    self.set_job(state='error',message=str(e))
+
+        def schedule(self):
+            with self.lock:
+                st=self.stream
+                if not st:
+                    return
+                # Futures are consumed by the scheduler thread, not worker callbacks.
+                for job,(future,region,key,layer) in list(self.future_jobs.items()):
+                    if not future.done():
+                        continue
+                    del self.future_jobs[job]
+                    if region!=st['region']:
+                        continue
+                    st['inflight'].pop(job,None)
+                    try:
+                        result=future.result()
+                        (st['ready'] if layer=='road' else st['scenes'])[key]=1
+                        st['built']+=1; st['buildSeconds']+=result['timings']['total']
+                        if layer=='road':
+                            self.history.append(result['timings']['total'])
+                        self.work.mkdir(parents=True,exist_ok=True)
+                        with (self.work/'fast-timings.jsonl').open('a',encoding='utf8') as f:
+                            f.write(json.dumps(dict(result,region=region,at=time.time()))+'\n')
+                    except Exception as e:
+                        st['failed'][job]=st['failed'].get(job,0)+1
+                        print('fast job failed',job,repr(e),flush=True)
+                        traceback.print_exc()
+                if not self.fast_store or str(self.fast_store.directory)!=st['dir']:
+                    if self.fast_store:
+                        self.fast_store.db.close()
+                    self.fast_store=sources.Store(st['dir'])
+                now=time.monotonic()
+                if now>=self.next_schedule:
+                    pose=self.pose
+                    if not pose:
+                        x,y=self.frame.local(self.landing['lon'],self.landing['lat'])
+                        pose={'x':float(x),'y':float(y),'vx':0,'vy':0}
+                    speed=max(83.333,math.hypot(pose.get('vx',0),pose.get('vy',0)))
+                    delivery=max(2.,float(pose.get('deliveryP99',2.)))
+                    horizon=max(12.,2*(percentile(self.history)+delivery+2))
+                    wanted=candidates(self.fast_store,pose,horizon,speed)
+                    self.desired={k:v for k,v in wanted.items() if self.fast_store.covered(self.frame.rect(v[1],v[2]))}
+                    st['horizonSeconds']=horizon
+                    st['loadRadius']=max(1000.,speed*(delivery+4)+sources.TILE*.71)
+                    st['pose']=pose; self.next_schedule=now+.5
+                landing_key='_'.join(map(str,self.landing['tile']))
+                job=self.status['job'] or {}
+                if job.get('state')=='working':
+                    elapsed=now-self.landing['at']
+                    if elapsed>120:
+                        self.set_job(state='error',message='startup_budget_exceeded: 120 seconds')
+                    elif landing_key in st['ready']:
+                        path=self.user/'e2r_stream'/st['region']/'tiles'/f'{landing_key}.json'
+                        m=json.loads(path.read_text())
+                        if not m.get('spawn'):
+                            self.set_job(state='error',message='no_drivable_spawn: select a road')
+                        else:
+                            self.set_job(state='ready',progress=1,stage='Завантаження доріг',
+                                manifest=f'/e2r_stream/{st["region"]}/tiles/{landing_key}.json',
+                                timings={'first_tile':elapsed})
+                # No unbounded executor backlog. Scene work can consume at most one worker.
+                pending=[]
+                for key,(deadline,i,j) in self.desired.items():
+                    task=key+':road'
+                    if key not in st['ready'] and task not in self.future_jobs and st['failed'].get(task,0)<2:
+                        pending.append((-1 if key==landing_key and not self.pose else deadline,i,j,key,'road'))
+                scene_running=sum(v[3]=='scene' for v in self.future_jobs.values())
+                if not pending and scene_running==0:
+                    for key,(deadline,i,j) in self.desired.items():
+                        task=key+':scene'
+                        if key in st['ready'] and key not in st['scenes'] and task not in self.future_jobs and st['failed'].get(task,0)<2:
+                            px,py=st['pose']['x'],st['pose']['y']
+                            distance=math.hypot((i+.5)*sources.TILE-px,(j+.5)*sources.TILE-py)
+                            pending.append((999 if key==landing_key and not self.pose else 1000+distance,i,j,key,'scene'))
+                st['queued']=len(pending)
+                for _,i,j,key,layer in sorted(pending):
+                    if len(self.future_jobs)>=self.workers or (layer=='scene' and scene_running):
+                        break
+                    task=key+':'+layer
+                    center=(self.landing['lon'],self.landing['lat']) if key==landing_key else None
+                    future=self.builders.submit(fast.run,st['dir'],i,j,str(self.work),
+                        str(self.user/'e2r_stream'),str(self.cache),center,layer)
+                    self.future_jobs[task]=(future,st['region'],key,layer)
+                    st['inflight'][task]=now
+                    if layer=='scene':
+                        scene_running+=1
+
+        def stream_status(self):
+            status=super().stream_status()
+            if status:
+                st=self.stream
+                status.update(generator=sources.GEOMETRY,scenes=dict(st['scenes']),
+                    wanted={k:v[0] for k,v in self.desired.items()},
+                    buildP99=percentile(self.history),horizonSeconds=st.get('horizonSeconds',12),
+                    loadRadius=st.get('loadRadius',1000),startupSeconds=time.monotonic()-self.landing['at'])
+            return status
+    return FastServer

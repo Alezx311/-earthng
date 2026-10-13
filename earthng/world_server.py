@@ -60,15 +60,18 @@ def unmerc(x, y, z):
     return lat, lon
 
 
-def warm():
+def warm(generator='v2'):
     """Worker initializer: below-normal priority (the game's main thread must win the CPU: with
     normal priority, 10 builders gave 2-5 s frames in route-03; netconvert children inherit it),
     then import the generator once per process."""
     if os.name == 'nt':
         import ctypes
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
-    import direct
-    direct.warm()
+    if generator == 'v2':
+        import direct
+        direct.warm()
+    else:
+        import fast
 
 
 class Server:
@@ -88,7 +91,8 @@ class Server:
         self.status = {'server': 'up', 'started': time.time(), 'tilesSource': self.index['source'],
                        'coverage': self.region_boxes(), 'job': None, 'view': None, 'stream': None}
         self.pool = ThreadPoolExecutor(6)       # map pictures
-        self.builders = ProcessPoolExecutor(self.workers, initializer=warm)
+        self.builders = ProcessPoolExecutor(self.workers, initializer=warm,
+                                           initargs=(getattr(args, 'generator', 'v2'),))
         self.stream, self.frame, self.pose, self.landing = None, None, None, None
         self.out_of_region = set()
         self.heading = None
@@ -196,8 +200,9 @@ class Server:
         rdir, meta = self.region_for(lat, lon)
         if not rdir:
             names = ', '.join(p.name for p in self.regions.glob('*')) or 'none'
-            self.set_job(**job, state='error', stage='source', progress=0,
-                         message=f'no_data: no prepared region contains this point (earthng/region.py; prepared: {names})')
+            self.set_job(**{**job, 'state': 'error', 'stage': 'source', 'progress': 0,
+                            'message': f'no_data: no prepared region contains this point '
+                                       f'(earthng/region.py; prepared: {names})'})
             return
         frame = tiles.Frame(rdir)
         tile = list(frame.tile_of(lon, lat))
@@ -346,7 +351,7 @@ class Server:
 
     # --- loop ----------------------------------------------------------------------------------
     def serve(self):
-        print(f'Earth2Road companion: user folder {self.user}, regions {self.status["coverage"]}, '
+        print(f'Earth2Road companion: user folder {self.user}, coverage areas {len(self.status["coverage"])}, '
               f'{self.workers} tile builders', flush=True)
         last_beat = 0
         while True:
@@ -389,7 +394,15 @@ def main():
     p.add_argument('--regions', default=str(paths.OUT / 'region'), help='prepared regions (earthng/region.py)')
     p.add_argument('--workers', type=int, default=8, help='tile builder processes')
     p.add_argument('--radius', type=float, default=800, help='tiles are generated within this distance of the car, m')
-    Server(p.parse_args()).serve()
+    p.add_argument('--generator', choices=('v2', 'fast'), default='v2', help='fast is experimental until acceptance gates pass')
+    args = p.parse_args()
+    if args.workers < 1:
+        p.error('--workers must be positive')
+    if args.generator == 'fast':
+        from fast_server import server_class
+        server_class(Server)(args).serve()
+    else:
+        Server(args).serve()
 
 
 if __name__ == '__main__':

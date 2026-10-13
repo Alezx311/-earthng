@@ -1,0 +1,312 @@
+"""Cold-start OSM index for the streaming generator. No SUMO or generated meshes.
+
+The index owns complete OSM ways and junction mouths, not tile-local decisions.
+SQLite/RTree readers are independent and bounded; workers never copy a city graph.
+"""
+from collections import Counter, defaultdict, OrderedDict
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sqlite3
+import time
+
+import numpy as np
+from PIL import Image
+import pyproj
+import shapely
+from shapely.geometry import LineString, MultiPoint, shape
+from shapely.ops import transform
+
+VERSION = 'fast-2'          # source index format (keys fast-index/<id>)
+GEOMETRY = 'fast-4'         # mesh/material semantics; bump to reject tiles built by older code
+TILE = 500.0
+LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
+CRS = 'EPSG:32636'
+ORIGIN = (324000., 5590000.) # fixed UTM anchor, independent of landing and source bounds
+DRIVABLE = {'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential',
+            'unclassified', 'service', 'living_street', 'road'}
+
+
+def number(value, default):
+    try:
+        return float(str(value).split(';')[0].replace(' m', '').replace(',', '.'))
+    except (ValueError, TypeError):
+        return default
+
+
+def road_width(tags):
+    klass = tags.get('highway', '').replace('_link', '')
+    lanes = number(tags.get('lanes'), 1 if tags.get('oneway') in ('yes', '1', '-1') else 2)
+    fallback = 4 if klass in ('service', 'living_street') else max(3.2, lanes * 3.3)
+    return min(35., max(2.5, number(tags.get('width'), fallback)))
+
+
+class Frame:
+    def __init__(self):
+        self.forward = pyproj.Transformer.from_crs('EPSG:4326', CRS, always_xy=True)
+        self.inverse = pyproj.Transformer.from_crs(CRS, 'EPSG:4326', always_xy=True)
+        self.cx, self.cy = ORIGIN
+
+    def local(self, lon, lat):
+        x, y = self.forward.transform(lon, lat)
+        return np.asarray(x) - self.cx, np.asarray(y) - self.cy
+
+    def lonlat(self, x, y):
+        return self.inverse.transform(x, y)
+
+    def geographic(self, x, y):
+        return self.inverse.transform(np.asarray(x) + self.cx, np.asarray(y) + self.cy)
+
+    def tile_of(self, lon, lat):
+        x, y = self.local(lon, lat)
+        return math.floor(x / TILE), math.floor(y / TILE)
+
+    def rect(self, i, j, pad=0.):
+        return i*TILE-pad, j*TILE-pad, (i+1)*TILE+pad, (j+1)*TILE+pad
+
+    def geo_bbox(self, rect):
+        x0, y0, x1, y1 = rect
+        lon, lat = self.geographic([x0,x0,x1,x1], [y0,y1,y0,y1])
+        return [float(min(lon)), float(min(lat)), float(max(lon)), float(max(lat))]
+
+
+def source_identity(source, dem):
+    """Index checksum plus DEM contents: old geometry cannot survive source replacement."""
+    source, dem = Path(source), Path(dem)
+    raw = (source / 'index.json').read_bytes()
+    index = json.loads(raw)
+    h = hashlib.sha256(VERSION.encode() + raw)
+    for p in sorted((dem / 'terrain' / '12').glob('*/*.png')):
+        h.update(p.relative_to(dem).as_posix().encode())
+        h.update(p.read_bytes())
+    return VERSION + '-' + h.hexdigest()[:16], index
+
+
+class Terrain:
+    """Vectorized, offline Terrarium samples with a tile-independent pixel grid.
+
+    Bilinear sampling crosses PNG boundaries. Missing tiles fail explicitly.
+    Roads use a symmetric 5-tap spatial filter; no optional network downloads.
+    """
+    def __init__(self, cache, frame=None):
+        self.cache, self.frame = Path(cache), frame or Frame()
+        self.images = OrderedDict()
+
+    def pixels(self, x, y):
+        out = np.empty(len(x), dtype=float)
+        tx, ty = x // 256, y // 256
+        for a, b in set(zip(tx.tolist(), ty.tolist())):
+            key = (a, b)
+            if key not in self.images:
+                path = self.cache / 'terrain' / '12' / str(a) / f'{b}.png'
+                if not path.exists():
+                    raise FileNotFoundError(f'no_dem: {path}')
+                with Image.open(path) as im:
+                    rgb = np.asarray(im.convert('RGB'), dtype=float)
+                self.images[key] = rgb[:,:,0]*256 + rgb[:,:,1] + rgb[:,:,2]/256 - 32768
+                if len(self.images) > 24:
+                    self.images.popitem(last=False)
+            self.images.move_to_end(key)
+            mask = (tx == a) & (ty == b)
+            out[mask] = self.images[key][y[mask] % 256, x[mask] % 256]
+        return out
+
+    def sample(self, xy, smooth=False):
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        if not len(xy):
+            return np.array([])
+        lon, lat = self.frame.geographic(xy[:,0], xy[:,1])
+        scale = 256 * 2**12
+        x = (lon+180)/360*scale
+        y = (1-np.arcsinh(np.tan(np.radians(lat)))/np.pi)/2*scale
+        ix, iy = np.floor(x).astype(int), np.floor(y).astype(int)
+        u, v = x-ix, y-iy
+        offsets = [(0,0,1.)] if not smooth else [(0,0,.5),(-1,0,.125),(1,0,.125),(0,-1,.125),(0,1,.125)]
+        z = np.zeros(len(x))
+        for dx, dy, weight in offsets:
+            z += weight * ((self.pixels(ix+dx,iy+dy)*(1-u) + self.pixels(ix+dx+1,iy+dy)*u)*(1-v)
+                           + (self.pixels(ix+dx,iy+dy+1)*(1-u) + self.pixels(ix+dx+1,iy+dy+1)*u)*v)
+        if not np.isfinite(z).all():
+            raise ValueError('non-finite DEM')
+        return z + LIFT
+
+
+def prepare(source, output, dem, emit=print):
+    """Parse source tiles once, split roads at shared nodes, publish a read-only index."""
+    import osmium
+    started = time.perf_counter()
+    identity, index = source_identity(source, dem)
+    target = Path(output) / identity
+    final = target / 'sources.sqlite'
+    if final.exists():
+        return target, json.loads((target / 'region.json').read_text())
+    target.mkdir(parents=True, exist_ok=True)
+    frame = Frame()
+    roads = {}
+
+    class Reader(osmium.SimpleHandler):
+        def way(self, w):
+            h = w.tags.get('highway', '')
+            if not (h in DRIVABLE or h.endswith('_link')) or w.id in roads:
+                return
+            if w.tags.get('area') == 'yes' or w.tags.get('access') == 'no':
+                return
+            nodes = [(n.ref, n.lon, n.lat) for n in w.nodes if n.location.valid()]
+            if len(nodes) != len(w.nodes):
+                raise ValueError(f'incomplete OSM way {w.id}')
+            if len(nodes) >= 2:
+                roads[w.id] = (dict(w.tags), nodes)
+
+    for n, entry in enumerate(index['tiles'].values()):
+        path = Path(source) / entry['file']
+        if hashlib.sha256(path.read_bytes()).hexdigest() != entry['sha256']:
+            raise ValueError(f'OSM checksum mismatch: {path}')
+        Reader().apply_file(str(path), locations=True)
+        if n % 20 == 0:
+            emit(f'index {n+1}/{len(index["tiles"])} sources, {len(roads)} roads, {time.perf_counter()-started:.1f}s')
+    emit(f'roads parsed in {time.perf_counter()-started:.1f}s')
+    refs = Counter(n[0] for _, nodes in roads.values() for n in nodes)
+    segments, mouths = [], defaultdict(list)
+    for wid, (tags, nodes) in sorted(roads.items()):
+        x, y = frame.local([n[1] for n in nodes], [n[2] for n in nodes])
+        xy = np.column_stack([x,y])
+        cuts = [0] + [k for k in range(1,len(nodes)-1) if refs[nodes[k][0]] > 1] + [len(nodes)-1]
+        for a, b in zip(cuts, cuts[1:]):
+            pts = xy[a:b+1]
+            pts = pts[np.r_[True, np.linalg.norm(np.diff(pts,axis=0),axis=1)>0.01]]
+            if len(pts)<2:
+                continue
+            line = LineString(pts)
+            if line.length < .1:
+                continue
+            width = road_width(tags)
+            seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': pts.tolist(),
+                   'nodes': [nodes[a][0],nodes[b][0]], 'width': width}
+            segments.append(seg)
+            for end in (0,1):
+                p = pts if end == 0 else pts[::-1]
+                d = p[1]-p[0]; d /= np.linalg.norm(d)
+                mouths[seg['nodes'][end]].append((seg['id'],end,p[0].tolist(),d.tolist(),width,line.length))
+    del roads, refs
+    tmp = target / f'sources.{os.getpid()}.tmp'
+    db = sqlite3.connect(tmp)
+    db.executescript('''CREATE TABLE features(id INTEGER PRIMARY KEY, kind TEXT, data TEXT, geom BLOB);
+        CREATE VIRTUAL TABLE bounds USING rtree(id,x0,x1,y0,y1);
+        CREATE TABLE nodes(id INTEGER PRIMARY KEY, data TEXT);
+        CREATE TABLE links(node INTEGER, segment INTEGER);
+        CREATE INDEX links_node ON links(node);''')
+    def put(fid, kind, data, geom, pad=0):
+        x0,y0,x1,y1 = geom.bounds
+        db.execute('INSERT INTO features VALUES(?,?,?,?)',(fid,kind,json.dumps(data,separators=(',',':')),geom.wkb))
+        db.execute('INSERT INTO bounds VALUES(?,?,?,?,?)',(fid,x0-pad,x1+pad,y0-pad,y1+pad))
+    cutbacks = {}
+    for nid, entries in mouths.items():
+        # Complete shared node ownership; endpoints use square caps, junctions shared mouths.
+        radius = max(e[4] for e in entries)*.8 if len(entries)>1 else 0.
+        corners = []
+        level = 0.
+        for sid, end, pos, direction, width, length in entries:
+            tags = segments[sid-1]['tags']
+            if tags.get('bridge') not in (None,'no'):
+                level = max(level, max(1,number(tags.get('layer'),1))*6.5)
+            cut = min(radius, length*.25)
+            cutbacks[sid,end] = cut
+            line = LineString(segments[sid-1]['xy'])
+            s = cut if end == 0 else line.length-cut
+            p = np.array(line.interpolate(s).coords[0])
+            d = np.array(line.interpolate(min(line.length,s+.25)).coords[0])-np.array(line.interpolate(max(0,s-.25)).coords[0])
+            d /= max(1e-9,np.linalg.norm(d))
+            normal = np.array([-d[1],d[0]])*width/2
+            corners.extend([(p+normal).tolist(),(p-normal).tolist()])
+            db.execute('INSERT INTO links VALUES(?,?)',(nid,sid))
+        data = {'xy': entries[0][2], 'raise': level, 'segments': [e[0] for e in entries]}
+        db.execute('INSERT INTO nodes VALUES(?,?)',(nid,json.dumps(data)))
+        if len(entries)>1:
+            polygon = MultiPoint(corners).convex_hull
+            if polygon.area > .01:
+                put(-nid,'junction',dict(data,node=nid),polygon)
+    for seg in segments:
+        seg['cuts'] = [cutbacks[seg['id'],0],cutbacks[seg['id'],1]]
+        # Bounds include end mouths so a query always includes the owning segment.
+        put(seg['id'],'road',seg,LineString(seg['xy']),seg['width']/2+1)
+    db.commit(); db.close()
+    meta = {'id':identity,'generator':VERSION,'bbox':index['package_box'],'center':[30.52,50.45],
+            'dem':str(Path(dem).resolve()), 'source':str(Path(source).resolve()),
+            'coverage':[v['coverage'] for v in index['tiles'].values()],
+            'seconds':time.perf_counter()-started,'roads':len(segments),'scenery':'lazy from raw OSM'}
+    (target/'region.json').write_text(json.dumps(meta),encoding='utf8')
+    os.replace(tmp,final)
+    emit(f'index ready: {meta["seconds"]:.1f}s, {len(segments)} segments')
+    return target, meta
+
+
+class Store:
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self.meta = json.loads((self.directory/'region.json').read_text())
+        self.db = sqlite3.connect((self.directory/'sources.sqlite').as_uri()+'?mode=ro',uri=True)
+        self.frame = Frame()
+        self.terrain = Terrain(self.meta['dem'],self.frame)
+        from shapely.geometry import box
+        self.coverage = shapely.union_all([box(*r) for r in self.meta['coverage']])
+        self.heights = OrderedDict()
+        self.scenes = OrderedDict()
+        self.source_index = json.loads((Path(self.meta['source'])/'index.json').read_text())
+
+    def query(self, rect, kinds=None):
+        x0,y0,x1,y1=rect
+        rows = self.db.execute('''SELECT f.id,f.kind,f.data,f.geom FROM bounds b JOIN features f ON f.id=b.id
+            WHERE b.x1>=? AND b.x0<=? AND b.y1>=? AND b.y0<=? ORDER BY f.id''',(x0,x1,y0,y1))
+        return [(fid,kind,json.loads(data),shapely.from_wkb(geom)) for fid,kind,data,geom in rows
+                if kinds is None or kind in kinds]
+
+    def node(self, nid):
+        return json.loads(self.db.execute('SELECT data FROM nodes WHERE id=?',(nid,)).fetchone()[0])
+
+    def height(self, nid):
+        if nid in self.heights:
+            self.heights.move_to_end(nid)
+            return self.heights[nid]
+        n = self.node(nid)
+        h = float(self.terrain.sample([n['xy']],smooth=True)[0]+n['raise']+.12)
+        self.heights[nid] = h
+        if len(self.heights)>8192:
+            self.heights.popitem(last=False)
+        return h
+
+    def covered(self, rect):
+        from shapely.geometry import box
+        return self.coverage.covers(box(*self.frame.geo_bbox(rect)))
+
+    def scenery(self, rect):
+        """Load only the raw OSM block needed now, including multipolygon holes.
+
+        This work is timed in scene jobs, never hidden in a prebuilt city asset.
+        """
+        import osmium
+        import osm_tiles
+        bbox=self.frame.geo_bbox(rect)
+        hit=osm_tiles.tile_for(self.source_index,bbox)
+        if not hit:
+            raise ValueError(f'no_osm scenery coverage: {bbox}')
+        key,entry=hit
+        if key not in self.scenes:
+            found={}; factory=osmium.geom.GeoJSONFactory()
+            class Reader(osmium.SimpleHandler):
+                def area(self,a):
+                    kind='building' if a.tags.get('building') not in (None,'no') else (
+                        'water' if a.tags.get('natural')=='water' or a.tags.get('waterway')=='riverbank' else None)
+                    if kind and a.id not in found:
+                        found[a.id]=(kind,dict(a.tags),shape(json.loads(factory.create_multipolygon(a))))
+            Reader().apply_file(str(Path(self.meta['source'])/entry['file']),locations=True)
+            ordered=sorted(found.items())
+            geoms=shapely.make_valid(shapely.transform([v[1][2] for v in ordered],self.frame.local,interleaved=False))
+            records=[(fid,kind,{'tags':tags},geom) for (fid,(kind,tags,_)),geom in zip(ordered,geoms)]
+            self.scenes[key]=(records,shapely.STRtree(geoms))
+            if len(self.scenes)>4: self.scenes.popitem(last=False)
+        self.scenes.move_to_end(key)
+        records,tree=self.scenes[key]
+        from shapely.geometry import box
+        return [records[int(k)] for k in sorted(tree.query(box(*rect)))]

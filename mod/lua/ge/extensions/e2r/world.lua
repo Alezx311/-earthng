@@ -102,6 +102,7 @@ local function land()
   if not S.marker then return end
   S.landSeq = request({type = 'land', lat = S.marker.lat, lon = S.marker.lon})
   S.landAt = S.now
+  S.landTimer = hptimer()
   S.state = 'generating'
   result.landRequestedAt = S.now
   saveResult()
@@ -112,10 +113,13 @@ end
 -- f32 pos[3v], f32 normal[3v], f32 uv[2v], u32 index[i]. ffi.cast is a no-op in game Lua, so the
 -- bytes are copied into a uint32 and a float buffer and indexed by 4-byte word.
 local function binMeshes(path, pause)
+  local t = hptimer()
   local f = io.open(path, 'rb')
   if not f then return nil end
   local data = f:read('*all')
   f:close()
+  local ms = t:stop()
+  if ms > (result.readMs or 0) then result.readMs, result.readItem = ms, path end
   local words = #data / 4
   local u = ffi.new('uint32_t[?]', words)
   ffi.copy(u, data, #data)
@@ -151,14 +155,18 @@ end
 local function spawnItem(it, group, pause)
   if it.kind == 'proc' then
     local meshes = binMeshes(it.shape, pause)
-    if not meshes then return end
+    if not meshes then error('missing mesh: ' .. tostring(it.shape)) end
     pause()
+    -- the one call that cannot yield: its worst case is the floor of a frame's streaming cost
+    local t = hptimer()
     local obj = createObject('ProceduralMesh')
     obj:registerObject(it.name)
     obj.canSave = false
     group:addObject(obj.obj)
     obj:createMesh({meshes})
     obj:setPosition(vec3(it.pos[1], it.pos[2], it.pos[3]))
+    local ms = t:stop()
+    if ms > (result.createMeshMs or 0) then result.createMeshMs, result.createMeshItem = ms, it.name end
   else
     local obj = createObject('TSStatic')
     obj:setField('shapeName', 0, it.shape)
@@ -194,13 +202,40 @@ end
 local function frameStats(list)
   local worst, total = 0, 0
   for _, dt in ipairs(list) do worst, total = math.max(worst, dt), total + dt end
-  return {frames = #list, worstFrameMs = worst, meanFrameMs = #list > 0 and total / #list or 0}
+  local sorted = {}
+  for k, dt in ipairs(list) do sorted[k] = dt end
+  table.sort(sorted)
+  return {frames = #list, worstFrameMs = worst, meanFrameMs = #list > 0 and total / #list or 0,
+          p99FrameMs = sorted[math.max(1, math.ceil(#sorted * 0.99))] or 0}
+end
+
+-- The whole driving phase, however long: 0.5 ms bins up to 1 s (p99 without keeping every frame).
+local function newAcc() return {n = 0, total = 0, worst = 0, over33 = 0, over100 = 0, bins = {}, worstAt = 0} end
+
+local function accFrame(acc, ms, now)
+  acc.n, acc.total = acc.n + 1, acc.total + ms
+  if ms > acc.worst then acc.worst, acc.worstAt = ms, now end
+  if ms > 33.3 then acc.over33 = acc.over33 + 1 end
+  if ms > 100 then acc.over100 = acc.over100 + 1 end
+  local b = math.min(2000, math.floor(ms * 2))
+  acc.bins[b] = (acc.bins[b] or 0) + 1
+end
+
+local function accStats(acc)
+  local need, seen, p99 = math.ceil(acc.n * 0.99), 0, 0
+  for b = 0, 2000 do
+    seen = seen + (acc.bins[b] or 0)
+    if seen >= need then p99 = (b + 1) / 2; break end
+  end
+  return {frames = acc.n, meanFrameMs = acc.n > 0 and acc.total / acc.n or 0, p99FrameMs = p99,
+          worstFrameMs = acc.worst, worstAt = acc.worstAt, over33 = acc.over33, over100 = acc.over100}
 end
 
 -- --- tile streaming ------------------------------------------------------------------------------
 -- S.stream: the companion's stream status (region, tile size, ready tiles). S.tiles[key]:
 -- {state = 'loading'|'loaded', i, j, manifest, group}. S.queue: items of loading tiles, in order.
 local function focus()
+  if S.replayPose then return S.replayPose.p, S.replayPose.v end
   if S.state == 'driving' then
     local veh = getPlayerVehicle(0)
     if veh then
@@ -242,8 +277,14 @@ local function writePose()
       end
     end
   end
+  local active = {}
+  for key, tile in pairs(S.tiles) do
+    active[key] = tile.failed and 'error' or (tile.collided and 'collision_active' or
+      (tile.roadComplete and 'loaded' or 'loading'))
+  end
   jsonWriteFile('e2r_world/pose.json', {x = p.x, y = p.y, z = p.z, vx = v.x, vy = v.y, t = os.time(),
-    region = S.stream and S.stream.region, state = S.state, ahead = ahead}, false)
+    region = S.stream and S.stream.region, state = S.state, ahead = ahead,
+    active = active, deliveryP99 = S.deliveryP99 or 2}, false)
 end
 
 -- Every tile's materials file defines all of the region's shared names. Loading a file re-creates
@@ -277,10 +318,22 @@ local function startTile(key, i, j)
   if not ok or type(manifest) ~= 'table' then return end
   loadNewMaterials(manifest.materials)
   local tile = {state = 'loading', i = i, j = j, manifest = manifest, group = tileGroup('E2RT_' .. key),
-                left = #manifest.items, startedAt = S.now}
+                left = #manifest.items, roadLeft = #manifest.items, startedAt = S.now}
   S.tiles[key] = tile
   for _, it in ipairs(manifest.items) do table.insert(S.queue, {tile = tile, key = key, item = it}) end
-  if #manifest.items == 0 then tile.state = 'loaded' end
+  if #manifest.items == 0 then tile.state = 'loaded'; tile.roadComplete = true end
+end
+
+local function startScene(key, tile)
+  local path = string.format('/e2r_stream/%s/tiles/%s.scene.json', S.stream.region, key)
+  local ok, manifest = pcall(jsonReadFile, path)
+  if not ok or type(manifest) ~= 'table' or manifest.source ~= S.stream.region then return end
+  loadNewMaterials(manifest.materials)
+  tile.sceneStarted = true
+  tile.sceneLeft = #manifest.items
+  tile.sceneComplete = tile.sceneLeft == 0
+  tile.left = tile.left + #manifest.items
+  for _, it in ipairs(manifest.items) do table.insert(S.queue, {tile = tile, key = key, item = it, scene = true}) end
 end
 
 local function updateTiles()
@@ -288,14 +341,18 @@ local function updateTiles()
   if not (S.stream and st and st.region == S.stream.region) then return end
   local p, v = focus()
   if not p then return end
+  local fast = st.generator ~= nil
+  local loadR = fast and (st.loadRadius or 1000) or LOAD_R
+  local unloadR = fast and loadR + 750 or UNLOAD_R
   -- unload far tiles (their queued items are skipped)
   for key, tile in pairs(S.tiles) do
     local cx, cy = tileCentre(tile.i, tile.j)
-    if math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) > UNLOAD_R then
+    if math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) > unloadR then
       dropGroup('E2RT_' .. key)
       S.tiles[key] = nil
       tile.dropped = true
       S.collisionDirty = true
+      S.removedCollision = true
       result.unloaded = (result.unloaded or 0) + 1
     end
   end
@@ -309,16 +366,32 @@ local function updateTiles()
       i, j = tonumber(i), tonumber(j)
       local cx, cy = tileCentre(i, j)
       local d = math.min(math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2), math.sqrt((cx - ax) ^ 2 + (cy - ay) ^ 2))
-      if d <= LOAD_R and (not bestD or d < bestD) then best, bestD = {key, i, j}, d end
+      if d <= loadR and (not bestD or d < bestD) then best, bestD = {key, i, j}, d end
     end
   end
   if best and #S.queue < 400 then startTile(best[1], best[2], best[3]) end
+  if fast and not best and #S.queue < 100 then
+    for key, tile in pairs(S.tiles) do
+      if tile.collided and not tile.sceneStarted and st.scenes and st.scenes[key] then
+        startScene(key, tile)
+        break
+      end
+    end
+  end
+  if fast then
+    -- Reprioritize pending work when direction changes; no scene object can block roads.
+    table.sort(S.queue, function(a, b)
+      if (not not a.scene) ~= (not not b.scene) then return not a.scene end
+      return ((st.wanted or {})[a.key] or math.huge) < ((st.wanted or {})[b.key] or math.huge)
+    end)
+  end
 end
 
 local function stepQueue()
   local frame = hptimer()
   local function over() return frame:stop() >= BUDGET_MS end
   local function pause() if over() then coroutine.yield() end end
+  if S.co and S.job and S.job.tile.dropped then S.co, S.job = nil, nil end
   repeat
     if not S.co then
       local job = table.remove(S.queue, 1)
@@ -327,21 +400,46 @@ local function stepQueue()
       S.job = job
       S.co = coroutine.create(function(p) spawnItem(job.item, job.tile.group, p) end)
     end
+    -- a resume far over the budget: is it the collector (Lua heap shrinks inside it)?
+    local kb0, t0 = collectgarbage('count'), hptimer()
     local ok, err = coroutine.resume(S.co, pause)
+    local resumeMs = t0:stop()
+    if resumeMs > 30 then
+      result.slowResumes = result.slowResumes or {}
+      if #result.slowResumes < 40 then
+        table.insert(result.slowResumes, {math.floor(S.now * 10) / 10, math.floor(resumeMs), math.floor(kb0),
+                                          math.floor(collectgarbage('count')), S.job.item.name})
+      end
+    end
     if not ok then
       log('E', logTag, tostring(err))
       result.errors = (result.errors or 0) + 1
+      S.job.tile.failed = true
     end
     if coroutine.status(S.co) == 'dead' then
       S.co = nil
       local tile = S.job.tile
       tile.left = tile.left - 1
-      if tile.left <= 0 and not tile.dropped then
+      if not S.job.scene then tile.roadLeft = tile.roadLeft - 1 end
+      if S.job.scene then
+        tile.sceneLeft = tile.sceneLeft - 1
+        tile.sceneComplete = tile.sceneLeft == 0 and not tile.failed
+      end
+      if tile.roadLeft <= 0 and not tile.dropped and not tile.failed and not tile.roadComplete then
+        tile.roadComplete = true
         tile.state = 'loaded'
         tile.loadSeconds = S.now - tile.startedAt
         S.collisionDirty = true
         result.tilesLoaded = (result.tilesLoaded or 0) + 1
+        S.deliveryTimes = S.deliveryTimes or {}
+        table.insert(S.deliveryTimes, tile.loadSeconds)
+        if #S.deliveryTimes > 128 then table.remove(S.deliveryTimes, 1) end
+        local sorted = {}
+        for k, value in ipairs(S.deliveryTimes) do sorted[k] = value end
+        table.sort(sorted)
+        S.deliveryP99 = sorted[math.ceil(#sorted * .99)]
       end
+      if S.job.scene and not tile.dropped then S.collisionDirty = true; S.removedCollision = true end
     end
   until over()
 end
@@ -353,12 +451,14 @@ end
 local COLLISION_R = 450
 local function updateCollision()
   if not S.collisionDirty or S.now - S.collisionAt < COLLISION_EVERY then return end
-  local p = focus()
-  local near = false
+  local p, v = focus()
+  local fast = S.stream and S.stream.generator
+  local radius = fast and math.max(750, (v and v:length() or 0) * ((S.deliveryP99 or 2) + 4) + 354) or COLLISION_R
+  local near = S.removedCollision or false
   for _, tile in pairs(S.tiles) do
     if tile.state == 'loaded' and not tile.collided and not (tile.manifest.empty or #tile.manifest.items == 0) then
       local cx, cy = tileCentre(tile.i, tile.j)
-      if not p or math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) <= COLLISION_R then near = true; break end
+      if not p or math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) <= radius then near = true; break end
     end
   end
   if not near then return end
@@ -368,15 +468,16 @@ local function updateCollision()
   result.reloadCollisionMs = math.max(result.reloadCollisionMs or 0, ms)
   result.collisionReloads = (result.collisionReloads or 0) + 1
   for _, tile in pairs(S.tiles) do
-    if tile.state == 'loaded' then tile.collided = true end
+    if tile.roadComplete and not tile.failed then tile.collided = true end
   end
   S.collisionDirty, S.collisionAt = false, S.now
+  S.removedCollision = false
 end
 
 local function tileLoadedAt(x, y)
   local i, j = tileOf(x, y)
   local t = S.tiles[i .. '_' .. j]
-  return t and t.state == 'loaded' and (t.collided or t.manifest.empty or #t.manifest.items == 0)
+  return t and not t.failed and t.roadComplete and t.collided and t.manifest.drivable ~= false
 end
 
 -- --- arrival ------------------------------------------------------------------------------------
@@ -393,7 +494,7 @@ local function beginArrival(job)
   -- leave the previous region
   for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); tile.dropped = true end
   S.tiles, S.queue, S.co = {}, {}, nil
-  S.stream = {region = job.region, tile = job.tileSize}
+  S.stream = {region = job.region, tile = job.tileSize, generator = job.generator}
   S.landing = manifest
   S.knownMats = {}
   loadNewMaterials(manifest.materials)
@@ -429,7 +530,9 @@ local function touchDown()
   end
   commands.setGameCamera()
   S.state, S.phaseAt = 'driving', S.now
+  S.driveAcc = newAcc()
   result.landedAt = S.now
+  result.startupSeconds = S.landTimer and S.landTimer:stop() / 1000 or S.now - S.landAt
   saveResult()
 end
 
@@ -666,11 +769,11 @@ end
 local function runTest()
   -- automation: pick, land, drive (straight, or the route with the autopilot), screenshots
   local t = S.now - (S.phaseAt or 0)
-  if S.state == 'pick' and not S.testPicked and S.tex and t > 3 then
+  if S.state == 'pick' and not S.testPicked and (S.tex or test.skipMap) and t > 3 then
     shot('1-picker')
     goTo(test.lat, test.lon, 15)
     S.testPicked, S.phaseAt = S.now, S.now
-  elseif S.state == 'pick' and S.testPicked and not S.testLanded and S.texView and S.texView.zoom == 15 and t > 2 then
+  elseif S.state == 'pick' and S.testPicked and not S.testLanded and (test.skipMap or (S.texView and S.texView.zoom == 15)) and t > 2 then
     shot('2-marker')
     S.testLanded = true
     land()
@@ -678,12 +781,24 @@ local function runTest()
     local veh = getPlayerVehicle(0)
     local p = veh:getPosition()
     result.vehicleSettled = {p.x, p.y, p.z}
+    -- a first-run dialog over the game pauses the simulation (fast-game-02 stood still under one)
+    local okR, cur = pcall(function() return extensions.ui_router.getCurrent() end)
+    result.uiRoute = okR and cur and cur.request and cur.request.name or nil
+    local okP, paused = pcall(function() return simTimeAuthority.getPause() end)
+    result.simPaused = okP and paused or nil
     shot('4-landed')
     S.testDriving, S.frames = S.now, {}
     if test.route then
       local ok, route = pcall(jsonReadFile, test.route)
       if ok and route then
-        autopilotStart(route, test.speed)
+        if test.replay then
+          S.replay = {points = route.points, idx = 1, along = 0, distance = 0, speed = test.speed or 83.333}
+          result.replay = true
+          result.deadlineMisses = {}
+          commands.setFreeCamera()
+        else
+          autopilotStart(route, test.speed)
+        end
         result.route = {points = #route.points, length = route.length}
       end
     else
@@ -693,16 +808,26 @@ local function runTest()
   elseif S.testDriving and not S.testDone then
     local veh = getPlayerVehicle(0)
     local p = veh:getPosition()
+    -- straight drive: horizontal distance actually covered by the car
+    if not S.replay then
+      if S.lastP then S.travelled = (S.travelled or 0) + math.sqrt((p.x - S.lastP.x) ^ 2 + (p.y - S.lastP.y) ^ 2) end
+      S.lastP = vec3(p.x, p.y, p.z)
+    end
+    if AP and AP.waiting then result.waitSeconds = (result.waitSeconds or 0) + (S.dt or 0) end
     if S.now - (S.traceAt or 0) > 1 then
       S.traceAt = S.now
       local loaded, loading = countTiles()
-      table.insert(S.trace, {math.floor(S.now), math.floor(p.x), math.floor(p.y), math.floor(p.z * 10) / 10,
-                             math.floor(veh:getVelocity():length() * 10) / 10, loaded, loading, AP and math.floor(AP.travelled) or 0,
+      -- the replay's trace is the synthetic pose, not the parked car
+      local tp, speed = p, veh:getVelocity():length()
+      if S.replayPose then tp, speed = S.replayPose.p, S.replayPose.v:length() end
+      table.insert(S.trace, {math.floor(S.now), math.floor(tp.x), math.floor(tp.y), math.floor(tp.z * 10) / 10,
+                             math.floor(speed * 10) / 10, loaded, loading, AP and math.floor(AP.travelled) or math.floor(S.travelled or 0),
                              AP and AP.offRoute and math.floor(AP.offRoute) or -1, AP and AP.waiting and AP.aheadKey or '',
                              AP and AP.idx or 0})
+      if #S.trace > 4000 then table.remove(S.trace, 1) end
       result.trace = S.trace
-      result.driveFrames = frameStats(S.frames)
-      if p.z < (S.lowestZ or math.huge) then S.lowestZ = p.z; result.lowestZ = p.z end
+      result.driveFrames = accStats(S.driveAcc)
+      if not S.replay and p.z < (S.lowestZ or math.huge) then S.lowestZ = p.z; result.lowestZ = p.z end
       saveResult()
     end
     if AP and AP.travelled / 1000 >= S.nextShotKm then
@@ -713,17 +838,71 @@ local function runTest()
     if (AP and (AP.done or S.now - S.testDriving > limit)) or (not AP and S.now - S.testDriving > limit) then
       veh:queueLuaCommand("input.event('throttle', 0, 2) input.event('brake', 1, 2)")
       result.vehicleAfterDrive = {p.x, p.y, p.z, veh:getVelocity():length()}
-      result.driveFrames = frameStats(S.frames)
-      if AP then result.travelledM, result.routeDone = AP.travelled, AP.done or false end
+      result.driveFrames = accStats(S.driveAcc)
+      result.travelledM = AP and AP.travelled or S.travelled or 0
+      if AP then result.routeDone = AP.done or false end
       shot('5-driving')
+      -- 'passed' only when every gate holds; finishing the timer alone is not a result
+      local f = {}
+      if result.uiRoute and result.uiRoute ~= 'play' then table.insert(f, 'ui_route_' .. tostring(result.uiRoute)) end
+      if result.simPaused then table.insert(f, 'sim_paused') end
+      if S.replay then
+        if #(result.deadlineMisses or {}) > 0 then table.insert(f, 'deadline_misses') end
+        local want = (S.replay.speed or 0) * limit * 0.95
+        if (result.replayDistanceM or 0) < want then table.insert(f, 'replay_short') end
+      else
+        if result.travelledM < (test.minDistance or 20) then table.insert(f, 'not_moved') end
+        if result.vehicleSettled and S.lowestZ and S.lowestZ < result.vehicleSettled[3] - 30 then table.insert(f, 'fell') end
+        if AP and (AP.assists or 0) > 0 then table.insert(f, 'assists') end
+        if (result.waitSeconds or 0) > 0 then table.insert(f, 'waited_for_tiles') end
+      end
+      if result.driveFrames.over100 > 0 then table.insert(f, 'frame_over_100ms') end
+      if (result.errors or 0) > 0 then table.insert(f, 'spawn_errors') end
+      result.failures = f
       AP = nil
       S.testDone = S.now
     end
   elseif S.testDone and S.now - S.testDone > 2 then
-    result.status = 'complete'
+    result.status = #result.failures == 0 and 'passed' or 'failed'
     saveResult()
     shutdown(0)
   end
+end
+
+local function replayStep(dt)
+  local r = S.replay
+  if not r then return end
+  r.distance = r.distance + r.speed * dt
+  local pts = r.points
+  while r.idx < #pts do
+    local a,b = pts[r.idx],pts[r.idx+1]
+    local len = math.sqrt((b[1]-a[1])^2+(b[2]-a[2])^2)
+    if r.along+len > r.distance then break end
+    r.along = r.along+len
+    r.idx = r.idx+1
+  end
+  if r.idx >= #pts then
+    -- turn round and drive the route back (a long soak keeps moving; tiles behind get revisited)
+    result.replayDone = true
+    result.replayLaps = (result.replayLaps or 0) + 1
+    local back = {}
+    for k = #pts, 1, -1 do back[#back + 1] = pts[k] end
+    r.points, r.idx, r.along, r.lapStart = back, 1, r.distance, r.distance
+    pts = back
+  end
+  local a,b = pts[r.idx],pts[r.idx+1]
+  local d = vec3(b[1]-a[1],b[2]-a[2],0):normalized()
+  local p = vec3(a[1],a[2],200)+d*(r.distance-r.along)
+  S.replayPose = {p=p,v=d*r.speed}
+  local q = quatFromDir(vec3(d.x,d.y,-.45),vec3(0,0,1))
+  core_camera.setPosRot(0,p.x-d.x*30,p.y-d.y*30,240,q.x,q.y,q.z,q.w)
+  local i,j = tileOf(p.x,p.y)
+  local key = i .. '_' .. j
+  if not tileLoadedAt(p.x,p.y) and S.lastMiss ~= key then
+    table.insert(result.deadlineMisses,{seconds=S.now-S.testDriving,tile=key,distance=r.distance})
+    S.lastMiss = key
+  end
+  result.replayDistanceM = r.distance
 end
 
 function M.onUpdate(dtReal)
@@ -731,9 +910,10 @@ function M.onUpdate(dtReal)
     S.state = 'off'
     return
   end
-  S.now = S.now + dtReal
+  S.now, S.dt = S.now + dtReal, dtReal
   local frameMs = frameTimer:stopAndReset()
   table.insert(S.frames, frameMs)
+  if S.driveAcc and S.state == 'driving' then accFrame(S.driveAcc, frameMs, S.now) end
   if frameMs > 300 and S.stream then
     result.hitches = result.hitches or {}
     if #result.hitches < 60 then table.insert(result.hitches, {math.floor(S.now), math.floor(frameMs), S.state}) end
@@ -774,7 +954,8 @@ end
 
 function M.tick(dt)
   readStatus()
-  if S.state == 'pick' and S.viewDirty and S.now - S.lastViewAt > 0.25 then requestView() end
+  replayStep(dt)
+  if S.state == 'pick' and S.viewDirty and S.now - S.lastViewAt > 0.25 and not (test and test.skipMap) then requestView() end
   if S.state == 'generating' then
     local job = S.status and S.status.job
     if job and job.seq == S.landSeq and job.state == 'ready' then beginArrival(job) end
@@ -808,7 +989,25 @@ function M.tick(dt)
     local loaded = countTiles()
     cameraOver(CAM_HIGH + (CAM_LOW - CAM_HIGH) * math.min(1, loaded / 4))
     -- touch down once the landing tile is in and its collision has been rebuilt a while ago
-    if tileLoadedAt(sp[1], sp[2]) and S.collisionAt > 0 and S.now - S.collisionAt > 1.5 then
+    local buffered = true
+    if S.stream.generator then
+      local li,lj = tileOf(sp[1],sp[2])
+      local landingTile = S.tiles[li .. '_' .. lj]
+      if not landingTile or not landingTile.sceneComplete then buffered = false end
+      for x = sp[1]-500, sp[1]+500, 250 do
+        for y = sp[2]-500, sp[2]+500, 250 do
+          local i,j = tileOf(x,y)
+          local t = S.tiles[i .. '_' .. j]
+          if not t or t.failed or not t.roadComplete or (#t.manifest.items > 0 and not t.collided) then buffered = false end
+        end
+      end
+      if S.landTimer and S.landTimer:stop() > 120000 then
+        result.startupFailed = true
+        S.lastError = 'Startup exceeded 120 seconds'
+        if test then result.status = 'failed'; saveResult(); shutdown(1) end
+      end
+    end
+    if buffered and tileLoadedAt(sp[1], sp[2]) and S.collisionAt > 0 and S.now - S.collisionAt > 0.2 then
       result.spawnFrames = frameStats(S.frames)
       result.spawnSeconds = S.now - S.phaseAt
       S.frames = {}

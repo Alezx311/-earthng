@@ -9,6 +9,7 @@ param(
     [string]$Tiles = "$PSScriptRoot\data\osm_tiles\kyiv-260918",
     [string]$UserFolder = "$env:LOCALAPPDATA\BeamNG\BeamNG.drive\current",
     [int]$Workers = 8,
+    [ValidateSet('v2', 'fast')][string]$Generator = 'v2',
     [switch]$NoGame
 )
 $env:EARTH2ROAD = $Earth2Road
@@ -16,4 +17,4 @@ $py = Join-Path $Earth2Road '.venv\Scripts\python.exe'
 & $py (Join-Path $PSScriptRoot 'earthng\build_mod.py') --out (Join-Path $PSScriptRoot 'out\mod') --install $UserFolder
 if (-not $NoGame) { Start-Process 'steam://rungameid/284160' }
 Write-Host 'Companion is running. In BeamNG: Freeroam -> Earth2Road planet level. Ctrl+C here to stop.'
-& $py (Join-Path $PSScriptRoot 'earthng\world_server.py') --tiles $Tiles --userfolder $UserFolder --workers $Workers
+& $py (Join-Path $PSScriptRoot 'earthng\world_server.py') --tiles $Tiles --userfolder $UserFolder --workers $Workers --generator $Generator
