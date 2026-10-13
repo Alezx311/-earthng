@@ -500,6 +500,26 @@ local function tileLoadedAt(x, y)
   return t and not t.failed and t.roadComplete and t.collided and t.manifest.drivable ~= false
 end
 
+-- --- texture packs (fast generator) -----------------------------------------------------------------
+-- packs.json (earthng/fast_art.py): pack -> material -> stage-0 fields. A switch rewrites the
+-- fields of the loaded materials in place; no tile is rebuilt or reloaded.
+local PACK_NAMES = {{'real', 'Реальний'}, {'toon', 'Мультяшний'}, {'model', 'Макет'}}
+
+local function applyPack(name)
+  local pack = S.packs and S.packs[name]
+  if not pack then return end
+  local timer = hptimer()
+  for matName, fields in pairs(pack) do
+    local mat = scenetree.findObject(matName)
+    if mat then
+      for field, value in pairs(fields) do mat:setField(field, 0, value) end
+      mat:reload()
+    end
+  end
+  S.pack = name
+  result.pack, result.packSwitchMs = name, timer:stop()
+end
+
 -- --- arrival ------------------------------------------------------------------------------------
 local function cameraOver(height)
   local sp = S.landing.spawn.pos
@@ -518,6 +538,11 @@ local function beginArrival(job)
   S.landing = manifest
   S.knownMats = {}
   loadNewMaterials(manifest.materials)
+  if manifest.packs and FS:fileExists(manifest.packs) then
+    local okP, packs = pcall(jsonReadFile, manifest.packs)
+    S.packs = okP and packs or nil
+    if S.pack and S.pack ~= 'real' then applyPack(S.pack) end   -- keep the player's choice
+  end
   commands.setFreeCamera()
   cameraOver(CAM_HIGH)
   -- one visible triangle per material: texture upload and pipeline creation happen now, high up,
@@ -739,6 +764,13 @@ local function drawWindow()
     if AP then
       im.Text(string.format('Автопілот: %.1f км%s', AP.travelled / 1000, AP.waiting and ' (чекаю тайл)' or ''))
     end
+    if S.packs then
+      im.Text('Стиль:')
+      for _, p in ipairs(PACK_NAMES) do
+        im.SameLine()
+        if im.Button(p[2] .. (S.pack == p[1] and ' *' or '')) then applyPack(p[1]) end
+      end
+    end
     if im.Button('Обрати інше місце') then S.state = 'pick' end
     im.End()
     return
@@ -926,7 +958,17 @@ local function runTest()
   elseif S.overviewShot and not S.overviewTaken and S.now - S.overviewShot > 1.5 then
     shot('6-overview')
     S.overviewTaken = S.now
-  elseif S.overviewTaken and S.now - S.overviewTaken > 1 then
+    S.packQueue = test.packs and S.packs and {'toon', 'model', 'real'} or nil
+  elseif S.packQueue and #S.packQueue > 0 and S.now - S.overviewTaken > 1.5 then
+    -- the same view in every pack (test.packs), then back to the default
+    local name = table.remove(S.packQueue, 1)
+    applyPack(name)
+    S.overviewTaken = S.now
+    if name ~= 'real' then S.packShot = name end
+  elseif S.packShot and S.now - S.overviewTaken > 1 then
+    shot('7-pack-' .. S.packShot)
+    S.packShot = nil
+  elseif S.overviewTaken and not (S.packQueue and #S.packQueue > 0) and not S.packShot and S.now - S.overviewTaken > 1 then
     result.status = #result.failures == 0 and 'passed' or 'failed'
     saveResult()
     shutdown(0)

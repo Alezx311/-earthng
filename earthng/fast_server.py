@@ -94,6 +94,8 @@ def server_class(base):
 
         def prepare_landing(self,req,generation):
             try:
+                import fast_art
+                fast_art.ensure(self.user)          # facades and texture packs, ~0.3 s once
                 directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,
                                               emit=lambda msg: print(msg,flush=True))
                 frame=sources.Frame(); i,j=frame.tile_of(req['lon'],req['lat'])

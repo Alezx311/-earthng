@@ -113,10 +113,13 @@ KINDS = {
     'water':       (None,            [.12, .29, .38, 1], 'MUD',     8.0, 'plan'),
     'roof':        ('roof',          [.32, .31, .30, 1], 'ROCK',    6.0, 'plan'),
     'forest':      ('grass',         [.20, .30, .16, 1], 'GRASS',   8.0, 'plan'),
+    'curb':        ('concrete',      [.70, .70, .68, 1], 'ASPHALT', 1.0, 'plan'),
 }
+ART = '/e2r_stream/fast-art/v2'      # fast_art.ensure writes the facades there
 WALLS = ('panel', 'precast', 'brick', 'brick_red', 'brick_white', 'plaster', 'stucco', 'glass', 'windows', 'block')
 for w in WALLS:
-    KINDS['wall_' + w] = (w, [.58, .55, .49, 1], 'ROCK', 4.0 if w not in ('panel', 'glass') else 6.0, 'wall')
+    # walls carry their own UVs (one 3 m window cell per repeat, floors from the base)
+    KINDS['wall_' + w] = (w, [.58, .55, .49, 1], 'ROCK', 3.0, 'wall')
 
 
 # baseColorFactor per kind: the game's grass is dry West Coast grass; Kyiv's is green
@@ -149,13 +152,20 @@ TREES = ['/assets/meshes/foliage/trees_library/beech/tree_beech_forest_a.dae',
          '/assets/meshes/foliage/trees_library/birch/tree_aspen_small_b.dae',
          '/assets/meshes/foliage/trees_library/oak/tree_oak_forest_a.dae',
          '/assets/meshes/foliage/trees_library/oak/tree_oak_sml_a.dae']
+LAMP = '/art/shapes/objects/lamp1.dae'     # the street lamp roadgen-v2 used
 TREE_SPACING = {'forest': 9.0, 'park': 16.0}
 TREES_PER_TILE = 400
 
 
 def material(kind):
     tex, colour, ground, _, _ = KINDS[kind]
-    stage = dict(TEXTURES[tex]) if tex else {'diffuseColor': colour}
+    if kind.startswith('wall_'):
+        w = kind[5:]
+        stage = {'baseColorMap': f'{ART}/real/{w}.color.png'}
+        if 'normalMap' in TEXTURES[w]:
+            stage['normalMap'] = TEXTURES[w]['normalMap']
+    else:
+        stage = dict(TEXTURES[tex]) if tex else {'diffuseColor': colour}
     if kind in TINT:
         stage['baseColorFactor'] = TINT[kind]
     return {'name': 'e2rf_' + kind, 'mapTo': 'e2rf_' + kind, 'class': 'Material', 'version': 1.5,
