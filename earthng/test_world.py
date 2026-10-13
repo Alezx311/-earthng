@@ -35,6 +35,7 @@ def main():
     p.add_argument('--route', type=Path, help='route.json (earthng/route.py) for the autopilot')
     p.add_argument('--speed', type=float, default=13.0, help='autopilot cruise speed, m/s')
     p.add_argument('--drive-seconds', type=float, default=8)
+    p.add_argument('--manual', action='store_true', help='land, then hand the car to the player; runs until the game is closed')
     p.add_argument('--min-distance', type=float, default=20, help='physics test fails below this, m')
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--generator', choices=('v2','fast'), default='v2')
@@ -71,6 +72,9 @@ def main():
         if not a.route or a.generator != 'fast':
             p.error('--replay requires --route and --generator fast')
         test['replay'] = True
+    if a.manual:
+        test['manual'] = True
+        a.timeout = 10**9
     if a.index_cache:
         shutil.copytree(a.index_cache, out / 'work/fast-index')
     if a.stream_cache:

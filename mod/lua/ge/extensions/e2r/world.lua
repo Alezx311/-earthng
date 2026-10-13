@@ -769,6 +769,8 @@ end
 local function runTest()
   -- automation: pick, land, drive (straight, or the route with the autopilot), screenshots
   local t = S.now - (S.phaseAt or 0)
+  -- manual play: the automation only picks the point and lands; the player drives from there
+  if test.manual and S.testLanded and S.state ~= 'pick' then return end
   if S.state == 'pick' and not S.testPicked and (S.tex or test.skipMap) and t > 3 then
     shot('1-picker')
     goTo(test.lat, test.lon, 15)
