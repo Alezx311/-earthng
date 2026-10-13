@@ -22,6 +22,9 @@ local COLLISION_EVERY = 2.0          -- s between batched reloadCollision calls
 local PRESETS = {
   {'Оболонь', 50.5070, 30.4990}, {'Поділ', 50.4655, 30.5170}, {'Хрещатик', 50.4475, 30.5225},
   {'Печерськ', 50.4280, 30.5410}, {'Голосіїв', 50.3920, 30.5080}, {'Біличі', 50.4775, 30.3600},
+  -- Kyiv oblast (fast generator with data/osm_tiles/kyiv-oblast-260918)
+  {'Ірпінь', 50.5210, 30.2500}, {'Бровари', 50.5110, 30.7900}, {'Бориспіль', 50.3520, 30.9550},
+  {'Фастів', 50.0780, 29.9180}, {'Біла Церква', 49.7960, 30.1150},
 }
 
 local S = {
@@ -819,7 +822,7 @@ local function drawWindow()
     im.Text('Колесо - масштаб, перетягування - рух, клік - точка висадки.')
     drawMap()
     for k, p in ipairs(PRESETS) do
-      if k > 1 then im.SameLine() end
+      if k > 1 and k ~= 7 then im.SameLine() end      -- the oblast towns on a second row
       if im.Button(p[1]) then goTo(p[2], p[3], 15) end
     end
     im.InputText('##coords', coordBuf, 64)
@@ -833,7 +836,7 @@ local function drawWindow()
       im.Text(string.format('Точка: %.5f, %.5f', S.marker.lat, S.marker.lon))
       if im.Button('Висадитися тут', im.ImVec2(220, 32)) then land() end
     else
-      im.Text('Оберіть точку на мапі. Зараз дані підготовлені для Києва (зелена зона).')
+      im.Text('Оберіть точку на мапі. Дані підготовлені там, де зелена зона.')
     end
   else
     local job = S.status and S.status.job

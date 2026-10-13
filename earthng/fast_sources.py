@@ -76,23 +76,39 @@ class Frame:
 # A package larger than this is indexed as a window round the landing (Kyiv oblast: ~2900
 # source tiles; the whole of it would take minutes against the 120 s start).
 WINDOW_TILES = 300
-WINDOW = (0.4, 0.25)        # half size, degrees lon/lat (~56 x 55 km)
 WINDOW_SNAP = 0.2           # window centres on this grid: nearby landings share an index
+WINDOW_WAYS = 1_200_000     # OSM ways a window may hold: the Kyiv package (162 tiles) has 1.17 M
+WINDOW_RINGS = (5, 20)      # rings of tiles round the centre: at least ~56 x 55 km, at most ~210 x 220
 
 
 def window_of(index, point):
-    """The tiles of a large package that a landing at point indexes, and the window box."""
+    """The tiles of a large package that a landing at point indexes, and the window box. The
+    window grows ring by ring (1.5 cells of longitude per cell of latitude: about square in km)
+    while it holds fewer ways than the Kyiv package, so a rural window covers far more ground
+    for the same indexing time."""
     if point is None or len(index['tiles']) <= WINDOW_TILES:
         return index, None
     lon, lat = point
-    cx, cy = round(lon / WINDOW_SNAP) * WINDOW_SNAP, round(lat / WINDOW_SNAP) * WINDOW_SNAP
-    box = [round(v, 6) for v in (cx - WINDOW[0], cy - WINDOW[1], cx + WINDOW[0], cy + WINDOW[1])]
-    tiles = {k: v for k, v in index['tiles'].items()
-             if box[0] <= (v['cell'][0] + v['cell'][2]) / 2 <= box[2] and box[1] <= (v['cell'][1] + v['cell'][3]) / 2 <= box[3]}
+    cell = index.get('cell', .05)
+    cx, cy = round(lon / WINDOW_SNAP) * WINDOW_SNAP / cell, round(lat / WINDOW_SNAP) * WINDOW_SNAP / cell
+    entries = []
+    for k, v in index['tiles'].items():
+        x, y = (v['cell'][0] + v['cell'][2]) / 2 / cell, (v['cell'][1] + v['cell'][3]) / 2 / cell
+        entries.append((max(abs(x - cx) / 1.5, abs(y - cy)), k, v))
+    tiles, ways = {}, 0
+    for r in range(WINDOW_RINGS[0], WINDOW_RINGS[1] + 1):
+        ring = {k: v for d, k, v in entries if d <= r}
+        total = sum(v.get('ways', WINDOW_WAYS) for v in ring.values())
+        if tiles and total > WINDOW_WAYS:
+            break
+        tiles, ways = ring, total
+        if total >= WINDOW_WAYS:
+            break
     if not tiles:
         raise ValueError(f'no_osm: {lon:.4f}, {lat:.4f} is outside the source package')
-    pb = index['package_box']
-    window = [max(pb[0], box[0]), max(pb[1], box[1]), min(pb[2], box[2]), min(pb[3], box[3])]
+    xs = [c for v in tiles.values() for c in (v['cell'][0], v['cell'][2])]
+    ys = [c for v in tiles.values() for c in (v['cell'][1], v['cell'][3])]
+    window = [round(min(xs), 6), round(min(ys), 6), round(max(xs), 6), round(max(ys), 6)]
     return dict(index, tiles=tiles, package_box=window, window=window), window
 
 

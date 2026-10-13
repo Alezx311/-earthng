@@ -6,12 +6,17 @@
 # ASCII only: Windows PowerShell 5.1 reads a UTF-8 file without BOM as ANSI.
 param(
     [string]$Earth2Road = $(if ($env:EARTH2ROAD) { $env:EARTH2ROAD } else { 'C:\js\Earth2Road' }),
-    [string]$Tiles = "$PSScriptRoot\data\osm_tiles\kyiv-260918",
+    [string]$Tiles = '',
     [string]$UserFolder = "$env:LOCALAPPDATA\BeamNG\BeamNG.drive\current",
     [int]$Workers = 8,
     [ValidateSet('v2', 'fast')][string]$Generator = 'v2',
     [switch]$NoGame
 )
+# fast: the Kyiv oblast package when it is there (tiles are indexed as a window round the landing)
+if (-not $Tiles) {
+    $oblast = "$PSScriptRoot\data\osm_tiles\kyiv-oblast-260918"
+    $Tiles = if ($Generator -eq 'fast' -and (Test-Path "$oblast\index.json")) { $oblast } else { "$PSScriptRoot\data\osm_tiles\kyiv-260918" }
+}
 $env:EARTH2ROAD = $Earth2Road
 $py = Join-Path $Earth2Road '.venv\Scripts\python.exe'
 & $py (Join-Path $PSScriptRoot 'earthng\build_mod.py') --out (Join-Path $PSScriptRoot 'out\mod') --install $UserFolder
