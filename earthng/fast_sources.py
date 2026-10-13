@@ -19,7 +19,7 @@ import shapely
 from shapely.geometry import LineString, MultiPoint, shape
 from shapely.ops import transform
 
-VERSION = 'fast-7'          # source index format (keys fast-index/<id>)
+VERSION = 'fast-8'          # source index format (keys fast-index/<id>)
 GEOMETRY = 'fast-18'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
@@ -248,7 +248,8 @@ def prepare(source, output, dem, emit=print, point=None):
                 continue
             if width is None:
                 width = road_width(tags)
-            seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': [list(q) for q in pts],
+            # millimetres are enough (seams <= 1 cm) and keep the JSON a third the size
+            seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': [[round(q[0], 3), round(q[1], 3)] for q in pts],
                    'nodes': [nodes[a][0],nodes[b][0]], 'width': width}
             segments.append(seg); arcs.append((np.array(pts), np.array(cum)))
             mouths[seg['nodes'][0]].append((seg['id'],0,list(pts[0]),None,width,cum[-1]))
@@ -292,7 +293,7 @@ def prepare(source, output, dem, emit=print, point=None):
             p, d = q[:,0], q[:,1]-q[:,2]
             d /= max(1e-9,np.linalg.norm(d))
             normal = np.array([-d[1],d[0]])*width/2
-            corners.extend([(p+normal).tolist(),(p-normal).tolist()])
+            corners.extend([np.round(p+normal,3).tolist(),np.round(p-normal,3).tolist()])
             # the corner sits on its own road's profile at the mouth: the strip meets it exactly
             ps, ph = segments[sid-1]['prof']
             cz.extend([float(np.interp(s, ps, ph)) + ROAD_LIFT]*2)

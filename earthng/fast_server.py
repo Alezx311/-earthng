@@ -80,7 +80,29 @@ def server_class(base):
             super().__init__(args)
 
         def region_boxes(self):
-            return [v['coverage'] for v in self.index['tiles'].values()]
+            """Tile cells merged into rectangles (runs per row, then equal runs of adjacent
+            rows): the oblast's ~2900 tiles as single boxes made status.json ~100 KB, written
+            twice a second and read by the game four times a second."""
+            cell=self.index['cell']
+            keys=sorted({tuple(map(int,k.split('_'))) for k in self.index['tiles']},key=lambda k:(k[1],k[0]))
+            runs={}
+            for x,y in keys:
+                row=runs.setdefault(y,[])
+                if row and row[-1][1]==x-1: row[-1][1]=x
+                else: row.append([x,x])
+            boxes={}                      # (x0,x1) -> [y0,y1] of the run still growing
+            out=[]
+            for y in sorted(runs):
+                grown={}
+                for x0,x1 in runs[y]:
+                    prev=boxes.get((x0,x1))
+                    grown[(x0,x1)]=[prev[0],y] if prev and prev[1]==y-1 else [y,y]
+                    if prev and prev[1]!=y-1: out.append((x0,x1,*prev))
+                for k,v in boxes.items():
+                    if k not in grown: out.append((*k,*v))
+                boxes=grown
+            out+=[(*k,*v) for k,v in boxes.items()]
+            return [[round(x0*cell,6),round(y0*cell,6),round((x1+1)*cell,6),round((y1+1)*cell,6)] for x0,x1,y0,y1 in out]
 
         def land(self,req):
             with self.lock:
