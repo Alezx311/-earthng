@@ -110,22 +110,36 @@ class Mesh:
         self.faces.setdefault(kind,[]).extend(zip(t,unit))
 
     def polygon(self, kind, geom, height):
-        for xy in triangles(geom):
-            a,b=xy[1]-xy[0],xy[2]-xy[0]
-            if a[0]*b[1]-a[1]*b[0] < 0:
-                xy=xy[[0,2,1]]
-            z = np.full(3,height) if np.isscalar(height) else height(xy)
-            self.add(kind,np.column_stack([xy,z]))
+        tris=triangles(geom)
+        if not tris:
+            return
+        xy=np.array(tris)
+        a,b=xy[:,1]-xy[:,0],xy[:,2]-xy[:,0]
+        cw=a[:,0]*b[:,1]-a[:,1]*b[:,0] < 0
+        xy[cw]=xy[cw][:,[0,2,1]]
+        # height(points) is evaluated once for every vertex of the polygon
+        z=np.full(xy.shape[:2],height) if np.isscalar(height) else np.asarray(height(xy.reshape(-1,2))).reshape(-1,3)
+        self.add_many(kind,np.concatenate([xy,z[:,:,None]],axis=2))
 
     def write(self, dest, region, key, layer):
         items=[]
         for kind, faces in sorted(self.faces.items()):
             for offset in range(0,len(faces),750):
                 batch=faces[offset:offset+750]
-                verts=np.array([v for v,n in batch]).reshape(-1,3)
-                normals=np.repeat([n for v,n in batch],3,axis=0)
+                corner=np.array([v for v,n in batch]).reshape(-1,3)
+                face_n=np.repeat([n for v,n in batch],3,axis=0)
+                # Shared vertices: ~4x fewer for the game's Lua to turn into tables, and smooth
+                # normals on ground and roads. Buildings keep hard edges (welded by normal too).
+                weld=np.round(corner*1000).astype(np.int64)
+                if kind=='building':
+                    weld=np.column_stack([weld,np.round(face_n*100).astype(np.int64)])
+                _,first,inverse=np.unique(weld,axis=0,return_index=True,return_inverse=True)
+                inverse=inverse.ravel()
+                verts=corner[first]
+                normals=np.zeros_like(verts); np.add.at(normals,inverse,face_n)
+                normals/=np.maximum(np.linalg.norm(normals,axis=1)[:,None],1e-9)
                 # Input is CCW; ProceduralMesh expects the opposite winding.
-                idx=np.arange(len(verts)).reshape(-1,3)[:,[0,2,1]].ravel().tolist()
+                idx=inverse.reshape(-1,3)[:,[0,2,1]].ravel().tolist()
                 sub={'mat':'e2rf_'+kind,'p':(verts-self.origin).ravel().tolist(),
                      'n':normals.ravel().tolist(),'t':(verts[:,:2]*.1).ravel().tolist(),'i':idx}
                 name=f'{key}_{layer}_{kind}_{offset//750}'

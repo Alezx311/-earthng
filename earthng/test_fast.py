@@ -46,8 +46,9 @@ class FastGeometryTests(unittest.TestCase):
             name_len=struct.unpack_from('<I',data,4)[0]; at=8+name_len
             nv,ni=struct.unpack_from('<II',data,at); at+=8
             verts=np.array(struct.unpack_from(f'<{nv*3}f',data,at)).reshape(-1,3)
-            self.assertTrue(np.allclose(verts+items[0]['pos'],[[10,10,50],[20,10,50],[10,20,50]]))
-            self.assertEqual(struct.unpack_from('<3I',data,at+nv*32),(0,2,1))
+            idx=struct.unpack_from(f'<{ni}I',data,at+nv*32)
+            # the indexed triangle, wound the opposite way for ProceduralMesh
+            self.assertTrue(np.allclose(verts[list(idx)]+items[0]['pos'],[[10,10,50],[10,20,50],[20,10,50]]))
 
     def test_dem_missing_is_error(self):
         with tempfile.TemporaryDirectory() as d:
@@ -124,6 +125,24 @@ class FastGeometryTests(unittest.TestCase):
             self.assertLess(poly.intersection(road).area,1e-6)
             for x,y,z in t: self.assertAlmostEqual(z,plane(x,y),places=6)
         self.assertAlmostEqual(area,80-6*4,places=4)
+
+    def test_written_mesh_shares_vertices_and_keeps_triangles(self):
+        with tempfile.TemporaryDirectory() as d:
+            m=fast.Mesh((0,0,500,500))
+            h=lambda x,y:[x,y,5+x*.01+y*.02]
+            grid=[np.array([h(x,y),h(x+10,y),h(x+10,y+10)]) for x in range(0,50,10) for y in range(0,50,10)]
+            grid+=[np.array([h(x,y),h(x+10,y+10),h(x,y+10)]) for x in range(0,50,10) for y in range(0,50,10)]
+            m.add_many('ground',grid)
+            item=m.write(Path(d),'t','0_0','road')[0]
+            data=(Path(d)/'tiles/0_0/0_0_road_ground_0.bin').read_bytes()
+            l=struct.unpack_from('<I',data,4)[0]; at=8+l
+            nv,ni=struct.unpack_from('<II',data,at); at+=8
+            self.assertEqual(nv,36)                      # 6x6 grid points instead of 150 corners
+            verts=np.array(struct.unpack_from(f'<{nv*3}f',data,at)).reshape(-1,3)+item['pos']
+            idx=np.array(struct.unpack_from(f'<{ni}I',data,at+nv*32)).reshape(-1,3)[:,[0,2,1]]
+            got=sorted(tuple(np.round(verts[t],4).ravel()) for t in idx)
+            want=sorted(tuple(np.round(v,4).ravel()) for v,n in m.faces['ground'])
+            self.assertEqual(got,want)
 
     def test_add_many_equals_add(self):
         rng=np.random.default_rng(1); tris=rng.uniform(-50,550,(400,3,3)); tris[:,:,2]=rng.uniform(0,5,(400,3))
