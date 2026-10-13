@@ -27,6 +27,7 @@ MATERIALS = style.MATERIALS
 MAJOR = {'motorway', 'trunk', 'primary', 'secondary'}
 WALKS = {'primary', 'secondary', 'tertiary', 'residential', 'living_street', 'unclassified'}
 SIDEWALK = 2.0    # m each side, flush with the road
+DECOR = {'mark', 'curb', 'roof'}   # no collision needed: spawned outside the MissionGroup
 CURB = 0.25       # m of the sidewalk next to the road drawn as a curb band
 LAMP_EVERY = 30.0 # m between street lamps (sidewalk side)
 ZEBRA = {'primary', 'secondary', 'tertiary', 'residential', 'unclassified', 'living_street'}
@@ -160,7 +161,7 @@ class Mesh:
         """Pieces of up to PIECE triangles, each holding submeshes of several kinds: every
         kind its own object made be:reloadCollision 78 ms (fast-replay-game-04)."""
         items=[]; subs=[]; tris=0; mats=[]
-        def flush():
+        def flush(decor=False):
             nonlocal subs,tris,mats
             if not subs:
                 return
@@ -170,16 +171,21 @@ class Mesh:
             path.write_bytes(s1.write_bin(subs)); warm(path)
             items.append({'kind':'proc','name':'e2rf_'+name,'pos':self.origin,
                           'shape':f'/e2r_stream/{region}/{rel}','triangles':tris,
-                          'mats':mats, 'layer':layer})
+                          'mats':mats, 'layer':layer, **({'decor':True} if decor else {})})
             subs,tris,mats=[],0,[]
-        for kind, faces in sorted(self.faces.items()):
-            for offset in range(0,len(faces),750):
-                batch=faces[offset:offset+750]
-                if tris+len(batch)>self.PIECE:
-                    flush()
-                subs.append(self.submesh(kind,batch)); tris+=len(batch)
-                if 'e2rf_'+kind not in mats: mats.append('e2rf_'+kind)
-        flush()
+        # decoration (lines, curbs, roofs) in pieces of its own: the game keeps them out of the
+        # static collision, which grew to 90 ms with them (fast-replay-game-07)
+        for decor in (False,True):
+            for kind, faces in sorted(self.faces.items()):
+                if (kind in DECOR)!=decor:
+                    continue
+                for offset in range(0,len(faces),750):
+                    batch=faces[offset:offset+750]
+                    if tris+len(batch)>self.PIECE:
+                        flush(decor)
+                    subs.append(self.submesh(kind,batch)); tris+=len(batch)
+                    if 'e2rf_'+kind not in mats: mats.append('e2rf_'+kind)
+            flush(decor)
         return items
 
 

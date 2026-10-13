@@ -20,7 +20,7 @@ from shapely.geometry import LineString, MultiPoint, shape
 from shapely.ops import transform
 
 VERSION = 'fast-7'          # source index format (keys fast-index/<id>)
-GEOMETRY = 'fast-16'         # mesh/material semantics; bump to reject tiles built by older code
+GEOMETRY = 'fast-18'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
@@ -73,15 +73,49 @@ class Frame:
         return [float(min(lon)), float(min(lat)), float(max(lon)), float(max(lat))]
 
 
-def source_identity(source, dem):
-    """Index checksum plus DEM contents: old geometry cannot survive source replacement."""
+# A package larger than this is indexed as a window round the landing (Kyiv oblast: ~2900
+# source tiles; the whole of it would take minutes against the 120 s start).
+WINDOW_TILES = 300
+WINDOW = (0.4, 0.25)        # half size, degrees lon/lat (~56 x 55 km)
+WINDOW_SNAP = 0.2           # window centres on this grid: nearby landings share an index
+
+
+def window_of(index, point):
+    """The tiles of a large package that a landing at point indexes, and the window box."""
+    if point is None or len(index['tiles']) <= WINDOW_TILES:
+        return index, None
+    lon, lat = point
+    cx, cy = round(lon / WINDOW_SNAP) * WINDOW_SNAP, round(lat / WINDOW_SNAP) * WINDOW_SNAP
+    box = [round(v, 6) for v in (cx - WINDOW[0], cy - WINDOW[1], cx + WINDOW[0], cy + WINDOW[1])]
+    tiles = {k: v for k, v in index['tiles'].items()
+             if box[0] <= (v['cell'][0] + v['cell'][2]) / 2 <= box[2] and box[1] <= (v['cell'][1] + v['cell'][3]) / 2 <= box[3]}
+    if not tiles:
+        raise ValueError(f'no_osm: {lon:.4f}, {lat:.4f} is outside the source package')
+    pb = index['package_box']
+    window = [max(pb[0], box[0]), max(pb[1], box[1]), min(pb[2], box[2]), min(pb[3], box[3])]
+    return dict(index, tiles=tiles, package_box=window, window=window), window
+
+
+def dem_tiles(box):
+    """z12 Terrarium tiles under a lon/lat box, one tile of margin (fast_dem.audit's rule)."""
+    w, s, e, n = box
+    tile = lambda lon, lat: ((lon + 180) / 360 * 4096, (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 4096)
+    x0, y0 = tile(w, n); x1, y1 = tile(e, s)
+    return [(x, y) for x in range(math.floor(x0) - 1, math.floor(x1) + 2) for y in range(math.floor(y0) - 1, math.floor(y1) + 2)]
+
+
+def source_identity(source, dem, point=None):
+    """Index checksum (of the window's tiles) plus the DEM files under it (name, size, mtime):
+    old geometry cannot survive source replacement. Contents were hashed before: 200 MB of
+    PNG per landing for the oblast."""
     source, dem = Path(source), Path(dem)
-    raw = (source / 'index.json').read_bytes()
-    index = json.loads(raw)
-    h = hashlib.sha256(VERSION.encode() + raw)
-    for p in sorted((dem / 'terrain' / '12').glob('*/*.png')):
-        h.update(p.relative_to(dem).as_posix().encode())
-        h.update(p.read_bytes())
+    index, window = window_of(json.loads((source / 'index.json').read_bytes()), point)
+    h = hashlib.sha256(VERSION.encode() + json.dumps(index, sort_keys=True).encode())
+    for x, y in dem_tiles(index['package_box']):
+        p = dem / 'terrain' / '12' / str(x) / f'{y}.png'
+        if p.exists():
+            st = p.stat()
+            h.update(f'{x}/{y}:{st.st_size}:{st.st_mtime_ns}'.encode())
     return VERSION + '-' + h.hexdigest()[:16], index
 
 
@@ -134,11 +168,12 @@ class Terrain:
         return z + LIFT
 
 
-def prepare(source, output, dem, emit=print):
-    """Parse source tiles once, split roads at shared nodes, publish a read-only index."""
+def prepare(source, output, dem, emit=print, point=None):
+    """Parse source tiles once, split roads at shared nodes, publish a read-only index.
+    A large package is indexed as a window round point (the landing)."""
     import osmium
     started = time.perf_counter()
-    identity, index = source_identity(source, dem)
+    identity, index = source_identity(source, dem, point)
     target = Path(output) / identity
     final = target / 'sources.sqlite'
     if final.exists():

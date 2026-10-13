@@ -64,6 +64,19 @@ class FastGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(float(x),-501,places=6)
         self.assertAlmostEqual(float(y),501,places=6)
 
+    def test_large_package_is_indexed_as_a_window(self):
+        cell=.05
+        tiles={f'{x}_{y}':{'cell':[x*cell,y*cell,(x+1)*cell,(y+1)*cell]} for x in range(584,644) for y in range(983,1032)}
+        index={'tiles':tiles,'package_box':[29.2,49.15,32.2,51.6]}
+        small={'tiles':dict(list(tiles.items())[:50]),'package_box':[0,0,1,1]}
+        self.assertIs(sources.window_of(small,(30.5,50.4))[0],small)
+        a,wa=sources.window_of(index,(30.36,50.46)); b,wb=sources.window_of(index,(30.31,50.42))
+        self.assertEqual(wa,wb)                                  # nearby landings share it
+        self.assertTrue(140<=len(a['tiles'])<=17*11)               # ~ the Kyiv package (162)
+        self.assertTrue(wa[0]<30.36-.15 and wa[2]>30.36+.15 and wa[1]<50.46-.1 and wa[3]>50.46+.1)
+        with self.assertRaisesRegex(ValueError,'no_osm'):
+            sources.window_of(index,(10,10))
+
     def test_road_profile_identical_for_different_tile_clips(self):
         class Terrain:
             def sample(self,xy,smooth=False):

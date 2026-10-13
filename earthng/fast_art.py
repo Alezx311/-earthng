@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 
 import fast_style as style
 
-VERSION = 'v2'
+VERSION = 'v3'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 ASSETS = Path(r'C:/Program Files (x86)/Steam/steamapps/common/BeamNG.drive/content/assets/materials')
@@ -136,6 +136,21 @@ def pack_fields(pack, base):
     return out
 
 
+def warm_defs(pack, fields):
+    """One material per pack and texture, loaded at the landing on a hidden triangle: a texture
+    the engine first meets through a runtime map swap streams into a slot sized for the old one
+    and breaks (\"dds mip chain (11) does not match texture (9)\", fast-game-packs-02)."""
+    out = {}
+    for mat, f in fields.items():
+        stage = {k: v for k, v in f.items() if k in MAP_FIELDS and v}
+        if not stage:
+            continue
+        name = f'e2rf_pk_{pack}_{mat[5:]}'
+        out[name] = {'name': name, 'mapTo': name, 'class': 'Material', 'version': 1.5,
+                     'Stages': [stage, {}, {}, {}]}
+    return out
+
+
 def ensure(user):
     """Write the facade textures and packs.json once (~1 s); returns the art root path."""
     r = root(user)
@@ -148,7 +163,8 @@ def ensure(user):
         for name in FACADES:
             path = r / pack / f'{name}.color.png'
             facade(name, pack).save(path)
+    fields = {p: pack_fields(p, base) for p in PACKS}
     tmp = r / 'packs.json.tmp'
-    tmp.write_text(json.dumps({p: pack_fields(p, base) for p in PACKS}), encoding='utf8')
+    tmp.write_text(json.dumps({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS}}), encoding='utf8')
     os.replace(tmp, done)
     return r

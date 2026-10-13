@@ -179,7 +179,7 @@ local function spawnItem(it, group, pause)
   end
 end
 
-local function tileGroup(name)
+local function tileGroup(name, outside)
   local g = scenetree.findObject(name)
   if g then
     g:deleteAllObjects()
@@ -187,7 +187,8 @@ local function tileGroup(name)
   end
   g = createObject('SimGroup')
   g:registerObject(name)
-  scenetree.MissionGroup:addObject(g)
+  -- outside: decoration kept out of the MissionGroup (and so out of the static collision)
+  if not outside then scenetree.MissionGroup:addObject(g) end
   return g
 end
 
@@ -329,7 +330,7 @@ local function startTile(key, i, j)
   local ok, manifest = pcall(jsonReadFile, path)
   if not ok or type(manifest) ~= 'table' then return end
   loadNewMaterials(manifest.materials)
-  local tile = {state = 'loading', i = i, j = j, manifest = manifest, group = tileGroup('E2RT_' .. key),
+  local tile = {state = 'loading', i = i, j = j, manifest = manifest, group = tileGroup('E2RT_' .. key), decor = tileGroup('E2RD_' .. key, true),
                 left = #manifest.items, roadLeft = #manifest.items, startedAt = S.now}
   S.tiles[key] = tile
   for _, it in ipairs(manifest.items) do table.insert(S.queue, {tile = tile, key = key, item = it}) end
@@ -355,12 +356,20 @@ local function updateTiles()
   if not p then return end
   local fast = st.generator ~= nil
   local loadR = fast and (st.loadRadius or 1000) or LOAD_R
-  local unloadR = fast and loadR + 750 or UNLOAD_R
+  local unloadR = fast and loadR + 350 or UNLOAD_R
+  -- fast, at speed: tiles well behind the car are neither kept nor loaded (the static collision
+  -- costs ~7.5 ms per MB of loaded world at every rebuild); a U-turn loads them back from disk
+  local speed = v:length()
+  local function behind(cx, cy, d)
+    if not fast or speed < 15 then return false end
+    return ((cx - p.x) * v.x + (cy - p.y) * v.y) < 0 and d > loadR * 0.6 + 250
+  end
   -- unload far tiles (their queued items are skipped)
   for key, tile in pairs(S.tiles) do
     local cx, cy = tileCentre(tile.i, tile.j)
-    if math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) > unloadR then
-      dropGroup('E2RT_' .. key)
+    local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
+    if d > unloadR or behind(cx, cy, d) then
+      dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key)
       S.tiles[key] = nil
       tile.dropped = true
       S.collisionDirty = true
@@ -379,8 +388,9 @@ local function updateTiles()
       local i, j = key:match('^(-?%d+)_(-?%d+)$')
       i, j = tonumber(i), tonumber(j)
       local cx, cy = tileCentre(i, j)
-      local d = math.min(math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2), math.sqrt((cx - ax) ^ 2 + (cy - ay) ^ 2))
-      if d <= loadR and (not bestD or d < bestD) then best, bestD = {key, i, j}, d end
+      local dp = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
+      local d = math.min(dp, math.sqrt((cx - ax) ^ 2 + (cy - ay) ^ 2))
+      if d <= loadR and not behind(cx, cy, dp) and (not bestD or d < bestD) then best, bestD = {key, i, j}, d end
     end
   end
   if best and #S.queue < 400 then startTile(best[1], best[2], best[3]) end
@@ -412,7 +422,8 @@ local function stepQueue()
       while job and job.tile.dropped do job = table.remove(S.queue, 1) end
       if not job then break end
       S.job = job
-      S.co = coroutine.create(function(p) spawnItem(job.item, job.tile.group, p) end)
+      local group = job.item.decor and job.tile.decor or job.tile.group
+      S.co = coroutine.create(function(p) spawnItem(job.item, group, p) end)
     end
     -- a resume far over the budget: is it the collector (Lua heap shrinks inside it)?
     local kb0, t0 = collectgarbage('count'), hptimer()
@@ -532,7 +543,7 @@ local function beginArrival(job)
   local manifest = jsonReadFile(job.manifest)
   if not manifest then return end
   -- leave the previous region
-  for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); tile.dropped = true end
+  for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true end
   S.tiles, S.queue, S.co = {}, {}, nil
   S.stream = {region = job.region, tile = job.tileSize, generator = job.generator}
   S.landing = manifest
@@ -540,7 +551,34 @@ local function beginArrival(job)
   loadNewMaterials(manifest.materials)
   if manifest.packs and FS:fileExists(manifest.packs) then
     local okP, packs = pcall(jsonReadFile, manifest.packs)
-    S.packs = okP and packs or nil
+    S.packs = okP and packs and packs.fields or nil
+    -- every pack's textures load now, the normal way, on warm-up triangles (removed with the
+    -- warm-up; the materials keep them): a texture first met through a runtime swap streams in broken
+    if okP and packs and packs.warm and not S.packsWarm then
+      local group = tileGroup('E2RWorldPacks')
+      local n = 0
+      for pack, defs in pairs(packs.warm) do
+        S.matSeq = (S.matSeq or 0) + 1
+        local tmp = string.format('e2r_world/materials_%d.json', S.matSeq)
+        jsonWriteFile(tmp, defs, false)
+        loadJsonMaterialsFile('/' .. tmp)
+        for name in pairs(defs) do
+          n = n + 1
+          local obj = createObject('ProceduralMesh')
+          obj:registerObject('e2r_pk_' .. n)
+          obj.canSave = false
+          group:addObject(obj.obj)
+          obj:createMesh({{{verts = {{x = 0, y = 0, z = 0}, {x = 3, y = 0, z = 0}, {x = 0, y = 3, z = 0}},
+                            normals = {{x = 0, y = 0, z = 1}}, uvs = {{u = 0, v = 0}, {u = 1, v = 0}, {u = 0, v = 1}},
+                            faces = {{v = 0, n = 0, u = 0}, {v = 2, n = 0, u = 2}, {v = 1, n = 0, u = 1}},
+                            material = name}}})
+          local sp0 = manifest.spawn.pos
+          obj:setPosition(vec3(sp0[1] + (n % 20) * 4 - 40, sp0[2] + math.floor(n / 20) * 4 + 30, sp0[3] + 3))
+        end
+      end
+      S.packsWarm = true
+      result.packMaterialsWarmed = n
+    end
     if S.pack and S.pack ~= 'real' then applyPack(S.pack) end   -- keep the player's choice
   end
   commands.setFreeCamera()
@@ -1069,6 +1107,7 @@ function M.tick(dt)
     if test then shot('3-descent') end
     result.warmupFrames = frameStats(S.frames)
     dropGroup('E2RWorldWarmup')
+    dropGroup('E2RWorldPacks')
     S.state, S.frames, S.phaseAt = 'spawning', {}, S.now
   end
   if S.stream and (S.state == 'spawning' or S.state == 'driving') then

@@ -97,7 +97,7 @@ def server_class(base):
                 import fast_art
                 fast_art.ensure(self.user)          # facades and texture packs, ~0.3 s once
                 directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,
-                                              emit=lambda msg: print(msg,flush=True))
+                                              emit=lambda msg: print(msg,flush=True),point=(req['lon'],req['lat']))
                 frame=sources.Frame(); i,j=frame.tile_of(req['lon'],req['lat'])
                 # Connections stay on scheduler thread; preparation owns no persistent SQLite reader.
                 with self.lock:

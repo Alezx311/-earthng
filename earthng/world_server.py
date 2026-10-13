@@ -88,6 +88,8 @@ class Server:
         self.workers = args.workers
         self.radius = args.radius
         self.lock = threading.RLock()
+        self.status_write_lock = threading.Lock()
+        self.status_writes = 0
         self.status = {'server': 'up', 'started': time.time(), 'tilesSource': self.index['source'],
                        'coverage': self.region_boxes(), 'job': None, 'view': None, 'stream': None}
         self.pool = ThreadPoolExecutor(6)       # map pictures
@@ -124,16 +126,28 @@ class Server:
             self.status['heartbeat'] = time.time()
             self.status['stream'] = self.stream_status()
             text = json.dumps(self.status)
-        # BeamNG may remove the folder while it starts up with a new profile (world-test-05)
-        self.io.mkdir(parents=True, exist_ok=True)
-        tmp = self.io / 'status.json.tmp'
-        tmp.write_text(text, encoding='utf8')
-        for _ in range(20):
+        # One writer at a time, and a temporary name per write: the scheduler loop and the
+        # landing thread both write, and a shared status.json.tmp being replaced by one while
+        # the other opened it gave "Permission denied: status.json.tmp" at game start.
+        with self.status_write_lock:
+            self.status_writes += 1
+            tmp = self.io / f'status.{os.getpid()}.{self.status_writes}.tmp'
             try:
-                os.replace(tmp, self.io / 'status.json')
-                return
-            except PermissionError:
-                time.sleep(0.025)
+                # BeamNG may remove the folder while it starts up with a new profile (world-test-05)
+                self.io.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(text, encoding='utf8')
+            except OSError:
+                return              # the next heartbeat writes it again
+            for _ in range(20):
+                try:
+                    os.replace(tmp, self.io / 'status.json')
+                    return
+                except PermissionError:
+                    time.sleep(0.025)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def set_job(self, **kw):
         with self.lock:
