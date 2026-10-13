@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 
 import fast_style as style
 
-VERSION = 'v3'
+VERSION = 'v5'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 ASSETS = Path(r'C:/Program Files (x86)/Steam/steamapps/common/BeamNG.drive/content/assets/materials')
@@ -44,8 +44,16 @@ FLAT = {   # kind: (toon colour, model colour)
     'paved': ((190, 184, 176), (220, 220, 220)), 'water': ((96, 176, 220), (180, 200, 214)),
     'roof': ((120, 96, 92), (210, 210, 210)), 'curb': ((240, 240, 240), (250, 250, 250)),
 }
-PACKS = ('real', 'toon', 'model')
-MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap')
+PACKS = ('real', 'toon', 'model', 'synth')
+MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap')
+# synthwave: dark violet surfaces, neon lines glowing (emissive), a striped sun at the horizon
+SYNTH = {
+    'road': (22, 16, 44), 'road_major': (26, 18, 52), 'sidewalk': (44, 30, 78), 'paved': (30, 20, 60),
+    'water': (14, 10, 46), 'roof': (34, 22, 62), 'ground': (20, 8, 40), 'forest': (16, 6, 34),
+}
+SYNTH_GLOW = {'mark': (0.0, 1.0, 1.0), 'curb': (1.0, 0.1, 0.8)}   # emissive lines on the roads
+NEON = (255, 40, 200)       # grid magenta
+CYAN = (0, 240, 255)
 
 
 def root(user):
@@ -68,8 +76,8 @@ def draw_windows(im, kind, pack):
     """Windows in world orientation (floor at the bottom of the picture)."""
     d = ImageDraw.Draw(im)
     s = PX / CELL
-    glass = {'real': (52, 66, 82), 'toon': (150, 205, 235), 'model': (190, 190, 192)}[pack]
-    frame = {'real': (225, 225, 220), 'toon': (60, 60, 70), 'model': (245, 245, 245)}[pack]
+    glass = {'real': (52, 66, 82), 'toon': (150, 205, 235), 'model': (190, 190, 192), 'synth': (40, 10, 70)}[pack]
+    frame = {'real': (225, 225, 220), 'toon': (60, 60, 70), 'model': (245, 245, 245), 'synth': CYAN}[pack]
     if kind == 'band':
         d.rectangle([0, s * .55, PX, s * 2.75], fill=glass)
         for x in range(0, PX, int(s * 1.5)):
@@ -102,11 +110,46 @@ def facade(name, pack):
             # the game texture spans 4 m; this cell is 3 m of it
             w, h = tex.size
             im = tex.crop((0, 0, int(w * CELL / 4), int(h * CELL / 4))).resize((PX, PX), Image.LANCZOS)
+    elif pack == 'synth':
+        im = Image.new('RGB', (PX, PX), (24, 14, 46))
     else:
         im = Image.new('RGB', (PX, PX), colour if pack == 'toon' else (238, 238, 236))
     draw_windows(im, kind, pack)
     # UV v grows with height and image rows grow downward: store it upside down
     return im.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def synth_glow(name):
+    """Emissive map for a synthwave facade: only the neon window frames light up."""
+    im = Image.new('RGB', (PX, PX), (0, 0, 0))
+    draw_windows(im, FACADES[name][1], 'synth')
+    mask = im.convert('RGB').point(lambda v: 255 if v > 200 else 0).convert('L')
+    out = Image.new('RGB', (PX, PX), (0, 0, 0))
+    out.paste(Image.new('RGB', (PX, PX), CYAN), mask=mask)
+    return out.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def synth_grid(base, glow=False):
+    """One ground repeat with neon lines on its edges (the Outrun grid)."""
+    im = Image.new('RGB', (PX, PX), (0, 0, 0) if glow else base)
+    d = ImageDraw.Draw(im)
+    w = PX // 64
+    d.rectangle([0, 0, PX, w], fill=NEON); d.rectangle([0, 0, w, PX], fill=NEON)
+    return im
+
+
+def synth_sun():
+    """The sun: yellow to magenta from the top, cut by widening gaps in its lower half."""
+    im = Image.new('RGBA', (PX, PX), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    for y in range(PX):
+        t = y / PX
+        if t > .5 and (t * 18) % 1 < .15 + .45 * (t - .5) / .5:
+            continue
+        half = (max(0., (PX / 2) ** 2 - (y - PX / 2) ** 2)) ** .5
+        if half > 0:
+            d.line([(PX / 2 - half, y), (PX / 2 + half, y)], fill=(255, int(230 - 200 * t), int(60 + 140 * t), 255))
+    return im
 
 
 def colour(rgb):
@@ -118,11 +161,14 @@ def pack_fields(pack, base):
     out = {}
     for kind, (tex, fallback, _, _, mode) in style.KINDS.items():
         f = {k: '' for k in MAP_FIELDS}
+        f['emissiveFactor'] = '0 0 0'
         if kind.startswith('wall_'):
             w = kind[5:]
             f['baseColorMap'] = f'{base}/{pack}/{w}.color.png'
             if pack == 'real':
                 f['normalMap'] = style.TEXTURES[w].get('normalMap', '')
+            if pack == 'synth':
+                f['emissiveMap'] = f'{base}/synth/{w}.glow.png'; f['emissiveFactor'] = '1 1 1'
             f['baseColorFactor'] = '1 1 1 1'
         elif pack == 'real':
             if tex:
@@ -130,10 +176,41 @@ def pack_fields(pack, base):
                 f['baseColorFactor'] = colour([c * 255 for c in style.TINT.get(kind, [1, 1, 1])[:3]])
             else:
                 f['baseColorFactor'] = colour([c * 255 for c in fallback[:3]])
+        elif pack == 'synth':
+            if kind in ('ground', 'forest', 'paved'):
+                f['baseColorMap'] = f'{base}/synth/grid_{kind}.color.png'
+                f['emissiveMap'] = f'{base}/synth/grid.glow.png'; f['emissiveFactor'] = '1 1 1'
+                f['baseColorFactor'] = '1 1 1 1'
+            elif kind in SYNTH_GLOW:
+                g = SYNTH_GLOW[kind]
+                f['baseColorFactor'] = colour([c * 255 for c in g]); f['emissiveFactor'] = ' '.join(map(str, g))
+            else:
+                f['baseColorFactor'] = colour(SYNTH.get(kind, (30, 20, 50)))
         else:
             f['baseColorFactor'] = colour(FLAT.get(kind, ((200, 200, 200), (230, 230, 230)))[0 if pack == 'toon' else 1])
         out['e2rf_' + kind] = f
     return out
+
+
+def environment(pack):
+    """Sky and fog per pack: the level's own (earthng/build_mod.SKY) or a synthwave dusk."""
+    import build_mod
+    sky = {o['name']: o for o in build_mod.SKY}
+
+    def fields(o, keys):
+        return {k: (' '.join(map(str, o[k])) if isinstance(o[k], list) else str(o[k])) for k in keys if k in o}
+    sun_keys = ('azimuth', 'elevation', 'brightness', 'skyBrightness', 'colorize', 'colorizeAmount', 'fogScale',
+                'sunScale', 'ambientScale', 'nightColor', 'nightFogColor')
+    info_keys = ('fogColor', 'fogDensity', 'canvasClearColor')
+    if pack != 'synth':
+        return {'objects': {'sunsky': fields(sky['sunsky'], sun_keys), 'theLevelInfo': fields(sky['theLevelInfo'], info_keys)},
+                'sun': False}
+    return {'objects': {
+        'sunsky': {'azimuth': '250', 'elevation': '3', 'brightness': '0.45', 'skyBrightness': '6',
+                   'colorize': '0.75 0.1 0.95 1', 'colorizeAmount': '4', 'fogScale': '0.55 0.08 0.75 1',
+                   'sunScale': '1 0.3 0.8 1', 'ambientScale': '0.45 0.25 0.7 1'},
+        'theLevelInfo': {'fogColor': '0.25 0.04 0.38 1', 'fogDensity': '0.00004', 'canvasClearColor': '40 10 60 255'}},
+        'sun': {'azimuth': 250, 'distance': 3200, 'size': 1500, 'height': 420, 'material': 'e2rf_synth_sun'}}
 
 
 def warm_defs(pack, fields):
@@ -163,8 +240,21 @@ def ensure(user):
         for name in FACADES:
             path = r / pack / f'{name}.color.png'
             facade(name, pack).save(path)
+            if pack == 'synth':
+                synth_glow(name).save(r / pack / f'{name}.glow.png')
+    for kind in ('ground', 'forest', 'paved'):
+        synth_grid(SYNTH[kind]).save(r / 'synth' / f'grid_{kind}.color.png')
+    synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')
+    synth_sun().save(r / 'synth' / 'sun.color.png')
     fields = {p: pack_fields(p, base) for p in PACKS}
     tmp = r / 'packs.json.tmp'
-    tmp.write_text(json.dumps({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS}}), encoding='utf8')
+    sun = {'e2rf_synth_sun': {'name': 'e2rf_synth_sun', 'mapTo': 'e2rf_synth_sun', 'class': 'Material', 'version': 1.5,
+                              # additive: the black around the disc adds nothing (an alpha test left a square)
+                              'translucent': True, 'translucentBlendOp': 'Add', 'translucentZWrite': False,
+                              'doubleSided': True,
+                              'Stages': [{'baseColorMap': f'{base}/synth/sun.color.png', 'emissiveMap': f'{base}/synth/sun.color.png',
+                                          'emissiveFactor': [1, 1, 1]}, {}, {}, {}]}}
+    tmp.write_text(json.dumps({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
+                               'environment': {p: environment(p) for p in PACKS}, 'extra': sun}), encoding='utf8')
     os.replace(tmp, done)
     return r

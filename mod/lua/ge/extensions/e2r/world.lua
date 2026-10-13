@@ -518,7 +518,39 @@ end
 -- --- texture packs (fast generator) -----------------------------------------------------------------
 -- packs.json (earthng/fast_art.py): pack -> material -> stage-0 fields. A switch rewrites the
 -- fields of the loaded materials in place; no tile is rebuilt or reloaded.
-local PACK_NAMES = {{'real', 'Реальний'}, {'toon', 'Мультяшний'}, {'model', 'Макет'}}
+local PACK_NAMES = {{'real', 'Реальний'}, {'toon', 'Мультяшний'}, {'model', 'Макет'}, {'synth', 'Синтвейв'}}
+
+-- The synthwave sun: one big textured quad that keeps its place on the horizon, as far from the
+-- camera as the view distance allows (env.sun: azimuth, distance, size, height, material).
+local function placeSun()
+  local cfg, obj = S.sunCfg, S.sunObj
+  if not (cfg and obj) then return end
+  local ok, cam = pcall(function() return core_camera.getPosition() end)
+  if not ok or not cam then return end
+  local a = math.rad(cfg.azimuth)
+  obj:setPosition(vec3(cam.x + math.sin(a) * cfg.distance, cam.y + math.cos(a) * cfg.distance, cam.z + cfg.height))
+end
+
+local function showSun(cfg)
+  if S.sunObj then S.sunObj:delete(); S.sunObj = nil end
+  S.sunCfg = cfg or nil
+  if not cfg then return end
+  local a, h = math.rad(cfg.azimuth), cfg.size / 2
+  local rx, ry = math.cos(a), -math.sin(a)          -- right of the view toward the sun
+  local nx, ny = -math.sin(a), -math.cos(a)         -- faces the camera
+  local verts = {{x = -rx * h, y = -ry * h, z = -h}, {x = rx * h, y = ry * h, z = -h},
+                 {x = rx * h, y = ry * h, z = h}, {x = -rx * h, y = -ry * h, z = h}}
+  local obj = createObject('ProceduralMesh')
+  obj:registerObject('e2r_synth_sun')
+  obj.canSave = false
+  obj:createMesh({{{verts = verts, normals = {{x = nx, y = ny, z = 0}},
+                    uvs = {{u = 0, v = 1}, {u = 1, v = 1}, {u = 1, v = 0}, {u = 0, v = 0}},
+                    faces = {{v = 0, n = 0, u = 0}, {v = 2, n = 0, u = 2}, {v = 1, n = 0, u = 1},
+                             {v = 0, n = 0, u = 0}, {v = 3, n = 0, u = 3}, {v = 2, n = 0, u = 2}},
+                    material = cfg.material}}})
+  S.sunObj = obj
+  placeSun()
+end
 
 local function applyPack(name)
   local pack = S.packs and S.packs[name]
@@ -530,6 +562,22 @@ local function applyPack(name)
       for field, value in pairs(fields) do mat:setField(field, 0, value) end
       mat:reload()
     end
+  end
+  -- sky, fog and the sun of the pack
+  local env = S.packEnv and S.packEnv[name]
+  if env then
+    for objName, fields in pairs(env.objects or {}) do
+      local obj = scenetree.findObject(objName)
+      if obj then
+        for field, value in pairs(fields) do obj:setField(field, 0, value) end
+        pcall(function() obj:postApply() end)
+        result.envCheck = result.envCheck or {}
+        for field in pairs(fields) do result.envCheck[objName .. '.' .. field] = tostring(obj:getField(field, 0)) end
+      else
+        result.envMissing = objName
+      end
+    end
+    showSun(env.sun ~= false and env.sun or nil)
   end
   S.pack = name
   result.pack, result.packSwitchMs = name, timer:stop()
@@ -556,12 +604,23 @@ local function beginArrival(job)
   if manifest.packs and FS:fileExists(manifest.packs) then
     local okP, packs = pcall(jsonReadFile, manifest.packs)
     S.packs = okP and packs and packs.fields or nil
+    S.packEnv = okP and packs and packs.environment or nil
+    if okP and packs and packs.extra and not S.packsExtra then      -- the sun's material
+      S.matSeq = (S.matSeq or 0) + 1
+      local tmpE = string.format('e2r_world/materials_%d.json', S.matSeq)
+      jsonWriteFile(tmpE, packs.extra, false)
+      loadJsonMaterialsFile('/' .. tmpE)
+      S.packsExtra = true
+    end
     -- every pack's textures load now, the normal way, on warm-up triangles (removed with the
     -- warm-up; the materials keep them): a texture first met through a runtime swap streams in broken
     if okP and packs and packs.warm and not S.packsWarm then
       local group = tileGroup('E2RWorldPacks')
       local n = 0
-      for pack, defs in pairs(packs.warm) do
+      local all = {}
+      for pack, defs in pairs(packs.warm) do all[pack] = defs end
+      if packs.extra then all.extra = packs.extra end
+      for pack, defs in pairs(all) do
         S.matSeq = (S.matSeq or 0) + 1
         local tmp = string.format('e2r_world/materials_%d.json', S.matSeq)
         jsonWriteFile(tmp, defs, false)
@@ -1011,13 +1070,22 @@ local function runTest()
   elseif S.overviewShot and not S.overviewTaken and S.now - S.overviewShot > 1.5 then
     shot('6-overview')
     S.overviewTaken = S.now
-    S.packQueue = test.packs and S.packs and {'toon', 'model', 'real'} or nil
+    S.packQueue = test.packs and S.packs and {'toon', 'model', 'synth', 'real'} or nil
   elseif S.packQueue and #S.packQueue > 0 and S.now - S.overviewTaken > 1.5 then
     -- the same view in every pack (test.packs), then back to the default
     local name = table.remove(S.packQueue, 1)
     applyPack(name)
     S.overviewTaken = S.now
     if name ~= 'real' then S.packShot = name end
+    if name == 'synth' and S.sunCfg then
+      -- look toward the sun from where the overview camera is
+      local okC, cam = pcall(function() return core_camera.getPosition() end)
+      if okC and cam then
+        local a = math.rad(S.sunCfg.azimuth)
+        local q = quatFromDir(vec3(math.sin(a), math.cos(a), -0.12), vec3(0, 0, 1))
+        core_camera.setPosRot(0, cam.x, cam.y, cam.z, q.x, q.y, q.z, q.w)
+      end
+    end
   elseif S.packShot and S.now - S.overviewTaken > 1 then
     shot('7-pack-' .. S.packShot)
     S.packShot = nil
@@ -1112,6 +1180,7 @@ function M.onUpdate(dtReal)
 end
 
 function M.tick(dt)
+  placeSun()
   readStatus()
   replayStep(dt)
   if S.state == 'pick' and S.viewDirty and S.now - S.lastViewAt > 0.25 and not (test and test.skipMap) then requestView() end
