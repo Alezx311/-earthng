@@ -217,19 +217,61 @@ def road_surface(store, data, footprint=True):
     return tris, foot, xy, z, tangent, knots, verge
 
 
+def clip_verges(verges, asphalt):
+    """Verge triangles minus every ground-level road surface. A verge slopes from its own
+    road to the ground and used to lie on top of the next road or a junction's other
+    mouths (1-6 % of a tile's asphalt under grass, up to 2 m above it). Cut pieces keep
+    their parent triangle's plane. asphalt: the separate road/junction polygons."""
+    if not len(verges) or not asphalt:
+        return verges
+    v=np.asarray(verges,dtype=float)
+    polys=shapely.polygons(v[:,:,:2])
+    parts=np.array(asphalt,dtype=object)
+    # overlap with the road shrunk by 1 cm: an edge shared with its own road is no hit
+    ti,ai=shapely.STRtree(shapely.buffer(parts,-.01,quad_segs=1)).query(polys,predicate='intersects')
+    hit=np.zeros(len(v),dtype=bool); hit[ti]=True
+    out=list(v[~hit])
+    if not len(ti):
+        return out
+    # subtract each triangle's roads one per round, all triangles of a round in one call
+    order=np.argsort(ti,kind='stable'); ti,ai=ti[order],ai[order]
+    rank=np.arange(len(ti))-np.searchsorted(ti,ti)
+    pieces=polys.copy()
+    for r in range(rank.max()+1):
+        sel=rank==r
+        pieces[ti[sel]]=shapely.difference(pieces[ti[sel]],parts[ai[sel]])
+    for k in np.flatnonzero(hit):
+        piece=pieces[k]
+        if piece.is_empty or piece.area<1e-4:
+            continue
+        a,b,c=v[k]
+        e1,e2=b[:2]-a[:2],c[:2]-a[:2]
+        den=e1[0]*e2[1]-e2[0]*e1[1]
+        if abs(den)<1e-12:
+            continue
+        for xy in triangles(piece):
+            d=xy-a[:2]
+            u=(d[:,0]*e2[1]-e2[0]*d[:,1])/den; w=(e1[0]*d[:,1]-d[:,0]*e1[1])/den
+            out.append(np.column_stack([xy,a[2]+u*(b[2]-a[2])+w*(c[2]-a[2])]))
+    return out
+
+
 def build_road(store, rect, center=None):
-    mesh=Mesh(rect); candidates=[]
+    mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]
     pad=SHOULDER+1   # a verge reaches into the tile from a road whose bounds do not
     for fid,kind,data,geom in store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad),{'road','junction'}):
         if kind=='junction':
             h=corner_heights(data)
             mesh.polygon('road',geom,h)
             if data['raise']==0:
-                mesh.add_many('ground',junction_verge(store,geom,h)[0])
+                verges.extend(junction_verge(store,geom,h)[0]); asphalt.append(geom)
             continue
         tris,_,xy,z,tangents,knots,verge=road_surface(store,data,footprint=False)
         mesh.add_many('road',tris)
-        mesh.add_many('ground',verge)
+        verges.extend(verge)
+        if verge:          # ground-level roads only: a bridge deck keeps the ground under it
+            asphalt.append(shapely.make_valid(Polygon(np.vstack([xy+np.column_stack([-tangents[:,1],tangents[:,0]])*data['width']/2,
+                                                                (xy-np.column_stack([-tangents[:,1],tangents[:,0]])*data['width']/2)[::-1]]))))
         # Marking uses the exact strip profile; no independent road height sampling.
         if data['width']>=5:
             for k in range(len(xy)-1):
@@ -250,6 +292,7 @@ def build_road(store, rect, center=None):
                 penalty=0 if data['width']>=5 else 150
                 candidates.append((np.linalg.norm(pos-target)+penalty,{'pos':[float(pos[0]),float(pos[1]),float(z[k]+.65)],
                                   'yaw':float(math.atan2(tangents[k,0],-tangents[k,1]))}))
+    mesh.add_many('ground',clip_verges(verges,asphalt))
     spawn=min(candidates,key=lambda x:x[0])[1] if candidates else None
     return mesh,spawn
 

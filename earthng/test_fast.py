@@ -111,6 +111,20 @@ class FastGeometryTests(unittest.TestCase):
               'prof':[[0,200],[48,48]]}
         self.assertEqual(fast.road_surface(Store(),data)[6],[])
 
+    def test_verges_are_cut_out_of_other_roads(self):
+        # a sloped verge strip crossing a 6 m road: none of it may stay on the road
+        verge=[np.array([[0.,0,10],[20,0,12],[20,4,14]]),np.array([[0.,0,10],[20,4,14],[0,4,12]])]
+        road=Polygon([(8,-5),(14,-5),(14,9),(8,9)])
+        own=Polygon([(0,-3),(20,-3),(20,0),(0,0)])       # shares an edge only: untouched
+        out=fast.clip_verges(verge,[road,own])
+        plane=lambda x,y: 10+x*.1+y*.5
+        area=0
+        for t in out:
+            poly=Polygon(t[:,:2]); area+=poly.area
+            self.assertLess(poly.intersection(road).area,1e-6)
+            for x,y,z in t: self.assertAlmostEqual(z,plane(x,y),places=6)
+        self.assertAlmostEqual(area,80-6*4,places=4)
+
     def test_add_many_equals_add(self):
         rng=np.random.default_rng(1); tris=rng.uniform(-50,550,(400,3,3)); tris[:,:,2]=rng.uniform(0,5,(400,3))
         for kind in ('road','building'):
