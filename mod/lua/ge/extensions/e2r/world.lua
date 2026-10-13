@@ -770,7 +770,25 @@ local function runTest()
   -- automation: pick, land, drive (straight, or the route with the autopilot), screenshots
   local t = S.now - (S.phaseAt or 0)
   -- manual play: the automation only picks the point and lands; the player drives from there
-  if test.manual and S.testLanded and S.state ~= 'pick' then return end
+  if test.manual and S.testLanded and S.state ~= 'pick' then
+    -- keep the report current for the drive (it was frozen at the landing, play-bilychi-01)
+    if S.state == 'driving' and S.now - (S.manualSaveAt or 0) > 5 then
+      S.manualSaveAt = S.now
+      result.status = 'manual'
+      result.driveFrames = S.driveAcc and accStats(S.driveAcc) or nil
+      local veh = getPlayerVehicle(0)
+      if veh then
+        local p = veh:getPosition()
+        S.trace = S.trace or {}
+        table.insert(S.trace, {math.floor(S.now), math.floor(p.x), math.floor(p.y), math.floor(p.z * 10) / 10,
+                               math.floor(veh:getVelocity():length() * 10) / 10, countTiles()})
+        if #S.trace > 4000 then table.remove(S.trace, 1) end
+        result.trace = S.trace
+      end
+      saveResult()
+    end
+    return
+  end
   if S.state == 'pick' and not S.testPicked and (S.tex or test.skipMap) and t > 3 then
     shot('1-picker')
     goTo(test.lat, test.lon, 15)

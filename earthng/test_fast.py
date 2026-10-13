@@ -11,6 +11,7 @@ import shapely
 from shapely.geometry import Polygon
 
 import fast
+import fast_profile
 import fast_sources as sources
 from fast_server import candidates
 
@@ -69,7 +70,8 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return {1:40.12,2:55.12}[n]
-        data={'xy':[[0,0],[1000,0]],'cuts':[5,5],'width':7,'tags':{},'nodes':[1,2]}
+        data={'xy':[[0,0],[1000,0]],'cuts':[5,5],'width':7,'tags':{},'nodes':[1,2],
+              'prof':[[0,333,1000],[40,47,55]]}
         tris,*_=fast.road_surface(Store(),data)
         a=[c for t in tris for c in fast.clip_triangle(t,(0,-100,500,100))]
         b=[c for t in tris for c in fast.clip_triangle(t,(500,-100,1000,100))]
@@ -83,7 +85,8 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return 43.
-        data={'xy':[[10,10],[300,40]],'cuts':[0,0],'width':6,'tags':{},'nodes':[1,2]}
+        data={'xy':[[10,10],[300,40]],'cuts':[0,0],'width':6,'tags':{},'nodes':[1,2],
+              'prof':[[0,291.5],[43,44]]}
         tris,_,_,_,_,_,verge=fast.road_surface(Store(),data)
         self.assertTrue(verge)
         road_pts={tuple(np.round(p,6)) for t in tris for p in t}
@@ -104,7 +107,8 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return 48.
-        data={'xy':[[0,0],[200,0]],'cuts':[0,0],'width':8,'tags':{'bridge':'yes'},'nodes':[1,2]}
+        data={'xy':[[0,0],[200,0]],'cuts':[0,0],'width':8,'tags':{'bridge':'yes'},'nodes':[1,2],
+              'prof':[[0,200],[48,48]]}
         self.assertEqual(fast.road_surface(Store(),data)[6],[])
 
     def test_add_many_equals_add(self):
@@ -115,6 +119,57 @@ class FastGeometryTests(unittest.TestCase):
             b.add_many(kind,tris)
             key=lambda faces: sorted((tuple(np.round(v,6).ravel()),tuple(np.round(n,6))) for v,n in faces)
             self.assertEqual(key(a.faces[kind]),key(b.faces[kind]))
+
+
+
+class ProfileTests(unittest.TestCase):
+    @staticmethod
+    def chain(xs, tags_at=lambda k: {}):
+        """Straight road split into segments at xs (shared nodes 1..n)."""
+        return [{'xy':[[a,0],[b,0]],'nodes':[k+1,k+2],'tags':tags_at(k)} for k,(a,b) in enumerate(zip(xs,xs[1:]))]
+
+    def test_noisy_flat_dem_gives_gentle_road(self):
+        rng=np.random.default_rng(3)
+        noise=lambda xy: 40+rng.normal(0,1.5,len(xy))      # 24 m DEM noise floor
+        segs=self.chain([0,12,25,31,60,200,215,400])
+        prof,_=fast_profile.solve(segs,noise)
+        g=max(np.abs(np.diff(h)/np.maximum(np.diff(s),.5)).max() for s,h in prof)
+        self.assertLess(g,.06)
+
+    def test_shared_nodes_have_one_height(self):
+        segs=self.chain([0,30,90,140])+[{'xy':[[30,0],[30,80]],'nodes':[2,9],'tags':{}}]
+        prof,nodes=fast_profile.solve(segs,lambda xy: 40+np.asarray(xy)[:,0]*.03+np.asarray(xy)[:,1]*.05)
+        self.assertAlmostEqual(prof[0][1][-1],prof[1][1][0])
+        self.assertAlmostEqual(prof[0][1][-1],prof[3][1][0])
+        self.assertAlmostEqual(nodes[2],prof[3][1][0])
+
+    def test_building_passage_is_not_a_tunnel(self):
+        flat=lambda xy: np.full(len(xy),40.)
+        segs=self.chain([0,100,140,240],lambda k:{'tunnel':'building_passage'} if k==1 else {})
+        prof,_=fast_profile.solve(segs,flat)
+        self.assertLess(max(np.abs(h-40).max() for _,h in prof),1e-3)
+
+    def test_bridge_over_a_valley_ramps_smoothly(self):
+        # river valley 12 m deep under a 300 m bridge: no step at the abutments
+        valley=lambda xy: 40-12*(np.abs(np.asarray(xy)[:,0]-500)<150)
+        segs=self.chain([0,200,350,650,800,1000],lambda k:{'bridge':'yes','layer':'1'} if k==2 else {})
+        prof,_=fast_profile.solve(segs,valley)
+        s=np.concatenate([p[0]+segs[k]['xy'][0][0] for k,p in enumerate(prof)])
+        h=np.concatenate([p[1] for p in prof])
+        order=np.argsort(s,kind='stable'); s,h=s[order],h[order]
+        keep=np.r_[True,np.diff(s)>.01]; s,h=s[keep],h[keep]
+        grade=np.abs(np.diff(h)/np.diff(s))
+        self.assertLess(grade.max(),.08)
+        mid=h[np.argmin(np.abs(s-500))]
+        self.assertGreater(mid,40-12+6)          # the deck stays well above the river
+
+    def test_station_ids_end_at_nodes(self):
+        segs=self.chain([0,7,50,51.5])
+        st,ids,pos,seg_of,run,nvar=fast_profile.stations(segs,{1:0,2:1,3:2,4:3})
+        for k in range(len(segs)):
+            run_ids=ids[seg_of==k]
+            self.assertEqual((run_ids[0],run_ids[-1]),(k,k+1))
+        self.assertEqual(len(set(ids.tolist())),nvar)
 
 
 if __name__=='__main__':

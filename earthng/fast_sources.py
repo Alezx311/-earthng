@@ -19,9 +19,10 @@ import shapely
 from shapely.geometry import LineString, MultiPoint, shape
 from shapely.ops import transform
 
-VERSION = 'fast-2'          # source index format (keys fast-index/<id>)
-GEOMETRY = 'fast-4'         # mesh/material semantics; bump to reject tiles built by older code
+VERSION = 'fast-3'          # source index format (keys fast-index/<id>)
+GEOMETRY = 'fast-5'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
+ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
 CRS = 'EPSG:32636'
 ORIGIN = (324000., 5590000.) # fixed UTM anchor, independent of landing and source bounds
@@ -168,7 +169,7 @@ def prepare(source, output, dem, emit=print):
             emit(f'index {n+1}/{len(index["tiles"])} sources, {len(roads)} roads, {time.perf_counter()-started:.1f}s')
     emit(f'roads parsed in {time.perf_counter()-started:.1f}s')
     refs = Counter(n[0] for _, nodes in roads.values() for n in nodes)
-    segments, mouths = [], defaultdict(list)
+    segments, arcs, mouths = [], [], defaultdict(list)
     for wid, (tags, nodes) in sorted(roads.items()):
         x, y = frame.local([n[1] for n in nodes], [n[2] for n in nodes])
         xy = np.column_stack([x,y])
@@ -178,18 +179,26 @@ def prepare(source, output, dem, emit=print):
             pts = pts[np.r_[True, np.linalg.norm(np.diff(pts,axis=0),axis=1)>0.01]]
             if len(pts)<2:
                 continue
-            line = LineString(pts)
-            if line.length < .1:
+            cum = np.r_[0., np.cumsum(np.linalg.norm(np.diff(pts,axis=0),axis=1))]
+            if cum[-1] < .1:
                 continue
             width = road_width(tags)
             seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': pts.tolist(),
                    'nodes': [nodes[a][0],nodes[b][0]], 'width': width}
-            segments.append(seg)
+            segments.append(seg); arcs.append((pts, cum))
             for end in (0,1):
                 p = pts if end == 0 else pts[::-1]
-                d = p[1]-p[0]; d /= np.linalg.norm(d)
-                mouths[seg['nodes'][end]].append((seg['id'],end,p[0].tolist(),d.tolist(),width,line.length))
+                mouths[seg['nodes'][end]].append((seg['id'],end,p[0].tolist(),None,width,float(cum[-1])))
     del roads, refs
+    # one height solve for the whole graph: shared nodes, smooth grades, soft bridges/tunnels
+    import fast_profile
+    terrain = Terrain(dem, frame)
+    mosaic = fast_profile.Mosaic(terrain, np.concatenate([np.asarray(seg['xy']) for seg in segments]))
+    profiles, node_h = fast_profile.solve(segments, lambda q: mosaic.sample(q, missing=True), emit=emit)
+    for seg, (ps, ph) in zip(segments, profiles):
+        seg['prof'] = [np.round(ps, 2).tolist(), np.round(ph, 3).tolist()]
+    del mosaic, profiles
+    emit(f'profile ready: {time.perf_counter()-started:.1f}s')
     tmp = target / f'sources.{os.getpid()}.tmp'
     db = sqlite3.connect(tmp)
     db.executescript('''CREATE TABLE features(id INTEGER PRIMARY KEY, kind TEXT, data TEXT, geom BLOB);
@@ -197,15 +206,16 @@ def prepare(source, output, dem, emit=print):
         CREATE TABLE nodes(id INTEGER PRIMARY KEY, data TEXT);
         CREATE TABLE links(node INTEGER, segment INTEGER);
         CREATE INDEX links_node ON links(node);''')
-    def put(fid, kind, data, geom, pad=0):
-        x0,y0,x1,y1 = geom.bounds
-        db.execute('INSERT INTO features VALUES(?,?,?,?)',(fid,kind,json.dumps(data,separators=(',',':')),geom.wkb))
-        db.execute('INSERT INTO bounds VALUES(?,?,?,?,?)',(fid,x0-pad,x1+pad,y0-pad,y1+pad))
-    cutbacks = {}
+    # rows collected and written with executemany; geometry made in shapely's vector calls
+    # (one call per mouth/segment cost ~60 s of the cold start)
+    def along(sid, at):
+        pts, cum = arcs[sid-1]
+        return np.array([np.interp(at, cum, pts[:,0]), np.interp(at, cum, pts[:,1])])
+    cutbacks, node_rows, link_rows, junctions = {}, [], [], []
     for nid, entries in mouths.items():
         # Complete shared node ownership; endpoints use square caps, junctions shared mouths.
         radius = max(e[4] for e in entries)*.8 if len(entries)>1 else 0.
-        corners = []
+        corners, cz = [], []
         level = 0.
         for sid, end, pos, direction, width, length in entries:
             tags = segments[sid-1]['tags']
@@ -213,24 +223,43 @@ def prepare(source, output, dem, emit=print):
                 level = max(level, max(1,number(tags.get('layer'),1))*6.5)
             cut = min(radius, length*.25)
             cutbacks[sid,end] = cut
-            line = LineString(segments[sid-1]['xy'])
-            s = cut if end == 0 else line.length-cut
-            p = np.array(line.interpolate(s).coords[0])
-            d = np.array(line.interpolate(min(line.length,s+.25)).coords[0])-np.array(line.interpolate(max(0,s-.25)).coords[0])
+            s = cut if end == 0 else length-cut
+            q = along(sid, [s, min(length,s+.25), max(0,s-.25)])
+            p, d = q[:,0], q[:,1]-q[:,2]
             d /= max(1e-9,np.linalg.norm(d))
             normal = np.array([-d[1],d[0]])*width/2
             corners.extend([(p+normal).tolist(),(p-normal).tolist()])
-            db.execute('INSERT INTO links VALUES(?,?)',(nid,sid))
-        data = {'xy': entries[0][2], 'raise': level, 'segments': [e[0] for e in entries]}
-        db.execute('INSERT INTO nodes VALUES(?,?)',(nid,json.dumps(data)))
+            # the corner sits on its own road's profile at the mouth: the strip meets it exactly
+            ps, ph = segments[sid-1]['prof']
+            cz.extend([float(np.interp(s, ps, ph)) + ROAD_LIFT]*2)
+            link_rows.append((nid,sid))
+        data = {'xy': entries[0][2], 'raise': level, 'segments': [e[0] for e in entries],
+                'h': node_h[nid] + ROAD_LIFT}
+        node_rows.append((nid,json.dumps(data)))
         if len(entries)>1:
-            polygon = MultiPoint(corners).convex_hull
-            if polygon.area > .01:
-                put(-nid,'junction',dict(data,node=nid),polygon)
-    for seg in segments:
+            junctions.append((nid, data, corners, cz))
+    feature_rows, bound_rows = [], []
+    if junctions:
+        counts = [len(j[2]) for j in junctions]
+        hulls = shapely.convex_hull(shapely.multipoints(np.concatenate([j[2] for j in junctions]),
+                                                        indices=np.repeat(np.arange(len(junctions)), counts)))
+        areas, wkbs, bounds = shapely.area(hulls), shapely.to_wkb(hulls), shapely.bounds(hulls)
+        for (nid, data, corners, cz), area, wkb, (x0,y0,x1,y1) in zip(junctions, areas, wkbs, bounds):
+            if area > .01:
+                feature_rows.append((-nid,'junction',json.dumps(dict(data,node=nid,corners=corners,cz=cz),separators=(',',':')),wkb))
+                bound_rows.append((-nid,x0,x1,y0,y1))
+    lines = shapely.linestrings(np.concatenate([a[0] for a in arcs]),
+                                indices=np.repeat(np.arange(len(arcs)), [len(a[0]) for a in arcs]))
+    for seg, wkb, (x0,y0,x1,y1) in zip(segments, shapely.to_wkb(lines), shapely.bounds(lines)):
         seg['cuts'] = [cutbacks[seg['id'],0],cutbacks[seg['id'],1]]
         # Bounds include end mouths so a query always includes the owning segment.
-        put(seg['id'],'road',seg,LineString(seg['xy']),seg['width']/2+1)
+        pad = seg['width']/2+1
+        feature_rows.append((seg['id'],'road',json.dumps(seg,separators=(',',':')),wkb))
+        bound_rows.append((seg['id'],x0-pad,x1+pad,y0-pad,y1+pad))
+    db.executemany('INSERT INTO features VALUES(?,?,?,?)', feature_rows)
+    db.executemany('INSERT INTO bounds VALUES(?,?,?,?,?)', bound_rows)
+    db.executemany('INSERT INTO nodes VALUES(?,?)', node_rows)
+    db.executemany('INSERT INTO links VALUES(?,?)', link_rows)
     db.commit(); db.close()
     meta = {'id':identity,'generator':VERSION,'bbox':index['package_box'],'center':[30.52,50.45],
             'dem':str(Path(dem).resolve()), 'source':str(Path(source).resolve()),
@@ -269,8 +298,7 @@ class Store:
         if nid in self.heights:
             self.heights.move_to_end(nid)
             return self.heights[nid]
-        n = self.node(nid)
-        h = float(self.terrain.sample([n['xy']],smooth=True)[0]+n['raise']+.12)
+        h = float(self.node(nid)['h'])     # solved with the whole graph (fast_profile)
         self.heights[nid] = h
         if len(self.heights)>8192:
             self.heights.popitem(last=False)

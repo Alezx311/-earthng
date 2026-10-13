@@ -16,6 +16,7 @@ import shapely
 from shapely.geometry import LineString, Polygon, box
 from shapely.ops import substring
 
+import fast_profile
 import fast_sources as sources
 import s1
 
@@ -160,13 +161,24 @@ def strip(inner, outer):
     return tris
 
 
+def corner_heights(data):
+    """Height at a junction polygon vertex: the corner's own road profile at its mouth. The
+    polygon is the corners' convex hull, so every vertex is one of them (nearest = exact)."""
+    corners=np.asarray(data['corners'],dtype=float); cz=np.asarray(data['cz'],dtype=float)
+    def at(xy):
+        xy=np.asarray(xy,dtype=float).reshape(-1,2)
+        d=((xy[:,None,:]-corners[None,:,:])**2).sum(axis=2)
+        return cz[d.argmin(axis=1)]
+    return at
+
+
 def junction_verge(store, geom, height):
     """A verge ring round a ground-level junction (convex) and the hole it leaves in the ground."""
     ring=np.asarray(geom.exterior.coords)[:,:2]
     c=np.asarray(geom.centroid.coords[0])
     d=ring-c; d/=np.maximum(np.linalg.norm(d,axis=1)[:,None],1e-9)
     outer=ring+d*SHOULDER
-    inner3=np.column_stack([ring,np.full(len(ring),height)])
+    inner3=np.column_stack([ring,height(ring) if callable(height) else np.full(len(ring),height)])
     outer3=np.column_stack([outer,ground_z(store,outer)])
     return strip(inner3,outer3), Polygon(outer).buffer(0)
 
@@ -183,22 +195,12 @@ def road_surface(store, data, footprint=True):
     tangent=after-before
     tangent/=np.maximum(np.linalg.norm(tangent,axis=1)[:,None],1e-9)
     normal=np.column_stack([-tangent[:,1],tangent[:,0]])*data['width']/2
-    z=store.terrain.sample(xy,smooth=True)+.12
-    ends=[store.height(n) for n in data['nodes']]
-    tags=data['tags']
-    bridge=tags.get('bridge') not in (None,'no')
-    tunnel=tags.get('tunnel') not in (None,'no')
-    u=(knots-a)/max(.01,length-a-b)
-    if bridge:
-        z=ends[0]*(1-u)+ends[1]*u
-    else:
-        # C1 endpoint corrections; junction elevations are shared for every incident road.
-        span=min(120.,max(1.,(length-a-b)/2))
-        w0=np.clip(1-(knots-a)/span,0,1); w0=w0*w0*(3-2*w0)
-        w1=np.clip(1-(length-b-knots)/span,0,1); w1=w1*w1*(3-2*w1)
-        z=z+(ends[0]-z[0])*w0+(ends[1]-z[-1])*w1
-        if tunnel:
-            z-=number_layer(tags)*3.5*np.sin(np.pi*u)**2
+    # the whole graph's solved profile (fast_profile): no per-segment DEM, so no ramps between
+    # independently sampled node heights, no pits under building passages
+    ps,ph=data['prof']
+    z=np.interp(knots,ps,ph)+sources.ROAD_LIFT
+    k=fast_profile.kind(data['tags'])
+    bridge,tunnel=k=='bridge',k=='tunnel'
     left,right=np.column_stack([xy+normal,z]),np.column_stack([xy-normal,z])
     tris=strip(left,right)
     verge=[]; outline=(left[:,:2],right[:,:2])
@@ -215,16 +217,12 @@ def road_surface(store, data, footprint=True):
     return tris, foot, xy, z, tangent, knots, verge
 
 
-def number_layer(tags):
-    return max(1,abs(sources.number(tags.get('layer'),1)))
-
-
 def build_road(store, rect, center=None):
     mesh=Mesh(rect); candidates=[]
     pad=SHOULDER+1   # a verge reaches into the tile from a road whose bounds do not
     for fid,kind,data,geom in store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad),{'road','junction'}):
         if kind=='junction':
-            h=store.height(data['node'])
+            h=corner_heights(data)
             mesh.polygon('road',geom,h)
             if data['raise']==0:
                 mesh.add_many('ground',junction_verge(store,geom,h)[0])
