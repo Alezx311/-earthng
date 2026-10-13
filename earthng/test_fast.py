@@ -41,7 +41,7 @@ class FastGeometryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m=fast.Mesh((0,0,500,500)); m.add('road',np.array([[10.,10.,50.],[20.,10.,50.],[10.,20.,50.]]))
             items=m.write(Path(d),'test','0_0','road')
-            data=(Path(d)/'tiles/0_0/0_0_road_road_0.bin').read_bytes()
+            data=(Path(d)/'tiles/0_0/0_0_road_0.bin').read_bytes()
             self.assertEqual(struct.unpack_from('<I',data)[0],1)
             name_len=struct.unpack_from('<I',data,4)[0]; at=8+name_len
             nv,ni=struct.unpack_from('<II',data,at); at+=8
@@ -134,7 +134,7 @@ class FastGeometryTests(unittest.TestCase):
             grid+=[np.array([h(x,y),h(x+10,y+10),h(x,y+10)]) for x in range(0,50,10) for y in range(0,50,10)]
             m.add_many('ground',grid)
             item=m.write(Path(d),'t','0_0','road')[0]
-            data=(Path(d)/'tiles/0_0/0_0_road_ground_0.bin').read_bytes()
+            data=(Path(d)/'tiles/0_0/0_0_road_0.bin').read_bytes()
             l=struct.unpack_from('<I',data,4)[0]; at=8+l
             nv,ni=struct.unpack_from('<II',data,at); at+=8
             self.assertEqual(nv,36)                      # 6x6 grid points instead of 150 corners
@@ -170,6 +170,26 @@ class FastGeometryTests(unittest.TestCase):
                 n=np.cross(quad[1]-quad[0],quad[2]-quad[0])
                 mid=(np.array(p)+np.array(q))/2
                 self.assertGreater(float(n[:2]@(mid-[5,5])),0)
+
+    def test_pieces_pack_kinds_and_stay_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            m=fast.Mesh((0,0,500,500))
+            rng=np.random.default_rng(2)
+            for kind,n in (('road',900),('mark',300),('ground',1000),('sidewalk',100)):
+                base=rng.uniform(10,490,(n,1,3)); base[:,:,2]=5
+                m.add_many(kind,base+np.array([[0,0,0],[1,0,0],[0,1,0]]))
+            items=m.write(Path(d),'t','0_0','road')
+            self.assertEqual(sum(it['triangles'] for it in items),2300)
+            self.assertTrue(all(it['triangles']<=fast.Mesh.PIECE for it in items))
+            self.assertLess(len(items),5)                 # was one object per kind and 750 tris
+            for it in items:
+                data=(Path(d)/it['shape'].split('/t/',1)[1]).read_bytes()
+                subs=struct.unpack_from('<I',data)[0]; at=4; names=[]
+                for _ in range(subs):
+                    l=struct.unpack_from('<I',data,at)[0]; names.append(data[at+4:at+4+l].rstrip(b'\x00').decode())
+                    at+=4+l; nv,ni=struct.unpack_from('<II',data,at); at+=8+4*(8*nv+ni)
+                self.assertEqual(at,len(data))
+                self.assertEqual(sorted(set(names)),sorted(it['mats']))
 
     def test_add_many_equals_add(self):
         rng=np.random.default_rng(1); tris=rng.uniform(-50,550,(400,3,3)); tris[:,:,2]=rng.uniform(0,5,(400,3))

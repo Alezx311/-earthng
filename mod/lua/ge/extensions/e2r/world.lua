@@ -282,9 +282,21 @@ local function writePose()
     active[key] = tile.failed and 'error' or (tile.collided and 'collision_active' or
       (tile.roadComplete and 'loaded' or 'loading'))
   end
-  jsonWriteFile('e2r_world/pose.json', {x = p.x, y = p.y, z = p.z, vx = v.x, vy = v.y, t = os.time(),
+  S.poseSeq = (S.poseSeq or 0) + 1
+  local pose = {x = p.x, y = p.y, z = p.z, vx = v.x, vy = v.y, t = os.time(), seq = S.poseSeq,
     region = S.stream and S.stream.region, state = S.state, ahead = ahead,
-    active = active, deliveryP99 = S.deliveryP99 or 2}, false)
+    active = active, deliveryP99 = S.deliveryP99 or 2}
+  -- a UDP datagram to the companion never blocks; writing pose.json once held a frame 5.2 s
+  -- (fast-replay-game-05). The file stays as the fallback for an older companion.
+  local port = S.status and S.status.posePort
+  if port then
+    if not S.udp or S.udpPort ~= port then
+      local ok, sock = pcall(function() local s = (socket or require('socket')).udp(); s:settimeout(0); s:setpeername('127.0.0.1', port); return s end)
+      S.udp, S.udpPort = ok and sock or nil, port
+    end
+    if S.udp and S.udp:send(jsonEncode(pose)) then return end
+  end
+  jsonWriteFile('e2r_world/pose.json', pose, false)
 end
 
 -- Every tile's materials file defines all of the region's shared names. Loading a file re-creates
@@ -352,7 +364,9 @@ local function updateTiles()
       S.tiles[key] = nil
       tile.dropped = true
       S.collisionDirty = true
-      S.removedCollision = true
+      -- fast: a far tile's stale collision is harmless until the next rebuild; forcing one per
+      -- unload (and per scene piece) made rebuilds back to back at 300 km/h
+      if not (S.stream and S.stream.generator) then S.removedCollision = true end
       result.unloaded = (result.unloaded or 0) + 1
     end
   end
@@ -439,7 +453,7 @@ local function stepQueue()
         table.sort(sorted)
         S.deliveryP99 = sorted[math.ceil(#sorted * .99)]
       end
-      if S.job.scene and not tile.dropped then S.collisionDirty = true; S.removedCollision = true end
+      if S.job.scene and not tile.dropped then S.collisionDirty = true; tile.sceneDirty = true end
     end
   until over()
 end
@@ -460,6 +474,11 @@ local function updateCollision()
       local cx, cy = tileCentre(tile.i, tile.j)
       if not p or math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) <= radius then near = true; break end
     end
+    -- buildings/ground next to the car get theirs soon; far scenery waits for a road rebuild
+    if fast and tile.sceneDirty and p then
+      local cx, cy = tileCentre(tile.i, tile.j)
+      if math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) <= 400 then near = true; break end
+    end
   end
   if not near then return end
   local timer = hptimer()
@@ -469,6 +488,7 @@ local function updateCollision()
   result.collisionReloads = (result.collisionReloads or 0) + 1
   for _, tile in pairs(S.tiles) do
     if tile.roadComplete and not tile.failed then tile.collided = true end
+    tile.sceneDirty = false
   end
   S.collisionDirty, S.collisionAt = false, S.now
   S.removedCollision = false

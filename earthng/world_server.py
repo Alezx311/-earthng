@@ -96,6 +96,21 @@ class Server:
         self.stream, self.frame, self.pose, self.landing = None, None, None, None
         self.out_of_region = set()
         self.heading = None
+        # The pose also arrives as a UDP datagram: writing pose.json once blocked the game's
+        # frame for 5.2 s (fast-replay-game-05); a send to localhost never waits.
+        import socket
+        self.pose_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.pose_socket.bind(('127.0.0.1', 0))
+        self.status['posePort'] = self.pose_socket.getsockname()[1]
+        threading.Thread(target=self.receive_poses, daemon=True).start()
+
+    def receive_poses(self):
+        while True:
+            try:
+                data, _ = self.pose_socket.recvfrom(65536)
+                self.accept_pose(json.loads(data.decode('utf8')))
+            except (OSError, ValueError):
+                time.sleep(0.05)
 
     def region_boxes(self):
         return [json.loads(p.read_text(encoding='utf8'))['bbox'] for p in sorted(self.regions.glob('*/region.json'))]
@@ -336,6 +351,12 @@ class Server:
         try:
             pose = json.loads((self.io / 'pose.json').read_text(encoding='utf8'))
         except (OSError, json.JSONDecodeError):
+            return
+        self.accept_pose(pose)
+
+    def accept_pose(self, pose):
+        # the newest of file and datagram wins (t: game clock)
+        if self.pose and pose.get('seq', 0) < self.pose.get('seq', 0):
             return
         with self.lock:
             if self.stream and pose.get('region') == self.stream['region'] and pose.get('state') == 'driving':

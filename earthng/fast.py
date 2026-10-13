@@ -127,34 +127,50 @@ class Mesh:
         z=np.full(xy.shape[:2],height) if np.isscalar(height) else np.asarray(height(xy.reshape(-1,2))).reshape(-1,3)
         self.add_many(kind,np.concatenate([xy,z[:,:,None]],axis=2))
 
+    PIECE = 1500      # triangles per ProceduralMesh: one createMesh call, ~8 ms at most
+
+    def submesh(self, kind, batch):
+        corner=np.array([v for v,n in batch]).reshape(-1,3)
+        face_n=np.repeat([n for v,n in batch],3,axis=0)
+        # Shared vertices: ~2x fewer for the game's Lua to turn into tables, and smooth
+        # normals on ground and roads. Walls keep hard edges (welded by normal too).
+        weld=np.round(corner*1000).astype(np.int64)
+        if is_wall(kind):
+            weld=np.column_stack([weld,np.round(face_n*100).astype(np.int64)])
+        _,first,inverse=np.unique(weld,axis=0,return_index=True,return_inverse=True)
+        inverse=inverse.ravel()
+        verts=corner[first]
+        normals=np.zeros_like(verts); np.add.at(normals,inverse,face_n)
+        normals/=np.maximum(np.linalg.norm(normals,axis=1)[:,None],1e-9)
+        # Input is CCW; ProceduralMesh expects the opposite winding.
+        idx=inverse.reshape(-1,3)[:,[0,2,1]].ravel().tolist()
+        return {'mat':'e2rf_'+kind,'p':(verts-self.origin).ravel().tolist(),
+                'n':normals.ravel().tolist(),'t':uv(kind,verts,normals).ravel().tolist(),'i':idx}
+
     def write(self, dest, region, key, layer):
-        items=[]
+        """Pieces of up to PIECE triangles, each holding submeshes of several kinds: every
+        kind its own object made be:reloadCollision 78 ms (fast-replay-game-04)."""
+        items=[]; subs=[]; tris=0; mats=[]
+        def flush():
+            nonlocal subs,tris,mats
+            if not subs:
+                return
+            name=f'{key}_{layer}_{len(items)}'
+            rel=f'tiles/{key}/{name}.bin'
+            path=dest/rel; path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(s1.write_bin(subs)); warm(path)
+            items.append({'kind':'proc','name':'e2rf_'+name,'pos':self.origin,
+                          'shape':f'/e2r_stream/{region}/{rel}','triangles':tris,
+                          'mats':mats, 'layer':layer})
+            subs,tris,mats=[],0,[]
         for kind, faces in sorted(self.faces.items()):
             for offset in range(0,len(faces),750):
                 batch=faces[offset:offset+750]
-                corner=np.array([v for v,n in batch]).reshape(-1,3)
-                face_n=np.repeat([n for v,n in batch],3,axis=0)
-                # Shared vertices: ~4x fewer for the game's Lua to turn into tables, and smooth
-                # normals on ground and roads. Buildings keep hard edges (welded by normal too).
-                weld=np.round(corner*1000).astype(np.int64)
-                if is_wall(kind):
-                    weld=np.column_stack([weld,np.round(face_n*100).astype(np.int64)])
-                _,first,inverse=np.unique(weld,axis=0,return_index=True,return_inverse=True)
-                inverse=inverse.ravel()
-                verts=corner[first]
-                normals=np.zeros_like(verts); np.add.at(normals,inverse,face_n)
-                normals/=np.maximum(np.linalg.norm(normals,axis=1)[:,None],1e-9)
-                # Input is CCW; ProceduralMesh expects the opposite winding.
-                idx=inverse.reshape(-1,3)[:,[0,2,1]].ravel().tolist()
-                sub={'mat':'e2rf_'+kind,'p':(verts-self.origin).ravel().tolist(),
-                     'n':normals.ravel().tolist(),'t':uv(kind,verts,normals).ravel().tolist(),'i':idx}
-                name=f'{key}_{layer}_{kind}_{offset//750}'
-                rel=f'tiles/{key}/{name}.bin'
-                path=dest/rel; path.parent.mkdir(parents=True,exist_ok=True)
-                path.write_bytes(s1.write_bin([sub])); warm(path)
-                items.append({'kind':'proc','name':'e2rf_'+name,'pos':self.origin,
-                              'shape':f'/e2r_stream/{region}/{rel}','triangles':len(batch),
-                              'mats':['e2rf_'+kind], 'layer':layer})
+                if tris+len(batch)>self.PIECE:
+                    flush()
+                subs.append(self.submesh(kind,batch)); tris+=len(batch)
+                if 'e2rf_'+kind not in mats: mats.append('e2rf_'+kind)
+        flush()
         return items
 
 
