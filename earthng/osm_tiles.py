@@ -4,7 +4,7 @@
 
 A fixed global grid of CELL x CELL degrees; tile (ix, iy) covers its cell grown by BUFFER degrees
 on every side and is written as ``<ix>_<iy>.osm.pbf``. The selection per tile is the one of
-akadem_maps.core.osm_extract.extract() for the buffered box (ways with a node inside, complete;
+Earth2Road's OSM extraction (earthng/osm_select.py) for the buffered box (ways with a node inside, complete;
 restriction/multipolygon/landmark relations with a member inside, completed; POI nodes inside),
 so a window that lies inside a tile's coverage cuts the same data from the tile as from the
 whole package. One read for all tiles instead of three passes per tile.
@@ -23,9 +23,7 @@ import time
 import osmium
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import paths  # noqa: E402,F401  (puts Earth2Road on sys.path)
-from akadem_maps.core.landmarks import category as landmark_category  # noqa: E402
-from akadem_maps.core.osm_extract import poi  # noqa: E402
+from osm_select import landmark_category, poi  # noqa: E402
 
 CELL = 0.05
 BUFFER = 0.01

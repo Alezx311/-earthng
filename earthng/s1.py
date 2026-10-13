@@ -26,7 +26,10 @@ import xml.etree.ElementTree as ET
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402,F401  (puts Earth2Road and its tools/ on sys.path)
-from beamng_bench import EXE, log_metrics, memory  # noqa: E402
+try:    # Earth2Road's bench tools: only the benchmarks below need them, not the mesh format
+    from beamng_bench import EXE, log_metrics, memory  # noqa: E402
+except ImportError:
+    EXE = log_metrics = memory = None
 
 LEVEL = 'e2r_void'
 STREAM = 'e2r_stream/s1'

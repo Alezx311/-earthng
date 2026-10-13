@@ -682,7 +682,7 @@ def main():
     p.add_argument('--out',required=True); p.add_argument('--lat',type=float,default=50.4475)
     p.add_argument('--lon',type=float,default=30.5225); p.add_argument('--scene',action='store_true')
     a=p.parse_args(); started=time.perf_counter()
-    directory,meta=sources.prepare(a.sources,Path(a.out)/'index',a.dem)
+    directory,meta=sources.prepare(a.sources,Path(a.out)/'index',a.dem,point=(a.lon,a.lat))
     i,j=sources.Frame().tile_of(a.lon,a.lat)
     print(json.dumps(run(directory,i,j,a.out,Path(a.out)/'stream',center=(a.lon,a.lat))))
     if a.scene:

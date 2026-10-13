@@ -1,5 +1,5 @@
 """Cut a bbox out of a country .osm.pbf into a .osm.pbf, with the selection of Earth2Road's
-akadem_maps.core.osm_extract.extract() (which writes OSM XML): every way with a node inside,
+Earth2Road's OSM extraction (which writes OSM XML; rules in osm_select.py): every way with a node inside,
 restriction/multipolygon/landmark relations with a member inside and their members, all nodes
 of the selected ways, POI nodes inside. The input for earthng/osm_tiles.py.
 
@@ -13,9 +13,7 @@ import time
 import osmium
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import paths  # noqa: E402,F401  (puts Earth2Road on sys.path)
-from akadem_maps.core.landmarks import category as landmark_category  # noqa: E402
-from akadem_maps.core.osm_extract import drop_incomplete, poi  # noqa: E402
+from osm_select import drop_incomplete, landmark_category, poi  # noqa: E402
 
 
 def extract(pbf, out, bbox):

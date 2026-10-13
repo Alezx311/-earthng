@@ -21,7 +21,38 @@ import fast_style as style
 VERSION = 'v5'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
-ASSETS = Path(r'C:/Program Files (x86)/Steam/steamapps/common/BeamNG.drive/content/assets/materials')
+
+
+def game_dir():
+    """The BeamNG.drive install: BEAMNG_DIR, else the Steam libraries (registry and
+    libraryfolders.vdf), else the default Steam folder. None when not found."""
+    import os, re
+    candidates = []
+    if os.environ.get('BEAMNG_DIR'):
+        candidates.append(Path(os.environ['BEAMNG_DIR']))
+    steam = []
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as k:
+            steam.append(Path(winreg.QueryValueEx(k, 'SteamPath')[0]))
+    except OSError:
+        pass
+    steam.append(Path(r'C:/Program Files (x86)/Steam'))
+    for root in steam:
+        vdf = root / 'steamapps' / 'libraryfolders.vdf'
+        libs = [root]
+        if vdf.exists():
+            libs += [Path(m.replace('\\', '/')) for m in re.findall(r'"path"\s+"([^"]+)"', vdf.read_text(errors='ignore'))]
+        candidates += [lib / 'steamapps' / 'common' / 'BeamNG.drive' for lib in libs]
+    for c in candidates:
+        if (c / 'content' / 'assets' / 'materials').exists():
+            return c
+    return None
+
+
+GAME = game_dir()
+# the game's texture zips; without them the 'real' facades fall back to flat colours
+ASSETS = (GAME / 'content' / 'assets' / 'materials') if GAME else Path('missing')
 
 # wall style: (flat colour for toon, window kind) -- 'band' = office strip glazing
 FACADES = {
