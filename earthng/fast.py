@@ -218,23 +218,72 @@ def corner_heights(data):
     return at
 
 
-def junction_verge(store, geom, height):
-    """A verge ring round a ground-level junction (convex) and the hole it leaves in the ground."""
-    ring=np.asarray(geom.exterior.coords)[:,:2]
-    c=np.asarray(geom.centroid.coords[0])
+def junction_star(data):
+    """All mouth corners ordered by angle round the node: every corner is a vertex, so every
+    road's strip ends exactly on a junction edge. (The convex hull dropped the corners of a
+    narrow road meeting at a sharp angle and left its strip end 0.19 m off the surface.)"""
+    corners=np.asarray(data['corners'],dtype=float); cz=np.asarray(data['cz'],dtype=float)
+    c=np.asarray(data['xy'],dtype=float)
+    order=np.argsort(np.arctan2(corners[:,1]-c[1],corners[:,0]-c[0]))
+    ring=np.vstack([corners[order],corners[order[:1]]]); z=np.r_[cz[order],cz[order[:1]]]
+    return c, ring, z
+
+
+def junction_polygon(data):
+    c,ring,z=junction_star(data)
+    return shapely.make_valid(Polygon(ring))
+
+
+def junction_fan(geom, data):
+    """The junction surface as a fan from its node over the star of corners: every slope inside
+    is a slope from the node to one mouth, never a sliver between two mouths (a hull
+    triangulation tilted 16-24 % between corners)."""
+    c,ring,z=junction_star(data)
+    cz=float(data.get('h',np.mean(z)))
+    return [np.array([[*c,cz],[*ring[k],z[k]],[*ring[k+1],z[k+1]]]) for k in range(len(ring)-1)]
+
+
+def junction_walks(store, data):
+    """True when a road at this junction has sidewalks: the junction then gets a sidewalk ring."""
+    for sid in data['segments']:
+        row=store.db.execute('SELECT data FROM features WHERE id=?',(sid,)).fetchone()
+        if row and walk_sides(json.loads(row[0])['tags']):
+            return True
+    return False
+
+
+def junction_verge(store, geom, height, inset=0.):
+    """Rings round a ground-level junction (convex): a sidewalk ring of width inset at the
+    junction's own edge heights, then the verge down to the ground. Returns verge triangles,
+    the hole they leave in the ground, sidewalk triangles and the sidewalk zone."""
+    if isinstance(geom,dict):          # junction data: the star round its node
+        c,ring,z=junction_star(geom)
+        if not callable(height): z=np.full(len(ring),height)
+    else:
+        ring=np.asarray(geom.exterior.coords)[:,:2]
+        c=np.asarray(geom.centroid.coords[0])
+        z=height(ring) if callable(height) else np.full(len(ring),height)
     d=ring-c; d/=np.maximum(np.linalg.norm(d,axis=1)[:,None],1e-9)
-    outer=ring+d*SHOULDER
-    inner3=np.column_stack([ring,height(ring) if callable(height) else np.full(len(ring),height)])
+    inner3=np.column_stack([ring,z])
+    walk=[]; zone=None
+    if inset>0:
+        mid3=np.column_stack([ring+d*inset,z])
+        walk=strip(inner3,mid3); zone=Polygon(mid3[:,:2]).buffer(0)
+        inner3=mid3
+    outer=ring+d*(inset+SHOULDER)
     outer3=np.column_stack([outer,ground_z(store,outer)])
-    return strip(inner3,outer3), Polygon(outer).buffer(0)
+    return strip(inner3,outer3), Polygon(outer).buffer(0), walk, zone
 
 
 def walk_sides(tags):
     """Which sides get a sidewalk: city streets by default, unless the tags say otherwise."""
     if tags.get('highway') not in WALKS:
         return ()
-    v=tags.get('sidewalk','both')
-    return {'no':(),'none':(),'left':('left',),'right':('right',)}.get(v,('left','right'))
+    v=tags.get('sidewalk')
+    if v is None and tags.get('oneway') in ('yes','1'):
+        # one carriageway of a divided road: the inner sidewalk would lie on the other one
+        return ('right',)
+    return {'no':(),'none':(),'separate':('left','right'),'left':('left',),'right':('right',)}.get(v or 'both',('left','right'))
 
 
 def lane_marks(xy, z, tangent, knots, width, tags):
@@ -356,14 +405,16 @@ def clip_verges(verges, asphalt):
 
 
 def build_road(store, rect, center=None):
-    mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]; walks=[]; paving=[]
+    mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]; walks=[]; paving=[]; ring_walks=[]; rings=[]
     pad=SHOULDER+1   # a verge reaches into the tile from a road whose bounds do not
     for fid,kind,data,geom in store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad),{'road','junction'}):
         if kind=='junction':
             h=corner_heights(data)
-            mesh.polygon('road',geom,h)
+            mesh.add_many('road',junction_fan(geom,data))
             if data['raise']==0:
-                verges.extend(junction_verge(store,geom,h)[0]); asphalt.append(geom)
+                v,_,w,zone=junction_verge(store,data,h,SIDEWALK if junction_walks(store,data) else 0.)
+                verges.extend(v); asphalt.append(junction_polygon(data)); ring_walks.extend(w)
+                if zone is not None: rings.append(zone)
             continue
         tris,_,xy,z,tangents,knots,verge,walk,edges=road_surface(store,data,footprint=False)
         major=data['tags'].get('highway','').replace('_link','') in MAJOR
@@ -390,8 +441,11 @@ def build_road(store, rect, center=None):
                 penalty=0 if data['width']>=5 else 150
                 candidates.append((np.linalg.norm(pos-target)+penalty,{'pos':[float(pos[0]),float(pos[1]),float(z[k]+.65)],
                                   'yaw':float(math.atan2(tangents[k,0],-tangents[k,1]))}))
-    mesh.add_many('sidewalk',clip_verges(walks,asphalt))
-    mesh.add_many('ground',clip_verges(verges,asphalt+paving))
+    # a road's sidewalk stops at the junction's sidewalk ring (two streets' sidewalks overlapped
+    # at the corner 0.29 m apart); the ring itself gives way to every road surface
+    mesh.add_many('sidewalk',clip_verges(walks,asphalt+rings))
+    mesh.add_many('sidewalk',clip_verges(ring_walks,asphalt))
+    mesh.add_many('ground',clip_verges(verges,asphalt+paving+rings))
     spawn=min(candidates,key=lambda x:x[0])[1] if candidates else None
     return mesh,spawn
 
@@ -405,7 +459,7 @@ def build_scene(store,rect):
         if kind=='road' and data['tags'].get('bridge') in (None,'no'):
             ground_holes.append(road_surface(store,data)[1])
         elif kind=='junction' and data['raise']==0:
-            ground_holes.append(geom.union(junction_verge(store,geom,0.)[1]))
+            ground_holes.append(junction_polygon(data).union(junction_verge(store,data,0.,SIDEWALK if junction_walks(store,data) else 0.)[1]))
         elif kind=='water':
             ground_holes.append(geom); blocked.append(geom)
             # Canonical water body level, shared by all tiles.

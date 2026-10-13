@@ -19,6 +19,48 @@ STEP = 20.0            # station spacing, m
 ALPHA = 40.0 ** 2      # grade smoothing length 40 m
 BETA = 50.0 ** 4       # grade-change smoothing length 50 m
 BRIDGE_CLEAR, TUNNEL_DEPTH, SOFT = 6.5, 7.0, 0.5
+# Grade weight on the first station gap out of a junction (3+ roads): roads leave it level, so
+# roads that overlap near it in plan are at one height. With free grades a link and the main
+# road diverged by 0.78 m over the main road's sidewalk, and junction polygons tilted 24 %.
+JUNCTION_FLAT = 10.0
+# Ground roads whose surfaces touch in plan (two carriageways of a divided road, a lane beside
+# a street) are tied to one height: on Khreshchatyk the carriageways overlapped by 1 m with
+# profiles up to 1.02 m apart.
+COUPLE = 1000.0
+
+
+def close_pairs(pos, seg_of, width, ground, same):
+    """Station -> nearby edge of another ground segment whose strip touches it: lateral
+    distance to the edge < half widths + 0.5 m. Returns station rows a, edge start rows e
+    (edge = e, e+1) and the parameter t of the closest point. Grid hashing, no SciPy."""
+    cell = 24.0
+    e0 = np.flatnonzero(same)                     # edge e0 -> e0+1, both of one segment
+    mid = (pos[e0] + pos[e0 + 1]) / 2
+    M = 1 << 21
+    def keys(xy, dx=0, dy=0):
+        return (np.floor(xy[:, 0] / cell).astype(np.int64) + dx + M) * (2 * M) + np.floor(xy[:, 1] / cell).astype(np.int64) + dy + M
+    ekey = keys(mid); order = np.argsort(ekey, kind='stable'); skey = ekey[order]
+    out = ([], [], [])
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            nk = keys(pos, dx, dy)
+            lo = np.searchsorted(skey, nk, 'left'); hi = np.searchsorted(skey, nk, 'right')
+            cnt = hi - lo
+            if not cnt.sum():
+                continue
+            ia = np.repeat(np.arange(len(pos)), cnt)
+            ie = e0[order[lo[ia] + (np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt))]]
+            keep = (seg_of[ia] != seg_of[ie]) & ground[ia] & ground[ie]
+            ia, ie = ia[keep], ie[keep]
+            a, b = pos[ie], pos[ie + 1]
+            ab = b - a; L2 = np.maximum((ab ** 2).sum(1), 1e-9)
+            t = np.clip(((pos[ia] - a) * ab).sum(1) / L2, 0, 1)
+            d = np.linalg.norm(pos[ia] - (a + ab * t[:, None]), axis=1)
+            keep = d < (width[ia] + width[ie]) / 2 + .5
+            out[0].append(ia[keep]); out[1].append(ie[keep]); out[2].append(t[keep])
+    if not out[0]:
+        return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
+    return tuple(np.concatenate(v) for v in out)
 
 
 def layer(tags):
@@ -110,10 +152,22 @@ def solve(segments, sample, iterations=400, tol=1e-3, emit=None):
     target[ids[inner]] = dem[ids[inner]] + off[inner]
     weight[ids[inner]] = np.where(known[ids[inner]], SOFT, 1e-3)
     mw = weight * np.maximum(mass, .5)
-    ce, ct = ALPHA / el, BETA / tl ** 3
+    degree = np.bincount(np.array([node_index[n] for seg in segments for n in seg['nodes']]), minlength=nvar)
+    flat = np.where((degree[ea] >= 3) | (degree[eb] >= 3), JUNCTION_FLAT, 1.)
+    ce, ct = ALPHA * flat / el, BETA / tl ** 3
+    widths = np.array([seg.get('width', 4.) for seg in segments])
+    pa, pe, pt = close_pairs(pos_st, seg_of, widths[seg_of], k_st == 0, same)
+    va, vb1, vb2 = ids[pa], ids[pe], ids[pe + 1]
+    keep = (va != vb1) & (va != vb2)
+    va, vb1, vb2, pt = va[keep], vb1[keep], vb2[keep], pt[keep]
     rows = [np.arange(nvar), ea, eb, ea, eb]
     cols = [np.arange(nvar), ea, eb, eb, ea]
     vals = [mw, ce, ce, -ce, -ce]
+    # residual h_a - (1-t) h_b1 - t h_b2, weight COUPLE
+    cv, cw = (va, vb1, vb2), (np.ones(len(va)), -(1 - pt), -pt)
+    for i in range(3):
+        for j in range(3):
+            rows.append(cv[i]); cols.append(cv[j]); vals.append(COUPLE * cw[i] * cw[j])
     trip, coef = (ta, tb, tc), (1., -2., 1.)
     for i in range(3):
         for j in range(3):
@@ -141,7 +195,7 @@ def solve(segments, sample, iterations=400, tol=1e-3, emit=None):
         z = r / diag; rz2 = r @ z
         p = z + (rz2 / rz) * p; rz = rz2
     if emit:
-        emit(f'profile: {nvar} stations, {it + 1} CG iterations, residual {math.sqrt(r @ r) / norm0:.1e}')
+        emit(f'profile: {nvar} stations, {len(va)} close station-edge pairs, {it + 1} CG iterations, residual {math.sqrt(r @ r) / norm0:.1e}')
     h = dem + x
     hs = h[ids]
     bounds = np.r_[run, len(s)]

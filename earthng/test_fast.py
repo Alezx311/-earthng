@@ -243,6 +243,18 @@ class ProfileTests(unittest.TestCase):
         mid=h[np.argmin(np.abs(s-500))]
         self.assertGreater(mid,40-12+6)          # the deck stays well above the river
 
+    def test_parallel_carriageways_share_height(self):
+        # two oneway halves 12 m apart, 13 m wide (they overlap), over a DEM tilted across them
+        dem=lambda xy: 40+np.asarray(xy)[:,1]*.15
+        segs=[{'xy':[[0,0],[300,0]],'nodes':[1,2],'tags':{},'width':13.},
+              {'xy':[[300,12],[0,12]],'nodes':[3,4],'tags':{},'width':13.}]
+        prof,_=fast_profile.solve(segs,dem)
+        a=np.interp(150,prof[0][0],prof[0][1]); b=np.interp(150,prof[1][0],prof[1][1])
+        self.assertLess(abs(a-b),.05)
+        far=[dict(segs[0]),dict(segs[1],xy=[[300,60],[0,60]])]
+        prof,_=fast_profile.solve(far,dem)                      # apart: each keeps its ground
+        self.assertGreater(abs(np.interp(150,prof[1][0],prof[1][1])-np.interp(150,prof[0][0],prof[0][1])),8)
+
     def test_station_ids_end_at_nodes(self):
         segs=self.chain([0,7,50,51.5])
         st,ids,pos,seg_of,run,nvar=fast_profile.stations(segs,{1:0,2:1,3:2,4:3})
