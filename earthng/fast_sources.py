@@ -168,18 +168,11 @@ class Terrain:
         return z + LIFT
 
 
-def prepare(source, output, dem, emit=print, point=None):
-    """Parse source tiles once, split roads at shared nodes, publish a read-only index.
-    A large package is indexed as a window round point (the landing)."""
+def read_roads(path, sha256):
+    """Drivable ways of one source tile: {way id: (tags, [(node, lon, lat), ...])}."""
     import osmium
-    started = time.perf_counter()
-    identity, index = source_identity(source, dem, point)
-    target = Path(output) / identity
-    final = target / 'sources.sqlite'
-    if final.exists():
-        return target, json.loads((target / 'region.json').read_text())
-    target.mkdir(parents=True, exist_ok=True)
-    frame = Frame()
+    if hashlib.sha256(Path(path).read_bytes()).hexdigest() != sha256:
+        raise ValueError(f'OSM checksum mismatch: {path}')
     roads = {}
 
     class Reader(osmium.SimpleHandler):
@@ -195,35 +188,71 @@ def prepare(source, output, dem, emit=print, point=None):
             if len(nodes) >= 2:
                 roads[w.id] = (dict(w.tags), nodes)
 
-    for n, entry in enumerate(index['tiles'].values()):
-        path = Path(source) / entry['file']
-        if hashlib.sha256(path.read_bytes()).hexdigest() != entry['sha256']:
-            raise ValueError(f'OSM checksum mismatch: {path}')
-        Reader().apply_file(str(path), locations=True)
-        if n % 20 == 0:
-            emit(f'index {n+1}/{len(index["tiles"])} sources, {len(roads)} roads, {time.perf_counter()-started:.1f}s')
+    Reader().apply_file(str(path), locations=True)
+    return roads
+
+
+def prepare(source, output, dem, emit=print, point=None):
+    """Parse source tiles once, split roads at shared nodes, publish a read-only index.
+    A large package is indexed as a window round point (the landing)."""
+    import osmium
+    started = time.perf_counter()
+    identity, index = source_identity(source, dem, point)
+    target = Path(output) / identity
+    final = target / 'sources.sqlite'
+    if final.exists():
+        return target, json.loads((target / 'region.json').read_text())
+    target.mkdir(parents=True, exist_ok=True)
+    frame = Frame()
+    roads = {}
+
+    files = [Path(source) / entry['file'] for entry in index['tiles'].values()]
+    shas = [entry['sha256'] for entry in index['tiles'].values()]
+    if len(files) > 24:
+        # tiles parse in parallel; merged in tile order, first copy of a way wins (as before)
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(min(6, os.cpu_count() or 2)) as pool:
+            parts = list(pool.map(read_roads, files, shas, chunksize=4))
+    else:
+        parts = [read_roads(f, h) for f, h in zip(files, shas)]
+    roads = {}
+    for part in parts:
+        for wid, road in part.items():
+            roads.setdefault(wid, road)
+    del parts
     emit(f'roads parsed in {time.perf_counter()-started:.1f}s')
     refs = Counter(n[0] for _, nodes in roads.values() for n in nodes)
+    order = sorted(roads)
+    lens = [len(roads[w][1]) for w in order]
+    lon = [n[1] for w in order for n in roads[w][1]]; lat = [n[2] for w in order for n in roads[w][1]]
+    X, Y = frame.local(lon, lat)            # one transform for every node (was one per way)
+    X, Y = X.tolist(), Y.tolist(); del lon, lat
     segments, arcs, mouths = [], [], defaultdict(list)
-    for wid, (tags, nodes) in sorted(roads.items()):
-        x, y = frame.local([n[1] for n in nodes], [n[2] for n in nodes])
-        xy = np.column_stack([x,y])
+    at = 0
+    hypot = math.hypot
+    for wid, count in zip(order, lens):
+        tags, nodes = roads[wid]
+        xy = list(zip(X[at:at + count], Y[at:at + count])); at += count
         cuts = [0] + [k for k in range(1,len(nodes)-1) if refs[nodes[k][0]] > 1] + [len(nodes)-1]
+        width = None
         for a, b in zip(cuts, cuts[1:]):
-            pts = xy[a:b+1]
-            pts = pts[np.r_[True, np.linalg.norm(np.diff(pts,axis=0),axis=1)>0.01]]
+            # points closer than 1 cm to the previous raw point dropped; arc length after that
+            pts = [xy[a]] + [xy[k] for k in range(a + 1, b + 1)
+                             if hypot(xy[k][0] - xy[k-1][0], xy[k][1] - xy[k-1][1]) > 0.01]
             if len(pts)<2:
                 continue
-            cum = np.r_[0., np.cumsum(np.linalg.norm(np.diff(pts,axis=0),axis=1))]
+            cum = [0.]
+            for k in range(1, len(pts)):
+                cum.append(cum[-1] + hypot(pts[k][0] - pts[k-1][0], pts[k][1] - pts[k-1][1]))
             if cum[-1] < .1:
                 continue
-            width = road_width(tags)
-            seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': pts.tolist(),
+            if width is None:
+                width = road_width(tags)
+            seg = {'id': len(segments)+1, 'way': wid, 'tags': tags, 'xy': [list(q) for q in pts],
                    'nodes': [nodes[a][0],nodes[b][0]], 'width': width}
-            segments.append(seg); arcs.append((pts, cum))
-            for end in (0,1):
-                p = pts if end == 0 else pts[::-1]
-                mouths[seg['nodes'][end]].append((seg['id'],end,p[0].tolist(),None,width,float(cum[-1])))
+            segments.append(seg); arcs.append((np.array(pts), np.array(cum)))
+            mouths[seg['nodes'][0]].append((seg['id'],0,list(pts[0]),None,width,cum[-1]))
+            mouths[seg['nodes'][1]].append((seg['id'],1,list(pts[-1]),None,width,cum[-1]))
     del roads, refs
     # one height solve for the whole graph: shared nodes, smooth grades, soft bridges/tunnels
     import fast_profile
