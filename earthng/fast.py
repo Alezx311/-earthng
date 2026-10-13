@@ -484,16 +484,26 @@ def build_road(store, rect, center=None):
         # Marking uses the exact strip profile; no independent road height sampling.
         mesh.add_many('mark',lane_marks(xy,z,tangents,knots,data['width'],data['tags']))
         mesh.add_many('mark',zebras(xy,z,tangents,knots,data))
+        # spawn away from junctions, on a real stretch of road: a knot near a segment end put
+        # the car across the main street at Bila Tserkva (fast-oblast-bc-01)
+        long_enough=knots[-1]-knots[0]>=40
         for k,p in enumerate(xy):
-            if rect[0]+5<p[0]<rect[2]-5 and rect[1]+5<p[1]<rect[3]-5:
+            if long_enough and knots[0]+15<=knots[k]<=knots[-1]-15 and rect[0]+5<p[0]<rect[2]-5 and rect[1]+5<p[1]<rect[3]-5:
                 normal=np.array([-tangents[k,1],tangents[k,0]])
                 # the right lane only where a 2 m car fits in it with room; narrow roads: the middle
                 pos=p-normal*max(0.,min(1.65,data['width']/2-1.6))
                 target=np.array(center or mesh.origin[:2])
                 # prefer a real carriageway over a lane or service road next to the point
-                penalty=0 if data['width']>=5 else 150
+                penalty=(0 if data['width']>=5 else 150)+max(0.,150-(knots[-1]-knots[0]))
+                # face the longer part of the road (more straight road ahead of the car)
+                sign=1 if knots[k]-knots[0]<=knots[-1]-knots[k] else -1
+                tx,ty=tangents[k,0]*sign,tangents[k,1]*sign
+                if sign<0:
+                    pos=p+normal*max(0.,min(1.65,data['width']/2-1.6))     # the right lane that way
                 candidates.append((np.linalg.norm(pos-target)+penalty,{'pos':[float(pos[0]),float(pos[1]),float(z[k]+.65)],
-                                  'yaw':float(math.atan2(tangents[k,0],-tangents[k,1]))}))
+                                  # BeamNG: quat(0,0,sin(yaw/2),cos(yaw/2)) faces (sin yaw, cos yaw) --
+                                  # atan2(tx,-ty) mirrored y and put the car across diagonal streets
+                                  'yaw':float(math.atan2(tx,ty))}))
     # a road's sidewalk stops at the junction's sidewalk ring (two streets' sidewalks overlapped
     # at the corner 0.29 m apart); the ring itself gives way to every road surface
     mesh.add_many('sidewalk',clip_verges(walks,asphalt+rings))

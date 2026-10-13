@@ -905,6 +905,12 @@ local function runTest()
     local veh = getPlayerVehicle(0)
     local p = veh:getPosition()
     result.vehicleSettled = {p.x, p.y, p.z}
+    local dir = veh:getDirectionVector()
+    local yaw = S.landing.spawn.yaw
+    -- the car's heading against the spawn's road direction (forward: sin, cos of yaw)
+    result.spawnHeading = {dir.x, dir.y, math.sin(yaw), math.cos(yaw)}
+    local hl = math.sqrt(dir.x ^ 2 + dir.y ^ 2) + 1e-9
+    result.spawnHeadingErrorDeg = math.deg(math.acos(math.max(-1, math.min(1, (dir.x * math.sin(yaw) + dir.y * math.cos(yaw)) / hl))))
     -- a first-run dialog over the game pauses the simulation (fast-game-02 stood still under one)
     local okR, cur = pcall(function() return extensions.ui_router.getCurrent() end)
     result.uiRoute = okR and cur and cur.request and cur.request.name or nil
@@ -976,6 +982,7 @@ local function runTest()
         if (result.replayDistanceM or 0) < want then table.insert(f, 'replay_short') end
       else
         if result.travelledM < (test.minDistance or 20) then table.insert(f, 'not_moved') end
+        if (result.spawnHeadingErrorDeg or 0) > 20 then table.insert(f, 'spawn_heading') end
         if result.vehicleSettled and S.lowestZ and S.lowestZ < result.vehicleSettled[3] - 30 then table.insert(f, 'fell') end
         if AP and (AP.assists or 0) > 0 then table.insert(f, 'assists') end
         if (result.waitSeconds or 0) > 0 then table.insert(f, 'waited_for_tiles') end
