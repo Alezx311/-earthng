@@ -247,5 +247,14 @@ def server_class(base):
                     wanted={k:v[0] for k,v in self.desired.items()},
                     buildP99=percentile(self.history),horizonSeconds=st.get('horizonSeconds',12),
                     loadRadius=st.get('loadRadius',1000),startupSeconds=time.monotonic()-self.landing['at'])
+                # how far the car is from the edge of the indexed window (the game warns near it)
+                pose,frame,b=self.pose,self.frame,st.get('bounds')
+                if pose and frame and b:
+                    try:
+                        lon,lat=frame.geographic(pose['x'],pose['y'])
+                        lon,lat=float(lon),float(lat)
+                        status['edgeKm']=round(min((lon-b[0])*71.5,(b[2]-lon)*71.5,(lat-b[1])*111.2,(b[3]-lat)*111.2),2)
+                    except Exception:
+                        pass
             return status
     return FastServer

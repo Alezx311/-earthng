@@ -800,6 +800,10 @@ local function drawWindow()
       im.Text(string.format('Компаньйон: %d готові, %d будуються, черга %d', st.readyCount or 0, st.building or 0, st.queued or 0))
     end
     local p = focus()
+    if st and st.edgeKm and st.edgeKm < 3 then
+      im.TextColored(im.ImVec4(1, 0.5, 0.2, 1), string.format('Край завантаженої області: %.1f км. Далі доріг немає -', math.max(0, st.edgeKm)))
+      im.TextColored(im.ImVec4(1, 0.5, 0.2, 1), 'висадьтеся ближче до нової точки ("Обрати інше місце").')
+    end
     if p and not tileLoadedAt(p.x, p.y) then
       im.TextColored(im.ImVec4(1, 0.7, 0.2, 1), 'Генерую світ попереду, зачекайте...')
     end
