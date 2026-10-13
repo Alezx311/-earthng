@@ -506,6 +506,7 @@ local function updateCollision()
   end
   S.collisionDirty, S.collisionAt = false, S.now
   S.removedCollision = false
+  return true
 end
 
 local function tileLoadedAt(x, y)
@@ -1127,10 +1128,12 @@ function M.tick(dt)
     local tPose = timer:stopAndReset()
     updateTiles()
     local tTiles = timer:stopAndReset()
-    stepQueue()
-    local tQueue = timer:stopAndReset()
-    updateCollision()
+    -- a frame that rebuilds the collision (up to ~65 ms) spawns no mesh: together with a
+    -- createMesh and the render they reached 98 ms (fast-oblast-replay-01)
+    local reloaded = updateCollision()
     local tColl = timer:stopAndReset()
+    if not reloaded then stepQueue() end
+    local tQueue = timer:stopAndReset()
     if tPose + tTiles + tQueue + tColl > 50 then
       result.slow = result.slow or {}
       if #result.slow < 60 then
