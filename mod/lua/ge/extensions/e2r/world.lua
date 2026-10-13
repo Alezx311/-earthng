@@ -515,6 +515,17 @@ local function beginArrival(job)
                       material = mat}}})
     obj:setPosition(vec3(sp[1] + (k % 12) * 4 - 24, sp[2] + math.floor(k / 12) * 4 - 24, sp[3] + 3))
   end
+  -- one instance of every streamed shape (trees), 40 m under the start for the whole session:
+  -- the shape loads now, not under the first tree while driving
+  local shapes = tileGroup('E2RWorldShapes')
+  for k, shape in ipairs(manifest.warmShapes or {}) do
+    local obj = createObject('TSStatic')
+    obj:setField('shapeName', 0, shape)
+    obj:setField('collisionType', 0, 'None')
+    obj:setPosRot(sp[1] + k * 3, sp[2], sp[3] - 40, 0, 0, 0, 1)
+    obj:registerObject('e2r_shape_' .. k)
+    shapes:addObject(obj)
+  end
   S.state, S.phaseAt, S.frames = 'warmup', S.now, {}
   result.readyAt, result.timings = S.now, job.timings
   saveResult()
@@ -882,7 +893,20 @@ local function runTest()
       AP = nil
       S.testDone = S.now
     end
-  elseif S.testDone and S.now - S.testDone > 2 then
+  elseif S.testDone and not S.overviewShot and S.now - S.testDone > 0.5 then
+    -- a view over the street from 60 m: the look of the city, not just the road under the car
+    local veh = getPlayerVehicle(0)
+    local p, d = veh:getPosition(), veh:getDirectionVector()
+    local f = vec3(d.x, d.y, 0):normalized()
+    local cam = vec3(p.x - f.x * 70, p.y - f.y * 70, p.z + 60)
+    local q = quatFromDir(vec3(p.x + f.x * 80, p.y + f.y * 80, p.z) - cam, vec3(0, 0, 1))
+    commands.setFreeCamera()
+    core_camera.setPosRot(0, cam.x, cam.y, cam.z, q.x, q.y, q.z, q.w)
+    S.overviewShot = S.now
+  elseif S.overviewShot and not S.overviewTaken and S.now - S.overviewShot > 1.5 then
+    shot('6-overview')
+    S.overviewTaken = S.now
+  elseif S.overviewTaken and S.now - S.overviewTaken > 1 then
     result.status = #result.failures == 0 and 'passed' or 'failed'
     saveResult()
     shutdown(0)

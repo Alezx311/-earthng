@@ -88,7 +88,7 @@ class FastGeometryTests(unittest.TestCase):
             def height(self,n): return 43.
         data={'xy':[[10,10],[300,40]],'cuts':[0,0],'width':6,'tags':{},'nodes':[1,2],
               'prof':[[0,291.5],[43,44]]}
-        tris,_,_,_,_,_,verge=fast.road_surface(Store(),data)
+        tris,_,_,_,_,_,verge,*_=fast.road_surface(Store(),data)
         self.assertTrue(verge)
         road_pts={tuple(np.round(p,6)) for t in tris for p in t}
         for t in verge:
@@ -143,6 +143,33 @@ class FastGeometryTests(unittest.TestCase):
             got=sorted(tuple(np.round(verts[t],4).ravel()) for t in idx)
             want=sorted(tuple(np.round(v,4).ravel()) for v,n in m.faces['ground'])
             self.assertEqual(got,want)
+
+    def test_sidewalk_sides_follow_tags(self):
+        self.assertEqual(fast.walk_sides({'highway':'residential'}),('left','right'))
+        self.assertEqual(fast.walk_sides({'highway':'residential','sidewalk':'no'}),())
+        self.assertEqual(fast.walk_sides({'highway':'tertiary','sidewalk':'right'}),('right',))
+        self.assertEqual(fast.walk_sides({'highway':'service'}),())
+
+    def test_lane_marks(self):
+        knots=np.arange(0,200.1,8.); xy=np.column_stack([knots,np.zeros_like(knots)])
+        t=np.tile([1.,0],(len(knots),1)); z=np.full(len(knots),10.)
+        area=lambda tris: sum(Polygon(q[:,:2]).area for q in tris)
+        two=fast.lane_marks(xy,z,t,knots,7,{'highway':'residential'})
+        four=fast.lane_marks(xy,z,t,knots,14,{'highway':'primary','lanes':'4'})
+        self.assertAlmostEqual(area(two),.12*3*17,places=6)        # dashed centre, 3 on 9 off
+        centre=[q for q in four if abs(q[:,1].mean())<.1]
+        self.assertAlmostEqual(area(centre),.12*200,places=6)     # solid centre on four lanes
+        self.assertTrue(all(np.allclose(q[:,2],10.008) for q in two))
+
+    def test_building_walls_face_outwards(self):
+        cw=Polygon([(0,0),(0,10),(10,10),(10,0)])                  # clockwise in OSM order
+        for poly in shapely.get_parts(shapely.orient_polygons(cw)):
+            ring=list(poly.exterior.coords)
+            for p,q in zip(ring,ring[1:]):
+                quad=np.array([[*p,0],[*q,0],[*q,5]])
+                n=np.cross(quad[1]-quad[0],quad[2]-quad[0])
+                mid=(np.array(p)+np.array(q))/2
+                self.assertGreater(float(n[:2]@(mid-[5,5])),0)
 
     def test_add_many_equals_add(self):
         rng=np.random.default_rng(1); tris=rng.uniform(-50,550,(400,3,3)); tris[:,:,2]=rng.uniform(0,5,(400,3))

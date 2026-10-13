@@ -18,16 +18,21 @@ from shapely.ops import substring
 
 import fast_profile
 import fast_sources as sources
+import fast_style as style
 import s1
 
-COLORS = {'road': [.18,.19,.20,1], 'mark': [.9,.88,.75,1], 'ground': [.29,.36,.22,1],
-          'water': [.12,.29,.38,1], 'building': [.58,.55,.49,1]}
-# Without groundType the wheels find no grip: fast-game-03 spun at 74 mph on the spot.
-GROUND = {'road': 'ASPHALT', 'mark': 'ASPHALT', 'ground': 'GRASS', 'water': 'MUD', 'building': 'ROCK'}
-MATERIALS = {f'e2rf_{name}': {'name':f'e2rf_{name}', 'mapTo':f'e2rf_{name}', 'class':'Material', 'version':1.5,
-             'groundType':GROUND[name], 'Stages':[{'diffuseColor':color}], 'doubleSided':False}
-             for name,color in COLORS.items()}
+# Every material has a groundType: without one the wheels find no grip (fast-game-03 spun
+# at 74 mph on the spot).
+MATERIALS = style.MATERIALS
+MAJOR = {'motorway', 'trunk', 'primary', 'secondary'}
+WALKS = {'primary', 'secondary', 'tertiary', 'residential', 'living_street', 'unclassified'}
+SIDEWALK = 2.0    # m each side, flush with the road
 _STORES = OrderedDict()
+
+
+def is_wall(kind):
+    """Vertical faces: keep their facing, keep hard edges, UV along the wall."""
+    return kind.startswith('wall_')
 
 
 def store_at(directory):
@@ -77,6 +82,7 @@ class Mesh:
         self.rect = rect
         self.origin = [(rect[0]+rect[2])/2,(rect[1]+rect[3])/2,0]
         self.faces = {}
+        self.statics = []      # TSStatic items (trees), written into the manifest as they are
 
     def add(self, kind, tri):
         for clipped in clip_triangle(tri,self.rect):
@@ -84,7 +90,7 @@ class Mesh:
             norm=np.linalg.norm(normal)
             if norm<1e-8:
                 continue
-            if kind != 'building' and normal[2]<0:
+            if not is_wall(kind) and normal[2]<0:
                 clipped=clipped[[0,2,1]]; normal=-normal
             self.faces.setdefault(kind,[]).append((clipped,normal/norm))
 
@@ -103,7 +109,7 @@ class Mesh:
         norm=np.linalg.norm(normal,axis=1)
         keep=norm>=1e-8
         t,normal,norm=t[keep],normal[keep],norm[keep]
-        if kind!='building':
+        if not is_wall(kind):
             down=normal[:,2]<0
             t[down]=t[down][:,[0,2,1]]; normal[down]*=-1
         unit=normal/norm[:,None]
@@ -131,7 +137,7 @@ class Mesh:
                 # Shared vertices: ~4x fewer for the game's Lua to turn into tables, and smooth
                 # normals on ground and roads. Buildings keep hard edges (welded by normal too).
                 weld=np.round(corner*1000).astype(np.int64)
-                if kind=='building':
+                if is_wall(kind):
                     weld=np.column_stack([weld,np.round(face_n*100).astype(np.int64)])
                 _,first,inverse=np.unique(weld,axis=0,return_index=True,return_inverse=True)
                 inverse=inverse.ravel()
@@ -141,7 +147,7 @@ class Mesh:
                 # Input is CCW; ProceduralMesh expects the opposite winding.
                 idx=inverse.reshape(-1,3)[:,[0,2,1]].ravel().tolist()
                 sub={'mat':'e2rf_'+kind,'p':(verts-self.origin).ravel().tolist(),
-                     'n':normals.ravel().tolist(),'t':(verts[:,:2]*.1).ravel().tolist(),'i':idx}
+                     'n':normals.ravel().tolist(),'t':uv(kind,verts,normals).ravel().tolist(),'i':idx}
                 name=f'{key}_{layer}_{kind}_{offset//750}'
                 rel=f'tiles/{key}/{name}.bin'
                 path=dest/rel; path.parent.mkdir(parents=True,exist_ok=True)
@@ -150,6 +156,16 @@ class Mesh:
                               'shape':f'/e2r_stream/{region}/{rel}','triangles':len(batch),
                               'mats':['e2rf_'+kind], 'layer':layer})
         return items
+
+
+def uv(kind, verts, normals):
+    """Texture coordinates in world metres / repeat: seamless across pieces and tiles."""
+    _, _, _, scale, mode = style.KINDS.get(kind, (None, None, None, 8.0, 'plan'))
+    if mode=='wall':
+        t=np.column_stack([-normals[:,1],normals[:,0]])
+        t/=np.maximum(np.linalg.norm(t,axis=1)[:,None],1e-9)
+        return np.column_stack([(verts[:,0]*t[:,0]+verts[:,1]*t[:,1])/scale,verts[:,2]/scale])
+    return verts[:,:2]/scale
 
 
 GRID = 25.0       # ground cells, m; global grid (tiles are multiples of it)
@@ -197,6 +213,50 @@ def junction_verge(store, geom, height):
     return strip(inner3,outer3), Polygon(outer).buffer(0)
 
 
+def walk_sides(tags):
+    """Which sides get a sidewalk: city streets by default, unless the tags say otherwise."""
+    if tags.get('highway') not in WALKS:
+        return ()
+    v=tags.get('sidewalk','both')
+    return {'no':(),'none':(),'left':('left',),'right':('right',)}.get(v,('left','right'))
+
+
+def lane_marks(xy, z, tangent, knots, width, tags):
+    """Lane lines as thin quads on the road plane: dashed 3 on / 9 off, a solid centre on
+    four lanes and up, solid edge lines on major roads. The dash phase runs from the
+    segment's start, so it is the same in every tile."""
+    if width<5 or len(knots)<2:
+        return []
+    oneway=tags.get('oneway') in ('yes','1','-1')
+    n=int(sources.number(tags.get('lanes'),max(1,round(width/3.3)) if oneway else 2))
+    n=max(1,min(n,int(width//2.5)))
+    lines=[]
+    lw=width/n
+    for k in range(1,n):
+        centre=not oneway and abs(k-n/2)<.01
+        lines.append((-width/2+k*lw,.12,None if centre and n>=4 else (3.,9.)))
+    if tags.get('highway','').replace('_link','') in MAJOR and width>=7:
+        lines+=[(width/2-.3,.15,None),(-width/2+.3,.15,None)]
+    out=[]
+    s0,s1=knots[0],knots[-1]
+    for off,w,dash in lines:
+        if dash:
+            period=dash[0]+dash[1]
+            spans=[(a,a+dash[0]) for a in np.arange(math.ceil(s0/period)*period,s1-dash[0],period)]
+        else:
+            spans=[(s0,s1)]
+        for a,b in spans:
+            ss=np.r_[a,knots[(knots>a)&(knots<b)],b]
+            p=np.column_stack([np.interp(ss,knots,xy[:,0]),np.interp(ss,knots,xy[:,1])])
+            t=np.column_stack([np.interp(ss,knots,tangent[:,0]),np.interp(ss,knots,tangent[:,1])])
+            t/=np.maximum(np.linalg.norm(t,axis=1)[:,None],1e-9)
+            nrm=np.column_stack([-t[:,1],t[:,0]])
+            zz=np.interp(ss,knots,z)+.008
+            c=p+nrm*off
+            out.extend(strip(np.column_stack([c-nrm*w/2,zz]),np.column_stack([c+nrm*w/2,zz])))
+    return out
+
+
 def road_surface(store, data, footprint=True):
     """Stable strips with shared, flat junction mouths and a sampled longitudinal profile."""
     line=LineString(data['xy']); a,b=data['cuts']
@@ -217,18 +277,27 @@ def road_surface(store, data, footprint=True):
     bridge,tunnel=k=='bridge',k=='tunnel'
     left,right=np.column_stack([xy+normal,z]),np.column_stack([xy-normal,z])
     tris=strip(left,right)
-    verge=[]; outline=(left[:,:2],right[:,:2])
+    unit=normal/np.maximum(np.linalg.norm(normal,axis=1)[:,None],1e-9)
+    # sidewalks: flush with the road, on the sides the tags allow (left = +normal)
+    sides=walk_sides(data['tags'])
+    walk=[]; edges=[]
+    for edge,sign,side in ((left,1,'left'),(right,-1,'right')):
+        if side in sides:
+            outer=np.column_stack([edge[:,:2]+unit*sign*SIDEWALK,z])
+            walk.extend(strip(edge,outer))
+            edge=outer
+        edges.append(edge)
+    verge=[]; outline=(edges[0][:,:2],edges[1][:,:2])
     if not bridge and not tunnel:
-        # verges slope from the road edge to the ground's own height: no step, no gap
-        unit=normal/np.maximum(np.linalg.norm(normal,axis=1)[:,None],1e-9)
-        outs=[xy+normal*sign+unit*sign*SHOULDER for sign in (1,-1)]
+        # verges slope from the road (or sidewalk) edge to the ground's own height: no step
+        outs=[edges[0][:,:2]+unit*SHOULDER,edges[1][:,:2]-unit*SHOULDER]
         heights=ground_z(store,np.vstack(outs)).reshape(2,-1)
-        for edge,out,h in zip((left,right),outs,heights):
+        for edge,out,h in zip(edges,outs,heights):
             verge.extend(strip(edge,np.column_stack([out,h])))
         outline=outs
     # one outline per road (not a union of its triangles: 28k Polygon() calls cost ~1 s a tile)
     foot=shapely.make_valid(Polygon(np.vstack([outline[0],outline[1][::-1]]))) if footprint else None
-    return tris, foot, xy, z, tangent, knots, verge
+    return tris, foot, xy, z, tangent, knots, verge, walk, edges
 
 
 def clip_verges(verges, asphalt):
@@ -271,7 +340,7 @@ def clip_verges(verges, asphalt):
 
 
 def build_road(store, rect, center=None):
-    mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]
+    mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]; walks=[]; paving=[]
     pad=SHOULDER+1   # a verge reaches into the tile from a road whose bounds do not
     for fid,kind,data,geom in store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad),{'road','junction'}):
         if kind=='junction':
@@ -280,22 +349,21 @@ def build_road(store, rect, center=None):
             if data['raise']==0:
                 verges.extend(junction_verge(store,geom,h)[0]); asphalt.append(geom)
             continue
-        tris,_,xy,z,tangents,knots,verge=road_surface(store,data,footprint=False)
-        mesh.add_many('road',tris)
+        tris,_,xy,z,tangents,knots,verge,walk,edges=road_surface(store,data,footprint=False)
+        major=data['tags'].get('highway','').replace('_link','') in MAJOR
+        mesh.add_many('road_major' if major else 'road',tris)
         verges.extend(verge)
         if verge:          # ground-level roads only: a bridge deck keeps the ground under it
-            asphalt.append(shapely.make_valid(Polygon(np.vstack([xy+np.column_stack([-tangents[:,1],tangents[:,0]])*data['width']/2,
-                                                                (xy-np.column_stack([-tangents[:,1],tangents[:,0]])*data['width']/2)[::-1]]))))
+            half=np.column_stack([-tangents[:,1],tangents[:,0]])*data['width']/2
+            asphalt.append(shapely.make_valid(Polygon(np.vstack([xy+half,(xy-half)[::-1]]))))
+            walks.extend(walk)
+            # the sidewalk band too, so no other road's verge lies on it
+            if walk:
+                paving.append(shapely.make_valid(Polygon(np.vstack([edges[0][:,:2],edges[1][:,:2][::-1]]))))
+        else:
+            mesh.add_many('sidewalk',walk)
         # Marking uses the exact strip profile; no independent road height sampling.
-        if data['width']>=5:
-            for k in range(len(xy)-1):
-                if int(knots[k]/8)%2:
-                    continue
-                n0=np.array([-tangents[k,1],tangents[k,0]])*.06
-                n1=np.array([-tangents[k+1,1],tangents[k+1,0]])*.06
-                q=np.array([[*(xy[k]+n0),z[k]+.008],[*(xy[k]-n0),z[k]+.008],
-                            [*(xy[k+1]-n1),z[k+1]+.008],[*(xy[k+1]+n1),z[k+1]+.008]])
-                mesh.add('mark',q[[0,1,2]]); mesh.add('mark',q[[0,2,3]])
+        mesh.add_many('mark',lane_marks(xy,z,tangents,knots,data['width'],data['tags']))
         for k,p in enumerate(xy):
             if rect[0]+5<p[0]<rect[2]-5 and rect[1]+5<p[1]<rect[3]-5:
                 normal=np.array([-tangents[k,1],tangents[k,0]])
@@ -306,53 +374,104 @@ def build_road(store, rect, center=None):
                 penalty=0 if data['width']>=5 else 150
                 candidates.append((np.linalg.norm(pos-target)+penalty,{'pos':[float(pos[0]),float(pos[1]),float(z[k]+.65)],
                                   'yaw':float(math.atan2(tangents[k,0],-tangents[k,1]))}))
-    mesh.add_many('ground',clip_verges(verges,asphalt))
+    mesh.add_many('sidewalk',clip_verges(walks,asphalt))
+    mesh.add_many('ground',clip_verges(verges,asphalt+paving))
     spawn=min(candidates,key=lambda x:x[0])[1] if candidates else None
     return mesh,spawn
 
 
 def build_scene(store,rect):
     mesh=Mesh(rect)
-    ground_holes=[]
+    ground_holes=[]; lands={}; blocked=[]
     pad=SHOULDER+1
     entries=store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad))+store.scenery(rect)
-    for _,kind,data,geom in entries:
+    for fid,kind,data,geom in entries:
         if kind=='road' and data['tags'].get('bridge') in (None,'no'):
             ground_holes.append(road_surface(store,data)[1])
         elif kind=='junction' and data['raise']==0:
             ground_holes.append(geom.union(junction_verge(store,geom,0.)[1]))
         elif kind=='water':
-            ground_holes.append(geom)
+            ground_holes.append(geom); blocked.append(geom)
             # Canonical water body level, shared by all tiles.
             p=geom.representative_point()
             h=float(store.terrain.sample([[p.x,p.y]])[0])-.5
             mesh.polygon('water',geom.intersection(box(*rect)),h)
+        elif kind in ('paved','forest','park'):
+            lands.setdefault(kind,[]).append(geom)
         elif kind=='building':
+            blocked.append(geom)
             tags=data['tags']; p=geom.representative_point()
             base=float(store.terrain.sample([[p.x,p.y]])[0])
             height=max(2.5,min(250,sources.number(tags.get('height'),sources.number(tags.get('building:levels'),3)*3)))
-            mesh.polygon('building',geom.intersection(box(*rect)),base+height)
+            mesh.polygon('roof',geom.intersection(box(*rect)),base+height)
             walls=[]
-            for poly in shapely.get_parts(geom):
+            # exterior rings counter-clockwise: every wall quad then faces out of the building
+            for poly in shapely.get_parts(shapely.orient_polygons(geom)):
                 if poly.geom_type!='Polygon':
                     continue
                 for ring in [poly.exterior,*poly.interiors]:
                     for p,q in zip(list(ring.coords),list(ring.coords)[1:]):
                         quad=np.array([[*p[:2],base],[*q[:2],base],[*q[:2],base+height],[*p[:2],base+height]])
                         walls.extend([quad[[0,1,2]],quad[[0,2,3]]])
-            mesh.add_many('building',walls)
+            mesh.add_many(style.wall(tags,height,fid),walls)
     holes=shapely.union_all(ground_holes)
+    # landuse splits the ground cells (paved first): same cell heights, so seams do not move
+    cover=[]
+    for k in ('paved','forest'):
+        if k in lands:
+            u=shapely.union_all(lands[k]).intersection(box(*rect))
+            for prev in cover: u=u.difference(prev[1])
+            if not u.is_empty:
+                shapely.prepare(u); cover.append((k,u))
     # Fixed 25 m grid (20 intervals/tile); vector sample once, then interpolate planar cells.
     xs=np.arange(rect[0],rect[2]+1,GRID); ys=np.arange(rect[1],rect[3]+1,GRID)
     points=np.array([(x,y) for y in ys for x in xs]); heights=store.terrain.sample(points).reshape(len(ys),len(xs))-.25
     for j in range(len(ys)-1):
         for i in range(len(xs)-1):
-            square=box(xs[i],ys[j],xs[i+1],ys[j+1]).difference(holes)
+            cell=box(xs[i],ys[j],xs[i+1],ys[j+1])
+            square=cell.difference(holes)
             def at(xy):
                 u=(xy[:,0]-xs[i])/25; v=(xy[:,1]-ys[j])/25
                 return (heights[j,i]*(1-u)+heights[j,i+1]*u)*(1-v)+(heights[j+1,i]*(1-u)+heights[j+1,i+1]*u)*v
+            for k,u in cover:
+                if shapely.intersects(u,cell):
+                    part=square.intersection(u)
+                    if not part.is_empty:
+                        mesh.polygon(k,part,at); square=square.difference(u)
             mesh.polygon('ground',square,at)
+    plant_trees(store,mesh,rect,lands,shapely.union_all([holes,*blocked]))
     return mesh
+
+
+def plant_trees(store, mesh, rect, lands, blocked):
+    """Trees in woods and parks on a global jittered lattice: a tree near a tile seam belongs
+    to exactly one tile (x in [x0, x1)), the same one every time."""
+    key=mesh.rect
+    for kind in ('forest','park'):
+        if kind not in lands or len(mesh.statics)>=style.TREES_PER_TILE:
+            continue
+        sp=style.TREE_SPACING[kind]
+        gi,gj=np.meshgrid(np.arange(math.floor(rect[0]/sp),math.ceil(rect[2]/sp)),
+                          np.arange(math.floor(rect[1]/sp),math.ceil(rect[3]/sp)))
+        gi,gj=gi.ravel().astype(np.int64),gj.ravel().astype(np.int64)
+        h=((gi*73856093)^(gj*19349663)^int(sp*1000))&0xffffffff
+        r=lambda k: ((h*(2654435761+k*40503)+k*97)&0xffffffff)/2**32
+        x=(gi+.5+(r(1)-.5)*.8)*sp; y=(gj+.5+(r(2)-.5)*.8)*sp
+        ok=(x>=rect[0])&(x<rect[2])&(y>=rect[1])&(y<rect[3])
+        area=shapely.union_all(lands[kind])
+        ok&=shapely.contains_xy(area,x,y)
+        if blocked is not None and not blocked.is_empty:
+            ok&=~shapely.contains_xy(blocked.buffer(1.5),x,y)
+        idx=np.flatnonzero(ok)[:style.TREES_PER_TILE-len(mesh.statics)]
+        if not len(idx):
+            continue
+        z=ground_z(store,np.column_stack([x[idx],y[idx]]))
+        for n,k in enumerate(idx):
+            yaw=r(3)[k]*2*math.pi
+            mesh.statics.append({'kind':'static','shape':style.TREES[int(r(4)[k]*len(style.TREES))%len(style.TREES)],
+                                 'pos':[float(x[k]),float(y[k]),float(z[n])],
+                                 'rot':[0,0,math.sin(yaw/2),math.cos(yaw/2)],
+                                 'collision':'None','decal':'None','triangles':0})
 
 
 def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
@@ -367,11 +486,15 @@ def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
     geometry=time.perf_counter()-started
     region=store.meta['id']; dest=Path(dest_root)/region; key=f'{i}_{j}'
     items=mesh.write(dest,region,key,layer)
+    for n,it in enumerate(mesh.statics):
+        items.append(dict(it,name=f'e2rf_{key}_{layer}_tree_{n}',layer=layer))
     mat=dest/'tiles'/f'{key}.{layer}.mats.json'; mat.parent.mkdir(parents=True,exist_ok=True)
     mat.write_text(json.dumps(MATERIALS),encoding='utf8'); warm(mat)
     manifest={'version':1,'generator':sources.GEOMETRY,'source':region,'layer':layer,'tile':[i,j],
               'rect':rect,'lift':sources.LIFT,'materials':f'/e2r_stream/{region}/tiles/{mat.name}',
-              'mats':list(MATERIALS),'items':items,'spawn':spawn,'drivable':bool(mesh.faces.get('road')),
+              'mats':list(MATERIALS),'items':items,'spawn':spawn,
+              'drivable':bool(mesh.faces.get('road') or mesh.faces.get('road_major')),
+              'warmShapes':style.TREES,
               'triangles':sum(it['triangles'] for it in items)}
     suffix='' if layer=='road' else '.scene'
     final=dest/'tiles'/f'{key}{suffix}.json'; tmp=final.with_suffix('.json.tmp')

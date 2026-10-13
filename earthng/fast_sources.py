@@ -20,7 +20,7 @@ from shapely.geometry import LineString, MultiPoint, shape
 from shapely.ops import transform
 
 VERSION = 'fast-3'          # source index format (keys fast-index/<id>)
-GEOMETRY = 'fast-7'         # mesh/material semantics; bump to reject tiles built by older code
+GEOMETRY = 'fast-12'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
@@ -326,6 +326,9 @@ class Store:
                 def area(self,a):
                     kind='building' if a.tags.get('building') not in (None,'no') else (
                         'water' if a.tags.get('natural')=='water' or a.tags.get('waterway')=='riverbank' else None)
+                    if kind is None:
+                        import fast_style
+                        kind=fast_style.ground_kind(a.tags)
                     if kind and a.id not in found:
                         found[a.id]=(kind,dict(a.tags),shape(json.loads(factory.create_multipolygon(a))))
             Reader().apply_file(str(Path(self.meta['source'])/entry['file']),locations=True)
