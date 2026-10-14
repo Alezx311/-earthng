@@ -22,6 +22,9 @@ FAR_R = float(os.environ.get('EARTHNG_FAR_R', 3000))   # m round the car: the fa
 FAR_FAST = 25.0    # m/s: above it the far city shrinks to FAR_R_FAST (the churn of far tiles at
 FAR_R_FAST = 1800. # 300 km/h doubled be:reloadCollision, vis-replay-01)
 
+SCENE_LAG = 3.0    # s: a scene ranks with the road of a tile the car reaches this much later
+SCENE_R = 1500.    # m: scenes beyond it wait (the far city stands in for them)
+
 
 def far_radius(pose):
     """Far tiles to build round the pose: none at speed (the game loads none then either)."""
@@ -235,20 +238,25 @@ def server_class(base):
                             self.set_job(state='ready',progress=1,stage='Завантаження доріг',
                                 manifest=f'/e2r_stream/{st["region"]}/tiles/{landing_key}.json',
                                 timings={'first_tile':elapsed},horizonZ=self.horizon_z(m['spawn']['pos']))
-                # No unbounded executor backlog. Scene work can consume at most one worker.
+                # No unbounded executor backlog. Roads and scenes share one order: the car's arrival
+                # at the tile (desired deadline), a scene SCENE_LAG s behind its road. Scenes used to
+                # wait for an empty road queue and run one at a time (p50 1.2 s, p90 4 s in the
+                # city): in the city the buildings came 10-30 s after the road (out/world 10-14).
                 pending=[]
                 for key,(deadline,i,j) in self.desired.items():
                     task=key+':road'
                     if key not in st['ready'] and task not in self.future_jobs and st['failed'].get(task,0)<2:
                         pending.append((-1 if key==landing_key and not self.pose else deadline,i,j,key,'road'))
                 scene_running=sum(v[3]=='scene' for v in self.future_jobs.values())
-                if not pending and scene_running==0:
-                    for key,(deadline,i,j) in self.desired.items():
-                        task=key+':scene'
-                        if key in st['ready'] and key not in st['scenes'] and task not in self.future_jobs and st['failed'].get(task,0)<2:
-                            px,py=st['pose']['x'],st['pose']['y']
-                            distance=math.hypot((i+.5)*sources.TILE-px,(j+.5)*sources.TILE-py)
-                            pending.append((999 if key==landing_key and not self.pose else 1000+distance,i,j,key,'scene'))
+                px,py=st['pose']['x'],st['pose']['y']
+                for key,(deadline,i,j) in self.desired.items():
+                    task=key+':scene'
+                    if key in st['ready'] and key not in st['scenes'] and task not in self.future_jobs and st['failed'].get(task,0)<2:
+                        distance=math.hypot((i+.5)*sources.TILE-px,(j+.5)*sources.TILE-py)
+                        if key==landing_key and not self.pose:
+                            pending.append((0,i,j,key,'scene'))
+                        elif distance<=SCENE_R:
+                            pending.append((deadline+SCENE_LAG+distance/1000,i,j,key,'scene'))
                 # the far city: one job at a time while no road is waiting, nearest first,
                 # for tiles within FAR_R that have no scene yet
                 far_running=sum(v[3]=='far' for v in self.future_jobs.values())
@@ -274,12 +282,12 @@ def server_class(base):
                     if best:
                         pending.append((5000+best[0],best[1],best[2],best[3],'far'))
                 st['queued']=len(pending)
+                scene_cap=max(1,self.workers-1)     # one worker is always there for a road
                 for _,i,j,key,layer in sorted(pending):
-                    if len(self.future_jobs)>=self.workers or (layer=='scene' and scene_running):
-                        if layer=='far' and len(self.future_jobs)<self.workers:
-                            pass
-                        else:
-                            break
+                    if len(self.future_jobs)>=self.workers:
+                        break
+                    if layer=='scene' and scene_running>=scene_cap:
+                        continue
                     task=key+':'+layer
                     center=(self.landing['lon'],self.landing['lat']) if key==landing_key else None
                     future=self.builders.submit(fast.run,st['dir'],i,j,str(self.work),

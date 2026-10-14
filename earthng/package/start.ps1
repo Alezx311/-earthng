@@ -1,4 +1,4 @@
-﻿# EarthNG: генерація Київської області в BeamNG.drive (тестова збірка).
+﻿# EarthNG: генерація України в BeamNG.drive (тестова збірка).
 # Встановлює мод, запускає компаньйон-генератор і гру. Вікно не закривати, поки граєте.
 param(
     [string]$UserFolder = '',      # тека користувача BeamNG (де лежить mods\)
@@ -21,6 +21,9 @@ New-Item -ItemType Directory -Force (Join-Path $UserFolder 'mods') | Out-Null
 Copy-Item (Join-Path $root 'mod\earth2road_world.zip') (Join-Path $UserFolder 'mods\earth2road_world.zip') -Force
 Write-Host 'Мод встановлено: mods\earth2road_world.zip'
 
+# the OSM tiles shipped in data\osm_tiles (one package: Ukraine or Kyiv oblast)
+$tiles = (Get-ChildItem (Join-Path $root 'data\osm_tiles') -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'index.json') } | Select-Object -First 1).FullName
+Write-Host "Дані OSM: $tiles"
 $env:EARTH2ROAD = Join-Path $root 'none'
 $env:PYTHONNOUSERSITE = '1'
 Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
@@ -32,6 +35,6 @@ Write-Host ''
 Write-Host "Компаньйон працює ($Workers процесів генерації). У грі: Freeroam -> 'Earth2Road - Планета'."
 Write-Host 'Не закривайте це вікно, поки граєте. Ctrl+C - зупинити.'
 & $py (Join-Path $root 'earthng\world_server.py') `
-    --tiles (Join-Path $root 'data\osm_tiles\kyiv-oblast-260918') `
+    --tiles $tiles `
     --userfolder $UserFolder --work (Join-Path $root 'work') --cache (Join-Path $root 'data\dem') `
     --regions (Join-Path $root 'work\regions') --workers $Workers --generator fast

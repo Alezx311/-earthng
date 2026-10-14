@@ -322,6 +322,24 @@ def autumn_leaves(rel):
 # --- the packs --------------------------------------------------------------------------------------
 GROUND_KINDS = ('ground', 'park', 'forest')
 GLOW = {'night': '1.8 1.8 1.8', 'cyber': '2.2 2.2 2.2', 'rain': '1.4 1.4 1.4'}      # emissive gain of lit windows
+# Moonlight fill: in the dark packs every surface also glows faintly in its own colour (emissive =
+# its colour map x FILL x TINT). The sky lights a night in two ways between sessions — a blue
+# "moonlit" one or, with a stale dark capture, nothing — and with nothing every wall away from a
+# lamp was black (tester, 2026-10-14). A sun above the horizon, however dim, blew the frame out
+# at a night exposure (out/fix-packs-02), and nightColor/ambientScale did not reach the dark case.
+FILL = {'night': .25, 'cyber': .2, 'rain': .3}
+TINT = {'night': (.7, .8, 1.), 'cyber': (.9, .6, 1.), 'rain': (.85, .9, 1.)}
+
+
+def with_fill(glow, colour, mood):
+    """A wall's glow map with the moonlight fill baked in (its emissive map is the windows'):
+    the colour map in linear light x FILL x TINT / the glow gain, added under the windows."""
+    if colour is None:
+        return glow
+    gain = float(GLOW[mood].split()[0])
+    c = _arr(colour.resize(glow.size, Image.BILINEAR)) ** 2.2 * np.array(TINT[mood], np.float32) * (FILL[mood] / gain)
+    g = _arr(glow) ** 2.2
+    return _img(np.clip(g + c, 0, 1) ** (1 / 2.2))
 
 
 def build(r, base):
@@ -335,10 +353,11 @@ def build(r, base):
         if photo.PHOTO_WALLS[name][0].startswith('end_'):
             continue
         for mood in ('night', 'cyber'):
-            wall_glow(name, mood, colour).save(r / mood / f'{name}.glow.png')
+            with_fill(wall_glow(name, mood, colour), colour, mood).save(r / mood / f'{name}.glow.png')
     for name, (_, kind) in fast_art.FACADES.items():
+        colour = Image.open(r / 'real' / f'{name}.color.png') if (r / 'real' / f'{name}.color.png').exists() else None
         for mood in ('night', 'cyber'):
-            facade_glow(kind, mood).save(r / mood / f'{name}.glow.png')
+            with_fill(facade_glow(kind, mood), colour, mood).save(r / mood / f'{name}.glow.png')
     # wet roads: the game's asphalt roughness, smoother overall and near mirror-smooth in puddles
     for tex, out in (('asphalt', 'road'), ('sidewalk', 'sidewalk')):
         rough = fast_art.game_texture(style.TEXTURES[tex]['roughnessMap'])
@@ -446,6 +465,16 @@ def fields(pack, base, real):
         put('footway', baseColorMap=f'{art}/paving.color.png', normalMap=f'{art}/paving.normal.png')
         for w in walls:
             put('wall_' + w, baseColorFactor='1 0.97 0.92 1')
+    if pack in FILL:
+        # the moonlight fill of everything else: its colour map (or colour) as a faint emissive;
+        # walls have it baked into their glow maps (with_fill), the neon of cyber stays as it is
+        for mat, f in out.items():
+            if not mat.startswith('e2rf_') or f.get('emissiveMap') or f.get('emissiveFactor', '0 0 0') != '0 0 0':
+                continue
+            bc = [float(v) for v in str(f.get('baseColorFactor', '1 1 1 1')).split()[:3]]
+            if f.get('baseColorMap'):
+                f['emissiveMap'] = f['baseColorMap']
+            f['emissiveFactor'] = ' '.join(f'{FILL[pack] * c * t:.4f}' for c, t in zip(bc, TINT[pack]))
     # the trees: their own materials (fast_tree_materials.json)
     for mat, rel in LEAF_MATS.items():
         f = {}
@@ -474,17 +503,17 @@ def environment(pack, real):
                    nightColor='0.008 0.011 0.026 1', nightFogColor='0.008 0.011 0.026 1', colorizeAmount='0')
         info.update(fogColor='0.016 0.022 0.048 1', fogDensity='0.00045', canvasClearColor='3 5 12 255')
         clouds.update(coverage='0.25', exposure='0.15')
-        env['lights'] = {'colors': [[1, .55, .2]], 'radius': 28, 'brightness': 6, 'height': 7.3, 'count': 28}
+        env['lights'] = {'colors': [[1, .55, .2]], 'radius': 34, 'brightness': 7, 'height': 7.3, 'count': 36}
         # a fixed exposure (EV): the automatic one brightens the night back to dusk. (A night
         # cubemap, BNG_Sky_Space, took in some sessions and not in others: vis-packs-podil-06/07.)
-        env['exposure'] = 5
+        env['exposure'] = 4.5
     if pack == 'cyber':
         sun.update(nightColor='0.04 0.012 0.07 1', nightFogColor='0.07 0.015 0.11 1', ambientScale='0.12 0.06 0.18 1')
         info.update(fogColor='0.08 0.015 0.13 1', fogDensity='0.0008', canvasClearColor='12 3 22 255')
         env['lights'] = {'colors': [[1, .1, .75], [0, .85, 1], [.55, .2, 1]], 'radius': 26, 'brightness': 6,
                          'height': 7.3, 'count': 28}
         env['precip'] = {'dataBlock': 'rain_medium', 'numDrops': 2500, 'minSpeed': 1.4, 'maxSpeed': 1.8}
-        env['exposure'] = 6
+        env['exposure'] = 5
     if pack == 'rain':
         # a rainy evening: dusk under low cloud, the street lights on, wet asphalt mirroring them
         sun.update(elevation='-5', brightness='0.1', skyBrightness='7', colorize='0.5 0.55 0.62 1', colorizeAmount='1',
@@ -494,7 +523,7 @@ def environment(pack, real):
         clouds.update(coverage='1', exposure='0.2', baseColor='0.3 0.32 0.36 1')
         env['precip'] = {'dataBlock': 'rain_medium', 'numDrops': 7000, 'minSpeed': 1.5, 'maxSpeed': 2.0}
         env['lights'] = {'colors': [[1, .62, .32]], 'radius': 26, 'brightness': 5, 'height': 7.3, 'count': 28}
-        env['exposure'] = 6.5
+        env['exposure'] = 5
     if pack == 'winter':
         sun.update(elevation='13', azimuth='195', brightness='0.75', skyBrightness='16', colorize='0.78 0.85 0.98 1',
                    colorizeAmount='0.7', ambientScale='0.52 0.56 0.66 1', sunScale='1 0.9 0.8 1', fogScale='0.75 0.8 0.9 1')

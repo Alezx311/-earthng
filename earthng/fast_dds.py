@@ -54,17 +54,37 @@ def bc1(rgb):
 BC1_UNORM, BC1_UNORM_SRGB = 71, 72
 
 
-def save(image, path, srgb=None):
+def keep_coverage(a, ref, coverage):
+    """A mip of an alpha-tested map scaled so the share of texels >= ref stays the level-0 one.
+    A plain box filter thins thin wire to nothing: the game's chain link (16 % of texels over
+    alphaRef 80) had none left from the 64 px level, so fences vanished ~30 m away."""
+    v = a[..., 0].astype(np.float32)
+    if coverage <= 0 or v.max() <= 0:
+        return a
+    t = np.quantile(v, 1 - coverage)
+    if t <= 0:
+        return a
+    return np.clip(v * (ref / t), 0, 255).astype(np.uint8)[..., None].repeat(3, -1)
+
+
+def save(image, path, srgb=None, alpha_ref=None):
     """Write image (PIL, RGB) as a BC1 DDS with mips; sides must be powers of two. A DX10 header
     carries the format as the game's own textures do: colour maps ('.color.' in the name, or
-    srgb=True) are sRGB; read as linear, a plain DXT1 lawn came out pale (vis-10-akadem)."""
+    srgb=True) are sRGB; read as linear, a plain DXT1 lawn came out pale (vis-10-akadem).
+    alpha_ref: an opacity map (grey) for that alpha test; every mip keeps the coverage."""
     if srgb is None:
         srgb = '.color.' in str(path) or '.glow.' in str(path)
     im = image.convert('RGB')
     w, h = im.size
     levels = []
+    coverage = None
     while True:
         a = np.asarray(im, dtype=np.uint8)
+        if alpha_ref is not None:
+            if coverage is None:
+                coverage = float((a[..., 0] >= alpha_ref).mean())
+            else:
+                a = keep_coverage(a, alpha_ref, coverage)
         if a.shape[0] < 4 or a.shape[1] < 4:
             # BC1 stores at least one 4 x 4 block: pad the smallest levels
             pad = np.zeros((max(4, a.shape[0]), max(4, a.shape[1]), 3), np.uint8)

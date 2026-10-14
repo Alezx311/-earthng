@@ -20,7 +20,7 @@ import fast_packs
 import fast_photo as photo
 import fast_style as style
 
-VERSION = 'v8'
+VERSION = 'v9'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 
@@ -393,6 +393,8 @@ def build(r):
     fence = Image.new('RGB', (1024, 1024), (150, 150, 146))
     fence.paste(slab.resize((1024, 820), Image.LANCZOS), (0, 1024 - 820))
     fence.transpose(Image.FLIP_TOP_BOTTOM).save(r / 'real' / 'fence_po2.color.png')
+    # chain link: the game's opacity map again, with mips that keep the wire (fast_dds.keep_coverage)
+    game_texture(style.CHAINLINK_OPACITY).save(r / 'real' / 'chainlink_o.data.png')
     for kind in ('ground', 'forest', 'paved'):
         synth_grid(SYNTH[kind]).save(r / 'synth' / f'grid_{kind}.color.png')
     synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')
@@ -404,7 +406,8 @@ def build(r):
     import fast_dds
     from concurrent.futures import ThreadPoolExecutor
     def to_dds(png):
-        fast_dds.save(Image.open(png), png.with_suffix('.dds'))
+        ref = style.EXTRA['fence_mesh']['alphaRef'] if png.name == 'chainlink_o.data.png' else None
+        fast_dds.save(Image.open(png), png.with_suffix('.dds'), alpha_ref=ref)
         png.unlink()
     with ThreadPoolExecutor(6) as pool:
         list(pool.map(to_dds, sorted(r.rglob('*.png'))))

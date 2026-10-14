@@ -18,6 +18,7 @@ local W, H = 720, 440          -- map picture size, px
 local BUDGET_MS = 4            -- spawn work per frame
 local CAM_HIGH, CAM_LOW = 350, 28
 local LOAD_R, UNLOAD_R = 800, 1250   -- tile centre distance from the car, m
+local SCENE_LAG = 3            -- s: a scene item queues as the road of a tile reached this much later
 local COLLISION_EVERY = 2.0          -- s between batched reloadCollision calls
 local LAMP_SHAPE = '/art/shapes/objects/lamp1.dae'   -- fast_style.LAMP
 local PRESETS = {
@@ -26,7 +27,13 @@ local PRESETS = {
   -- Kyiv oblast (fast generator with data/osm_tiles/kyiv-oblast-260918)
   {'Ірпінь', 50.5210, 30.2500}, {'Бровари', 50.5110, 30.7900}, {'Бориспіль', 50.3520, 30.9550},
   {'Фастів', 50.0780, 29.9180}, {'Біла Церква', 49.7960, 30.1150},
+  -- oblast centres (data/osm_tiles/ukraine-260918)
+  {'Львів', 49.8400, 24.0280}, {'Одеса', 46.4800, 30.7300}, {'Харків', 49.9900, 36.2300}, {'Дніпро', 48.4650, 35.0460},
+  {'Запоріжжя', 47.8390, 35.1400}, {'Вінниця', 49.2330, 28.4680}, {'Житомир', 50.2550, 28.6590},
+  {'Чернігів', 51.4980, 31.2890}, {'Полтава', 49.5880, 34.5510}, {'Черкаси', 49.4440, 32.0600}, {'Ужгород', 48.6210, 22.2880},
+  {'Чернівці', 48.2920, 25.9400}, {'Івано-Франківськ', 48.9230, 24.7110}, {'Луцьк', 50.7470, 25.3250},
 }
+local PRESET_ROWS = {[7] = true, [12] = true, [19] = true}   -- Kyiv, its oblast, the country (two rows)
 
 local S = {
   widgetHidden = false, pickerOpen = false,
@@ -446,13 +453,18 @@ local function updateTiles()
     end
   end
   if best and #S.queue < 400 then startTile(best[1], best[2], best[3]) end
-  if fast and not best and #S.queue < 100 then
+  -- the nearest scene (look-ahead point too) whose road is in: it used to wait for every road tile
+  -- in loadR and then took any one, so buildings next to the car came after roads 1 km away
+  if fast and #S.queue < 300 and st.scenes then
+    local bestS, bestSD
     for key, tile in pairs(S.tiles) do
-      if tile.collided and not tile.sceneStarted and st.scenes and st.scenes[key] then
-        startScene(key, tile)
-        break
+      if tile.roadComplete and not tile.sceneStarted and st.scenes[key] then
+        local cx, cy = tileCentre(tile.i, tile.j)
+        local d = math.min(math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2), math.sqrt((cx - ax) ^ 2 + (cy - ay) ^ 2))
+        if not bestSD or d < bestSD then bestS, bestSD = {key, tile}, d end
       end
     end
+    if bestS and (not best or bestSD < bestD) then startScene(bestS[1], bestS[2]) end
   end
   if fast then
     -- the far city (earthng/fast_far.py): a tile without its own scene, within farRadius, gets
@@ -496,11 +508,17 @@ local function updateTiles()
     end
     -- Reprioritize pending work when direction changes; no scene object can block roads, no far
     -- object a scene.
-    local function rank(job) return job.far and 2 or (job.scene and 1 or 0) end
+    -- Roads and scenes go by the car's arrival (wanted, s), a scene SCENE_LAG s after its road:
+    -- the buildings by the car come before the roads of a tile a kilometre ahead.
+    local wanted = st.wanted or {}
+    local function rank(job) return job.far and 1 or 0 end
+    local function due(job) return (wanted[job.key] or 1e6) + (job.scene and SCENE_LAG or 0) end
     table.sort(S.queue, function(a, b)
       local ra, rb = rank(a), rank(b)
       if ra ~= rb then return ra < rb end
-      return ((st.wanted or {})[a.key] or math.huge) < ((st.wanted or {})[b.key] or math.huge)
+      local da, db = due(a), due(b)
+      if da ~= db then return da < db end
+      return (a.scene and 1 or 0) < (b.scene and 1 or 0)
     end)
   end
 end
@@ -1255,7 +1273,7 @@ local function drawWindow()
     im.Text('Колесо - масштаб, перетягування - рух, клік - точка висадки.')
     drawMap()
     for k, p in ipairs(PRESETS) do
-      if k > 1 and k ~= 7 then im.SameLine() end      -- the oblast towns on a second row
+      if k > 1 and not PRESET_ROWS[k] then im.SameLine() end
       if im.Button(p[1]) then goTo(p[2], p[3], 15) end
     end
     im.InputText('##coords', coordBuf, 64)

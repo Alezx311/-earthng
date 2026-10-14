@@ -20,7 +20,7 @@ from shapely.geometry import LineString, MultiPoint, Point, shape
 from shapely.ops import transform
 
 VERSION = 'fast-9'          # source index format (keys fast-index/<id>); 9: frame per landing
-GEOMETRY = 'fast-30'         # mesh/material semantics; bump to reject tiles built by older code
+GEOMETRY = 'fast-31'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane

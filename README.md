@@ -1,10 +1,10 @@
 # EarthNG
 
-**Пакет для тестувальників (Київська область, генератор fast):** `earthng/package.py` збирає
-`out/package/EarthNG-KyivOblast-<дата>.zip` (~400 МБ: Python, компаньйон, мод, тайли й DEM). Отримувачу
-досить розпакувати й запустити `start.bat`; інструкція всередині — `ІНСТРУКЦІЯ.txt`. Потрібні
-`data/osm_tiles/kyiv-oblast-260918` (`earthng/osm_extract_pbf.py` + `earthng/osm_tiles.py`) і DEM
-(`earthng/fast_dem.py --download`).
+**Пакет для тестувальників (уся Україна, генератор fast):** `earthng/package.py` збирає
+`out/package/EarthNG-Ukraine-<дата>.zip` (~4,5 ГБ: Python, компаньйон, мод, 34 946 тайлів OSM, DEM і готовий арт).
+Отримувачу досить розпакувати й запустити `start.bat`; інструкція всередині — `ІНСТРУКЦІЯ.txt`. Потрібні
+`data/osm_tiles/ukraine-260918` (`earthng/osm_tiles_country.py`) і DEM (`earthng/fast_dem.py --download`).
+`--tiles data/osm_tiles/kyiv-oblast-260918` дає старий пакет області (`EarthNG-KyivOblast`).
 
 Поточна незавершена робота над генератором для 300 км/год: **[передача Claude, заміри й наступні кроки](docs/HANDOFF_FAST_STREAMING.md)**. Типовий режим запуску — `fast` по всій Україні; `-Generator v2` — старий генератор у підготовленому регіоні Києва.
 

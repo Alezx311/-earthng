@@ -126,7 +126,7 @@ KINDS = {
     'forest':      ('grass',         [.20, .30, .16, 1], 'GRASS',   8.0, 'plan'),
     'curb':        ('concrete',      [.70, .70, .68, 1], 'ASPHALT', 1.0, 'plan'),
 }
-ART = '/e2r_stream/fast-art/v8'      # fast_art.ensure writes the facades there
+ART = '/e2r_stream/fast-art/v9'      # fast_art.ensure writes the facades there
 WALLS = ('panel', 'precast', 'brick', 'brick_red', 'brick_white', 'plaster', 'stucco', 'glass', 'windows', 'block')
 for w in WALLS:
     # walls carry their own UVs (one 3 m window cell per repeat, floors from the base)
@@ -138,8 +138,9 @@ TEXTURES['fence_po2'] = {'baseColorMap': f'{ART}/real/fence_po2.color.png'}
 TEXTURES['fence_mesh'] = {
     'baseColorMap': '/assets/materials/tileable/metal/chainlink/t_chainlink_fence_b.color.png',
     'normalMap': '/assets/materials/tileable/metal/chainlink/t_chainlink_fence_nm.normal.png',
-    'opacityMap': '/assets/materials/tileable/metal/chainlink/t_chainlink_fence_o.data.png',
+    'opacityMap': f'{ART}/real/chainlink_o.data.png',
 }
+CHAINLINK_OPACITY = '/assets/materials/tileable/metal/chainlink/t_chainlink_fence_o.data.png'
 TEXTURES['car'] = {'baseColorMap': f'{ART}/real/cars.color.png'}
 # material fields beyond the stage: see-through fences, both sides of a single quad
 EXTRA = {'fence_mesh': {'alphaTest': True, 'alphaRef': 80, 'doubleSided': True, 'castShadows': False},

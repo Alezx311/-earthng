@@ -1,15 +1,15 @@
-"""Build the tester package: everything needed to drive the fast generator over Kyiv oblast.
+"""Build the tester package: everything needed to drive the fast generator (all of Ukraine by default).
 
     C:/js/Earth2Road/.venv/Scripts/python.exe earthng/package.py --out out/package
 
-<out>/EarthNG-KyivOblast/
+<out>/EarthNG-<Area>/  (Ukraine for ukraine-* tiles, KyivOblast for kyiv-oblast-*)
     start.bat, start.ps1        install the mod, start the companion and the game
     ІНСТРУКЦІЯ.txt              install and run (Ukrainian)
     python/                     Python 3.14 with numpy, shapely, pyproj, osmium, Pillow
     earthng/                    the companion (fast generator); needs nothing from Earth2Road
     mod/earth2road_world.zip    the BeamNG mod
     data/osm_tiles/<package>/   OSM source tiles;  data/dem/terrain/12/  Terrarium DEM
-and <out>/EarthNG-KyivOblast-<date>.zip of that folder. The package is checked with its own
+and <out>/EarthNG-<Area>-<date>.zip of that folder. The package is checked with its own
 Python (imports, one tile built from its own data) before it is zipped.
 """
 import argparse
@@ -33,7 +33,13 @@ SITE = Path(sys.prefix) / 'Lib' / 'site-packages'   # the venv's packages
 PACKAGES = ['PIL', 'numpy', 'numpy.libs', 'osmium', 'osmium.libs', 'pyproj', 'pyproj.libs', 'shapely', 'shapely.libs', 'certifi']
 DIST = ['pillow', 'numpy', 'osmium', 'pyproj', 'shapely', 'certifi']
 SKIP_LIB = {'test', 'idlelib', 'tkinter', 'turtledemo', 'ensurepip', 'site-packages', '__pycache__', 'pydoc_data'}
-NAME = 'EarthNG-KyivOblast'
+AREAS = {'ukraine': 'Ukraine', 'kyiv-oblast': 'KyivOblast', 'kyiv': 'Kyiv'}
+
+
+def package_name(tiles):
+    """EarthNG-<Area> from the tiles folder name (ukraine-260918 -> EarthNG-Ukraine)."""
+    stem = tiles.name.rsplit('-', 1)[0]
+    return 'EarthNG-' + AREAS.get(stem, stem)
 
 
 def copy_python(dst):
@@ -62,11 +68,12 @@ def copy_python(dst):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--out', type=Path, default=ROOT / 'out' / 'package')
-    p.add_argument('--tiles', type=Path, default=ROOT / 'data' / 'osm_tiles' / 'kyiv-oblast-260918')
+    p.add_argument('--tiles', type=Path, default=ROOT / 'data' / 'osm_tiles' / 'ukraine-260918')
     p.add_argument('--dem', type=Path, default=ROOT / 'out' / 'world' / 'cache')
     p.add_argument('--no-zip', action='store_true')
     a = p.parse_args()
     a.out, a.tiles, a.dem = a.out.resolve(), a.tiles.resolve(), a.dem.resolve()
+    NAME = package_name(a.tiles)
     pkg = a.out / NAME
     if pkg.exists():
         shutil.rmtree(pkg)
