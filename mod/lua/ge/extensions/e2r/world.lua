@@ -19,6 +19,7 @@ local BUDGET_MS = 4            -- spawn work per frame
 local CAM_HIGH, CAM_LOW = 350, 28
 local LOAD_R, UNLOAD_R = 800, 1250   -- tile centre distance from the car, m
 local COLLISION_EVERY = 2.0          -- s between batched reloadCollision calls
+local LAMP_SHAPE = '/art/shapes/objects/lamp1.dae'   -- fast_style.LAMP
 local PRESETS = {
   {'Оболонь', 50.5070, 30.4990}, {'Поділ', 50.4655, 30.5170}, {'Хрещатик', 50.4475, 30.5225},
   {'Печерськ', 50.4280, 30.5410}, {'Голосіїв', 50.3920, 30.5080}, {'Біличі', 50.4775, 30.3600},
@@ -182,6 +183,11 @@ local function spawnItem(it, group, pause)
     if it.scale then obj:setScale(vec3(it.scale, it.scale, it.scale)) end
     obj:registerObject(it.name)
     group:addObject(obj)
+    -- street lamps: where a night pack's lights go (lightsStep)
+    if it.shape == LAMP_SHAPE then
+      S.lamps = S.lamps or {}
+      S.lamps[string.format('%d_%d', math.floor(it.pos[1]), math.floor(it.pos[2]))] = {it.pos[1], it.pos[2], it.pos[3]}
+    end
   end
 end
 
@@ -600,6 +606,70 @@ end
 -- fields of the loaded materials in place; no tile is rebuilt or reloaded.
 local PACK_NAMES = {{'real', 'Реальний'}, {'toon', 'Мультяшний'}, {'model', 'Макет'}, {'synth', 'Синтвейв'}}
 
+-- Street lights of a night pack: a pool of PointLights moved onto the lamps nearest the camera
+-- (env.lights: colors, radius, brightness, height, count). Lamps are noted as tiles spawn them.
+local function dropLights()
+  for _, l in ipairs(S.lightPool or {}) do l:delete() end
+  S.lightPool, S.lightCfg, S.lightsAt = nil, nil, nil
+end
+
+local function showLights(cfg)
+  dropLights()
+  if not cfg then return end
+  S.lightCfg, S.lightPool = cfg, {}
+  for k = 1, cfg.count or 24 do
+    local c = cfg.colors[(k - 1) % #cfg.colors + 1]
+    local l = createObject('PointLight')
+    l:setField('radius', 0, tostring(cfg.radius or 20))
+    l:setField('brightness', 0, tostring(cfg.brightness or 2))
+    l:setField('color', 0, string.format('%f %f %f 1', c[1], c[2], c[3]))
+    l:setField('castShadows', 0, '0')
+    l:setField('flareType', 0, 'BNG_LightFlare_1')
+    l:setField('flareScale', 0, tostring(cfg.flare or 0.6))
+    l:registerObject('e2r_light_' .. k)
+    l.canSave = false
+    l:setPosition(vec3(0, 0, -10000))
+    S.lightPool[k] = l
+  end
+  S.lightsAt = -1
+end
+
+local function lightsStep()
+  local pool, cfg = S.lightPool, S.lightCfg
+  if not pool or not S.lamps or S.now - (S.lightsAt or -1) < 0.4 then return end
+  S.lightsAt = S.now
+  local ok, cam = pcall(function() return core_camera.getPosition() end)
+  if not ok or not cam then return end
+  local near = {}
+  for key, p in pairs(S.lamps) do
+    local d = (p[1] - cam.x) ^ 2 + (p[2] - cam.y) ^ 2
+    if d < 400 * 400 then near[#near + 1] = {d, p} elseif d > 2000 * 2000 then S.lamps[key] = nil end
+  end
+  table.sort(near, function(a, b) return a[1] < b[1] end)
+  result.lampsNear, result.lightsPlaced = #near, math.min(#near, #pool)
+  for k, l in ipairs(pool) do
+    local n = near[k]
+    if n then l:setPosition(vec3(n[2][1], n[2][2], n[2][3] + (cfg.height or 7.3))) else l:setPosition(vec3(0, 0, -10000)) end
+  end
+end
+
+-- Rain or snow round the camera (env.precip: the game's PrecipitationData rain_medium or Snow_menu)
+local function showPrecip(cfg)
+  local old = scenetree.findObject('e2r_precip')
+  if old then old:delete() end
+  if not cfg then return end
+  local obj = createObject('Precipitation')
+  obj:setField('dataBlock', 0, cfg.dataBlock)
+  for k, v in pairs({numDrops = cfg.numDrops or 3000, boxWidth = cfg.boxWidth or 60, boxHeight = cfg.boxHeight or 40,
+                     dropSize = cfg.dropSize or 0.6, minSpeed = cfg.minSpeed or 1.5, maxSpeed = cfg.maxSpeed or 2,
+                     splashSize = cfg.splashSize or 0.25, splashMS = 250, fadeDist = 4, fadeDistEnd = 60,
+                     useTurbulence = cfg.turbulence and 1 or 0, useWind = 1, followCam = 1}) do
+    obj:setField(k, 0, tostring(v))
+  end
+  obj:registerObject('e2r_precip')
+  obj.canSave = false
+end
+
 -- The synthwave sun: one big textured quad that keeps its place on the horizon, as far from the
 -- camera as the view distance allows (env.sun: azimuth, distance, size, height, material).
 local function placeSun()
@@ -636,13 +706,34 @@ local function applyPack(name)
   local pack = S.packs and S.packs[name]
   if not pack then return end
   local timer = hptimer()
+  -- a field the previous pack set and this one does not goes back to the material's own value
+  -- (noted the first time a pack changed it): roughness of wet roads, hidden leaves, tints
+  S.packOrig = S.packOrig or {}
+  for matName, fields in pairs(S.packSet or {}) do
+    local mat, orig = scenetree.findObject(matName), S.packOrig[matName]
+    if mat and orig then
+      local dirty = false
+      for field in pairs(fields) do
+        if not (pack[matName] and pack[matName][field] ~= nil) and orig[field] ~= nil then
+          mat:setField(field, 0, orig[field]); dirty = true
+        end
+      end
+      if dirty and not pack[matName] then mat:reload() end
+    end
+  end
   for matName, fields in pairs(pack) do
     local mat = scenetree.findObject(matName)
     if mat then
-      for field, value in pairs(fields) do mat:setField(field, 0, value) end
+      local orig = S.packOrig[matName] or {}
+      S.packOrig[matName] = orig
+      for field, value in pairs(fields) do
+        if orig[field] == nil then orig[field] = mat:getField(field, 0) end
+        mat:setField(field, 0, value)
+      end
       mat:reload()
     end
   end
+  S.packSet = pack
   -- sky, fog and the sun of the pack
   local env = S.packEnv and S.packEnv[name]
   if env then
@@ -658,6 +749,19 @@ local function applyPack(name)
       end
     end
     showSun(env.sun ~= false and env.sun or nil)
+    showLights(env.lights ~= false and env.lights or nil)
+    -- a night is a night only with a fixed exposure: the automatic one brightens it back to dusk
+    local lx = scenetree.findObject('PostEffectLocalExposureObject')
+    if lx then
+      if S.exposureOrig == nil then S.exposureOrig = {lx.autoExposure, lx.manualEV} end
+      if env.exposure then
+        lx.autoExposure, lx.manualEV = false, env.exposure
+      else
+        lx.autoExposure, lx.manualEV = S.exposureOrig[1], S.exposureOrig[2]
+      end
+      result.exposure = {tostring(S.exposureOrig[1]), S.exposureOrig[2], tostring(lx.autoExposure), lx.manualEV}
+    end
+    showPrecip(env.precip ~= false and env.precip or nil)
   end
   S.pack = name
   result.pack, result.packSwitchMs = name, timer:stop()
@@ -701,12 +805,17 @@ local function beginArrival(job)
   S.stream = {region = job.region, tile = job.tileSize, generator = job.generator}
   S.landing = manifest
   S.knownMats = {}
+  S.lamps = {}
   loadNewMaterials(manifest.materials)
   if manifest.spawn then pcall(makeHorizon, job.horizonZ, manifest.spawn.pos[1], manifest.spawn.pos[2]) end
   if manifest.packs and FS:fileExists(manifest.packs) then
     local okP, packs = pcall(jsonReadFile, manifest.packs)
     S.packs = okP and packs and packs.fields or nil
     S.packEnv = okP and packs and packs.environment or nil
+    if okP and packs and packs.order then
+      PACK_NAMES = {}
+      for _, name in ipairs(packs.order) do table.insert(PACK_NAMES, {name, packs.labels and packs.labels[name] or name}) end
+    end
     if okP and packs and packs.extra and not S.packsExtra then      -- the sun's material
       S.matSeq = (S.matSeq or 0) + 1
       local tmpE = string.format('e2r_world/materials_%d.json', S.matSeq)
@@ -987,8 +1096,8 @@ local function drawWindow()
     end
     if S.packs then
       im.Text('Стиль:')
-      for _, p in ipairs(PACK_NAMES) do
-        im.SameLine()
+      for k, p in ipairs(PACK_NAMES) do
+        if (k - 1) % 5 ~= 0 then im.SameLine() end
         if im.Button(p[2] .. (S.pack == p[1] and ' *' or '')) then applyPack(p[1]) end
       end
     end
@@ -1229,7 +1338,15 @@ local function runTest()
       for _, v in ipairs(test.views or {}) do
         table.insert(S.gallery, {'v-' .. v.name, vec3(v.cam[1], v.cam[2], v.cam[3]), vec3(v.at[1], v.at[2], v.at[3])})
       end
-      S.galleryIdx, S.galleryAt = 0, S.now - 10
+      S.galleryIdx, S.galleryAt, S.galleryPrefix = 0, S.now - 10, ''
+      -- test.packGallery: the same views once per pack
+      S.galleryPacks = {}
+      for _, name in ipairs(test.packGallery or {}) do table.insert(S.galleryPacks, name) end
+      if #S.galleryPacks > 0 then
+        local name = table.remove(S.galleryPacks, 1)
+        applyPack(name)
+        S.galleryPrefix, S.galleryAt = name .. '-', S.now + 3
+      end
       -- the game's HUD (dashboard, camera help) off for the pictures
       pcall(function() extensions.ui_visibility.setCef(false) end)
     end
@@ -1240,7 +1357,11 @@ local function runTest()
     elseif not S.galleryPending and S.now - S.galleryAt > 0.3 then
       S.galleryIdx = S.galleryIdx + 1
       local v = S.gallery[S.galleryIdx]
-      if not v then
+      if not v and #S.galleryPacks > 0 then
+        local name = table.remove(S.galleryPacks, 1)
+        applyPack(name)
+        S.galleryPrefix, S.galleryIdx, S.galleryAt = name .. '-', 0, S.now + 3
+      elseif not v then
         S.galleryDone = true
         pcall(function() extensions.ui_visibility.setCef(true) end)
         S.overviewTaken = S.now - 2
@@ -1248,7 +1369,7 @@ local function runTest()
         local q = quatFromDir(v[3] - v[2], vec3(0, 0, 1))
         commands.setFreeCamera()
         core_camera.setPosRot(0, v[2].x, v[2].y, v[2].z, q.x, q.y, q.z, q.w)
-        S.galleryPending, S.galleryAt = v[1], S.now
+        S.galleryPending, S.galleryAt = S.galleryPrefix .. v[1], S.now
       end
     end
   elseif S.overviewTaken and not (S.packQueue and #S.packQueue > 0) and not S.packShot and S.now - S.overviewTaken > 1
@@ -1344,6 +1465,7 @@ end
 
 function M.tick(dt)
   placeSun()
+  lightsStep()
   readStatus()
   replayStep(dt)
   -- UI visibility never changes the simulation state. skipMap only skips the automated

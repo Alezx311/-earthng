@@ -16,10 +16,11 @@ import zipfile
 
 from PIL import Image, ImageDraw
 
+import fast_packs
 import fast_photo as photo
 import fast_style as style
 
-VERSION = 'v7'
+VERSION = 'v8'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 
@@ -78,7 +79,9 @@ FLAT = {   # kind: (toon colour, model colour)
     'park': ((126, 196, 112), (226, 228, 222)), 'roof_tile': ((176, 84, 62), (200, 200, 200)),
     'roof_metal': ((96, 120, 116), (205, 205, 205)), 'parapet': ((200, 196, 190), (236, 236, 236)),
 }
-PACKS = ('real', 'toon', 'model', 'synth')
+BASE_PACKS = ('real', 'toon', 'model', 'synth')
+PACKS = BASE_PACKS + fast_packs.PACKS
+LABELS = {'real': 'Реальний', 'toon': 'Мультяшний', 'model': 'Макет', 'synth': 'Синтвейв', **fast_packs.LABELS}
 MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap', 'opacityMap')
 # synthwave: dark violet surfaces, neon lines glowing (emissive), a striped sun at the horizon
 SYNTH = {
@@ -237,6 +240,8 @@ def colour(rgb):
 
 def pack_fields(pack, base):
     """Material name -> stage-0 fields for one pack (all map fields present, '' clears)."""
+    if pack in fast_packs.PACKS:
+        return fast_packs.fields(pack, base, pack_fields('real', base))
     out = {}
     for kind, (tex, fallback, _, _, mode) in style.KINDS.items():
         f = {k: '' for k in MAP_FIELDS}
@@ -282,11 +287,13 @@ def environment(pack):
     def fields(o, keys):
         return {k: (' '.join(map(str, o[k])) if isinstance(o[k], list) else str(o[k])) for k in keys if k in o}
     sun_keys = ('azimuth', 'elevation', 'brightness', 'skyBrightness', 'colorize', 'colorizeAmount', 'fogScale',
-                'sunScale', 'ambientScale', 'nightColor', 'nightFogColor')
+                'sunScale', 'ambientScale', 'nightColor', 'nightFogColor', 'nightCubemap')
     info_keys = ('fogColor', 'fogDensity', 'canvasClearColor')
     if pack != 'synth':
-        return {'objects': {'sunsky': fields(sky['sunsky'], sun_keys), 'theLevelInfo': fields(sky['theLevelInfo'], info_keys)},
+        real = {'objects': {'sunsky': {**fields(sky['sunsky'], sun_keys), 'useNightCubemap': '0'}, 'theLevelInfo': fields(sky['theLevelInfo'], info_keys),
+                            'clouds': fields(sky['clouds'], ('coverage', 'exposure', 'baseColor'))},
                 'sun': False}
+        return fast_packs.environment(pack, real) if pack in fast_packs.PACKS else real
     return {'objects': {
         'sunsky': {'azimuth': '250', 'elevation': '3', 'brightness': '0.45', 'skyBrightness': '6',
                    'colorize': '0.75 0.1 0.95 1', 'colorizeAmount': '4', 'fogScale': '0.55 0.08 0.75 1',
@@ -304,7 +311,7 @@ def warm_defs(pack, fields):
         stage = {k: v for k, v in f.items() if k in MAP_FIELDS and v}
         if not stage:
             continue
-        name = f'e2rf_pk_{pack}_{mat[5:]}'
+        name = f'e2rf_pk_{pack}_{mat.removeprefix("e2rf_")}'
         out[name] = {'name': name, 'mapTo': name, 'class': 'Material', 'version': 1.5,
                      'Stages': [stage, {}, {}, {}]}
     return out
@@ -346,7 +353,7 @@ def build(r):
     """Write the facade textures, ground sheets and packs.json into r."""
     base = '/e2r_stream/fast-art/' + VERSION
     done = r / 'packs.json'
-    for pack in PACKS:
+    for pack in BASE_PACKS:
         (r / pack).mkdir(parents=True, exist_ok=True)
         for name in FACADES:
             path = r / pack / f'{name}.color.png'
@@ -390,6 +397,7 @@ def build(r):
         synth_grid(SYNTH[kind]).save(r / 'synth' / f'grid_{kind}.color.png')
     synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')
     synth_sun().save(r / 'synth' / 'sun.color.png')
+    fast_packs.build(r, base)
     # every map as a BC1 DDS with its mips, the PNG removed: the game reads '<name>.png' from
     # '<name>.dds' as it does its own assets, and does not cook (vis-08-centre showed checker
     # placeholders for ~30 s while ~70 PNGs cooked one by one)
@@ -408,7 +416,7 @@ def build(r):
                               'doubleSided': True,
                               'Stages': [{'baseColorMap': f'{base}/synth/sun.color.png', 'emissiveMap': f'{base}/synth/sun.color.png',
                                           'emissiveFactor': [1, 1, 1]}, {}, {}, {}]}}
-    tmp.write_text(json.dumps(style.dds({'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
+    tmp.write_text(json.dumps(style.dds({'order': list(PACKS), 'labels': LABELS, 'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
                                'environment': {p: environment(p) for p in PACKS}, 'extra': sun})), encoding='utf8')
     os.replace(tmp, done)
     return r

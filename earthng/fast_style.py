@@ -126,7 +126,7 @@ KINDS = {
     'forest':      ('grass',         [.20, .30, .16, 1], 'GRASS',   8.0, 'plan'),
     'curb':        ('concrete',      [.70, .70, .68, 1], 'ASPHALT', 1.0, 'plan'),
 }
-ART = '/e2r_stream/fast-art/v7'      # fast_art.ensure writes the facades there
+ART = '/e2r_stream/fast-art/v8'      # fast_art.ensure writes the facades there
 WALLS = ('panel', 'precast', 'brick', 'brick_red', 'brick_white', 'plaster', 'stucco', 'glass', 'windows', 'block')
 for w in WALLS:
     # walls carry their own UVs (one 3 m window cell per repeat, floors from the base)
