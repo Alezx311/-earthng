@@ -404,6 +404,9 @@ def fields(pack, base, real):
             put('wall_' + w, baseColorFactor='0.45 0.42 0.55 1')
         put('mark', baseColorFactor=_colour((0, 1, 1)), emissiveFactor='0 0.9 1')
         put('curb', baseColorFactor=_colour((1, .1, .8)), emissiveFactor='1 0.08 0.75')
+        # the parapets glow: every flat roof outlined in neon over the dark city
+        put('parapet', baseColorMap='', normalMap='', roughnessMap='', ambientOcclusionMap='',
+            baseColorFactor=_colour((.6, .1, 1)), emissiveFactor='0.55 0.08 1.2')
         put('water', baseColorFactor=_colour((.04, .03, .1)), roughnessFactor=.05)
     if pack in ('rain', 'cyber'):
         put('road', roughnessMap=f'{base}/rain/wet_road.data.png', baseColorFactor='0.55 0.55 0.58 1')
@@ -433,6 +436,7 @@ def fields(pack, base, real):
         for k in ('road', 'road_major', 'footway_asphalt'):
             put(k, roughnessMap=f'{art}/slush.data.png', baseColorFactor='0.95 0.96 1 1')
         put('curb', baseColorFactor=_colour((.93, .95, 1)))
+        put('parapet', baseColorFactor=_colour((.88, .9, .95)))
         put('water', baseColorFactor=_colour((.72, .8, .86)), roughnessFactor=.12)
         for w in walls:
             put('wall_' + w, baseColorFactor='0.92 0.94 1 1')
