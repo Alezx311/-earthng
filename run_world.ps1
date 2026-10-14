@@ -1,7 +1,8 @@
 # EarthNG planet for BeamNG.drive: builds and installs the mod, starts the companion and the game.
 #   powershell -ExecutionPolicy Bypass -File C:\js\EarthNG\run_world.ps1
 # In the game: Freeroam -> the "Earth2Road" planet level. Keep this window open while playing.
-# A landing needs a prepared region (earthng/region.py, e.g. out/region/kyiv-ns); tiles stream around the car.
+# Default: generator fast over the whole of Ukraine (data/osm_tiles/ukraine-260918); tiles stream around the car.
+# -Generator v2 needs a prepared region (earthng/region.py, e.g. out/region/kyiv-ns).
 # The world generator is Earth2Road (its .venv); -Earth2Road points at its checkout.
 # ASCII only: Windows PowerShell 5.1 reads a UTF-8 file without BOM as ANSI.
 param(
@@ -9,13 +10,19 @@ param(
     [string]$Tiles = '',
     [string]$UserFolder = "$env:LOCALAPPDATA\BeamNG\BeamNG.drive\current",
     [int]$Workers = 8,
-    [ValidateSet('v2', 'fast')][string]$Generator = 'v2',
+    [ValidateSet('v2', 'fast')][string]$Generator = 'fast',
     [switch]$NoGame
 )
-# fast: the Kyiv oblast package when it is there (tiles are indexed as a window round the landing)
+# fast: the Ukraine package, else the Kyiv oblast one, when it is there (tiles are indexed as a
+# window round the landing)
 if (-not $Tiles) {
-    $oblast = "$PSScriptRoot\data\osm_tiles\kyiv-oblast-260918"
-    $Tiles = if ($Generator -eq 'fast' -and (Test-Path "$oblast\index.json")) { $oblast } else { "$PSScriptRoot\data\osm_tiles\kyiv-260918" }
+    $Tiles = "$PSScriptRoot\data\osm_tiles\kyiv-260918"
+    if ($Generator -eq 'fast') {
+        foreach ($name in @('ukraine-260918', 'kyiv-oblast-260918')) {
+            $dir = "$PSScriptRoot\data\osm_tiles\$name"
+            if (Test-Path "$dir\index.json") { $Tiles = $dir; break }
+        }
+    }
 }
 $env:EARTH2ROAD = $Earth2Road
 $py = Join-Path $Earth2Road '.venv\Scripts\python.exe'

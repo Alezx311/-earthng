@@ -9,13 +9,17 @@ import urllib.request
 
 
 def audit(index, cache):
-    w,s,e,n=index['package_box']
+    """DEM under every source tile's coverage, not the package box: a country's box is half
+    sea and neighbours (Ukraine: OSM tiles only where the data is)."""
     tile=lambda lon,lat: ((lon+180)/360*4096,(1-math.asinh(math.tan(math.radians(lat)))/math.pi)/2*4096)
-    x0,y0=tile(w,n); x1,y1=tile(e,s)
-    # One extra tile handles complete OSM features and filtered edge samples.
-    return [Path(cache)/'terrain/12'/str(x)/f'{y}.png'
-            for x in range(math.floor(x0)-1,math.floor(x1)+2)
-            for y in range(math.floor(y0)-1,math.floor(y1)+2)]
+    keys=set()
+    for t in index['tiles'].values():
+        w,s,e,n=t['coverage']
+        x0,y0=tile(w,n); x1,y1=tile(e,s)
+        # One extra tile handles complete OSM features and filtered edge samples.
+        keys.update((x,y) for x in range(math.floor(x0)-1,math.floor(x1)+2)
+                    for y in range(math.floor(y0)-1,math.floor(y1)+2))
+    return [Path(cache)/'terrain/12'/str(x)/f'{y}.png' for x,y in sorted(keys)]
 
 
 def fetch(path):

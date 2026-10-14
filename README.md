@@ -6,7 +6,7 @@
 `data/osm_tiles/kyiv-oblast-260918` (`earthng/osm_extract_pbf.py` + `earthng/osm_tiles.py`) і DEM
 (`earthng/fast_dem.py --download`).
 
-Поточна незавершена робота над генератором для 300 км/год: **[передача Claude, заміри й наступні кроки](docs/HANDOFF_FAST_STREAMING.md)**. Режим `fast` експериментальний, типовим лишається `v2`.
+Поточна незавершена робота над генератором для 300 км/год: **[передача Claude, заміри й наступні кроки](docs/HANDOFF_FAST_STREAMING.md)**. Типовий режим запуску — `fast` по всій Україні; `-Generator v2` — старий генератор у підготовленому регіоні Києва.
 
 Мод для BeamNG.drive: обрати будь-яку точку на мапі, «висадитися» і їхати реальними вулицями,
 згенерованими з OpenStreetMap. Зараз дані підготовлені для Києва.
@@ -56,6 +56,7 @@ C:/js/Earth2Road/.venv/Scripts/python.exe earthng/region.py --pbf <ukraine-26091
 | `earthng/seams.py`, `earthng/route.py` | перевірка швів між сусідніми тайлами; маршрут для автопілота тесту |
 | `earthng/direct.py` | прямий шлях збірки в шматки без DAE/ZIP (`StreamSink`) |
 | `earthng/osm_tiles.py` | нарізка OSM-пакета на статичні тайли (сітка 0,05°, буфер 0,01°) |
+| `earthng/osm_tiles_country.py` | те саме для країни: дерево витягів (країна → групи → блоки 1,5°) і `osm_tiles` на кожен блок; тайли побайтово ті самі |
 | `earthng/fast.py`, `earthng/fast_far.py` | генератор `fast`: дороги, сцена (будівлі, ґрунт, доріжки, паркани, дерева, авто), далекий план |
 | `earthng/fast_style.py`, `earthng/fast_photo.py`, `earthng/fast_art.py` | вигляд: матеріали, вибір фасаду за тегами OSM, фото-фасади й ґрунт, текстур-паки |
 | `earthng/fast_packs.py`, `earthng/fetch_textures.py` | паки на основі фото: ніч, дощовий вечір, кіберпанк, зима, осінь; CC0-сніг і листя з ambientCG |
@@ -66,4 +67,5 @@ C:/js/Earth2Road/.venv/Scripts/python.exe earthng/region.py --pbf <ukraine-26091
 | `earthng/profile_land.py`, `earthng/compare_worlds.py` | заміри висадки; побайтовий оракул для прискорень |
 | `docs/BEAMNG_STREAMING.md` | дизайн, усі заміри, пастки BeamNG |
 | `data/osm_tiles/kyiv-260918` | 162 тайли Києва (71 МБ), не в git |
+| `data/osm_tiles/ukraine-260918` | 34 946 тайлів усієї України (3,3 ГБ, ~70 хв на 6 процесах), не в git; `run_world.ps1` бере їх типово |
 | `out/` | результати експериментів і прогонів, регіони (`out/region/`), не в git |

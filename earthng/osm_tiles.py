@@ -187,8 +187,8 @@ def cut(pbf, out, package_box=None):
             'sha256': hashlib.sha256(final.read_bytes()).hexdigest(), **counts[k]}
     index['seconds'] = round(time.monotonic() - t0, 1)
     (out / 'index.json').write_text(json.dumps(index, indent=1), encoding='utf8')
-    sizes = [t['bytes'] for t in index['tiles'].values()]
-    print(f"written {len(sizes)} tiles, {sum(sizes)/2**20:.1f} MB total, median {sorted(sizes)[len(sizes)//2]/2**10:.0f} KB, "
+    sizes = [t['bytes'] for t in index['tiles'].values()] or [0]
+    print(f"written {len(index['tiles'])} tiles, {sum(sizes)/2**20:.1f} MB total, median {sorted(sizes)[len(sizes)//2]/2**10:.0f} KB, "
           f"max {max(sizes)/2**20:.2f} MB ({index['seconds']} s)", flush=True)
     return index
 

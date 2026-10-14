@@ -90,8 +90,11 @@ class Server:
         self.lock = threading.RLock()
         self.status_write_lock = threading.Lock()
         self.status_writes = 0
+        # only the map render reads it: Ukraine is ~900 boxes (24 KB), kept out of status.json,
+        # which the game reads four times a second
+        self.coverage = self.region_boxes()
         self.status = {'server': 'up', 'started': time.time(), 'tilesSource': self.index['source'],
-                       'coverage': self.region_boxes(), 'job': None, 'view': None, 'stream': None}
+                       'job': None, 'view': None, 'stream': None}
         self.view_worker = ThreadPoolExecutor(1)
         self.view_future = None
         self.pending_view = None
@@ -215,7 +218,7 @@ class Server:
             x, y = merc(lat, lon, z)
             return x - x0, y - y0
         # where a landing works: the prepared regions
-        for c in self.status['coverage']:
+        for c in self.coverage:
             (ax, ay), (bx, by) = px(c[3], c[0]), px(c[1], c[2])
             if bx < 0 or by < 0 or ax > w or ay > h:
                 continue
@@ -409,7 +412,7 @@ class Server:
 
     # --- loop ----------------------------------------------------------------------------------
     def serve(self):
-        print(f'Earth2Road companion: user folder {self.user}, coverage areas {len(self.status["coverage"])}, '
+        print(f'Earth2Road companion: user folder {self.user}, coverage areas {len(self.coverage)}, '
               f'{self.workers} tile builders', flush=True)
         last_beat = 0
         while True:
