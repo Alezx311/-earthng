@@ -60,6 +60,14 @@ local function shot(name)
   if not test then return end
   createScreenshot2({filename = 'screenshots/e2r-' .. name, writeJPG = false, superSampling = 1})
   table.insert(result.shots, name)
+  -- what the picture was taken under (pack looks vary run to run: exposure, night sky)
+  pcall(function()
+    local lx, sky = scenetree.findObject('PostEffectLocalExposureObject'), scenetree.findObject('sunsky')
+    result.shotState = result.shotState or {}
+    result.shotState[name] = {lx and tostring(lx.autoExposure), lx and lx.manualEV,
+                              sky and sky:getField('nightCubemap', 0), sky and sky:getField('useNightCubemap', 0),
+                              sky and sky:getField('elevation', 0)}
+  end)
 end
 
 local function request(tbl)
@@ -702,6 +710,56 @@ local function showSun(cfg)
   placeSun()
 end
 
+local function applyEnvObjects(env)
+  for objName, fields in pairs(env.objects or {}) do
+    local obj = scenetree.findObject(objName)
+    if obj then
+      -- in a fixed order and twice: the night cubemap took (or not) depending on the order
+      -- pairs() gave nightCubemap and useNightCubemap (vis-packs-10 dark, -11 dusk, same values)
+      local keys = {}
+      for field in pairs(fields) do table.insert(keys, field) end
+      table.sort(keys)
+      for _ = 1, 2 do
+        for _, field in ipairs(keys) do obj:setField(field, 0, fields[field]) end
+        pcall(function() obj:postApply() end)
+      end
+      result.envCheck = result.envCheck or {}
+      for field in pairs(fields) do result.envCheck[objName .. '.' .. field] = tostring(obj:getField(field, 0)) end
+    else
+      result.envMissing = objName
+    end
+  end
+end
+
+local function envAgainStep()
+  local e = S.envAgain
+  if not e or S.now < e.at[1] then return end
+  table.remove(e.at, 1)
+  -- the sun nudged first: a changed elevation makes the sky redo its lighting
+  local sky = scenetree.findObject('sunsky')
+  local el = e.env.objects and e.env.objects.sunsky and tonumber(e.env.objects.sunsky.elevation)
+  if sky and el then
+    sky:setField('elevation', 0, tostring(el - 0.3))
+    pcall(function() sky:postApply() end)
+  end
+  applyEnvObjects(e.env)
+  if #e.at == 0 then S.envAgain = nil end
+end
+
+local RELOADS_PER_FRAME = 2
+local function reloadStep()
+  local q = S.reloadQueue
+  if not q or #q == 0 then return end
+  local t = hptimer()
+  for _ = 1, RELOADS_PER_FRAME do
+    local mat = table.remove(q)
+    if not mat then break end
+    mat:reload()
+  end
+  local ms = t:stop()
+  if ms > (result.reloadStepMs or 0) then result.reloadStepMs = ms end
+end
+
 local function applyPack(name)
   local pack = S.packs and S.packs[name]
   if not pack then return end
@@ -709,16 +767,22 @@ local function applyPack(name)
   -- a field the previous pack set and this one does not goes back to the material's own value
   -- (noted the first time a pack changed it): roughness of wet roads, hidden leaves, tints
   S.packOrig = S.packOrig or {}
+  -- only what differs is set, and only a changed material reloads (a reload of every one of
+  -- ~90 materials took 0.6-0.9 s, vis-packs-10)
+  local dirty = {}
+  local function set(mat, matName, field, value)
+    value = tostring(value)
+    if mat:getField(field, 0) ~= value then
+      mat:setField(field, 0, value)
+      dirty[matName] = mat
+    end
+  end
   for matName, fields in pairs(S.packSet or {}) do
     local mat, orig = scenetree.findObject(matName), S.packOrig[matName]
     if mat and orig then
-      local dirty = false
       for field in pairs(fields) do
-        if not (pack[matName] and pack[matName][field] ~= nil) and orig[field] ~= nil then
-          mat:setField(field, 0, orig[field]); dirty = true
-        end
+        if not (pack[matName] and pack[matName][field] ~= nil) and orig[field] ~= nil then set(mat, matName, field, orig[field]) end
       end
-      if dirty and not pack[matName] then mat:reload() end
     end
   end
   for matName, fields in pairs(pack) do
@@ -728,26 +792,23 @@ local function applyPack(name)
       S.packOrig[matName] = orig
       for field, value in pairs(fields) do
         if orig[field] == nil then orig[field] = mat:getField(field, 0) end
-        mat:setField(field, 0, value)
+        set(mat, matName, field, value)
       end
-      mat:reload()
     end
   end
+  -- reloaded a few a frame (reloadStep): ~80 in one frame stalled it for 0.5-1 s
+  S.reloadQueue = {}
+  for _, mat in pairs(dirty) do table.insert(S.reloadQueue, mat) end
+  result.packReloads = #S.reloadQueue
   S.packSet = pack
+  local tMats = timer:stop()
   -- sky, fog and the sun of the pack
   local env = S.packEnv and S.packEnv[name]
   if env then
-    for objName, fields in pairs(env.objects or {}) do
-      local obj = scenetree.findObject(objName)
-      if obj then
-        for field, value in pairs(fields) do obj:setField(field, 0, value) end
-        pcall(function() obj:postApply() end)
-        result.envCheck = result.envCheck or {}
-        for field in pairs(fields) do result.envCheck[objName .. '.' .. field] = tostring(obj:getField(field, 0)) end
-      else
-        result.envMissing = objName
-      end
-    end
+    applyEnvObjects(env)
+    -- again a little later: the sky's lighting is captured some frame after a change, and a
+    -- capture during the switch left the same night lit like dusk in some runs (vis-packs-11, -13)
+    S.envAgain = {env = env, at = {S.now + 0.7, S.now + 2.0, S.now + 4.0}}
     showSun(env.sun ~= false and env.sun or nil)
     showLights(env.lights ~= false and env.lights or nil)
     -- a night is a night only with a fixed exposure: the automatic one brightens it back to dusk
@@ -765,6 +826,8 @@ local function applyPack(name)
   end
   S.pack = name
   result.pack, result.packSwitchMs = name, timer:stop()
+  result.packSwitches = result.packSwitches or {}
+  table.insert(result.packSwitches, {name, math.floor(tMats), math.floor(result.packSwitchMs)})
 end
 
 -- --- arrival ------------------------------------------------------------------------------------
@@ -1466,6 +1529,8 @@ end
 function M.tick(dt)
   placeSun()
   lightsStep()
+  reloadStep()
+  envAgainStep()
   readStatus()
   replayStep(dt)
   -- UI visibility never changes the simulation state. skipMap only skips the automated

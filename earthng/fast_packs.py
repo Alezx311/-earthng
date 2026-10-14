@@ -46,8 +46,8 @@ def windows_of(name):
     out = []
     if family == 'panel':
         own = photo.WINDOW_LAYERS[int(photo.unit('own', name) * len(photo.WINDOW_LAYERS))]
-        for bx in range(2):
-            for sy in range(2):
+        for bx in range(photo.PANEL_N):
+            for sy in range(photo.PANEL_N):
                 swap = photo.WINDOW_LAYERS[int(photo.unit('flat', name, bx, sy) * len(photo.WINDOW_LAYERS))]
                 layer = swap if photo.unit('swap', name, bx, sy) < .2 else own
                 x0, y0, x1, y1 = LAYER_GLASS[layer]
@@ -114,7 +114,7 @@ def wall_glow(name, mood, colour_image=None):
     i.e. upside down): some windows lit. mood 'night' (homes warm, offices white) or 'cyber'
     (neon, shop signs with letters, a neon line along every office floor)."""
     family = photo.PHOTO_WALLS[name][0]
-    size = photo.SHEET_PX if family == 'loggia' else photo.TILE_PX
+    size = photo.SHEET_PX if family == 'loggia' else photo.CELL * photo.PANEL_N if family == 'panel' else photo.TILE_PX
     im = Image.new('RGB', (size, size), (0, 0, 0))
     if family.startswith('end_'):
         return im
@@ -127,7 +127,7 @@ def wall_glow(name, mood, colour_image=None):
     for k, (box, role) in enumerate(wins):
         u = photo.unit('lit', name, mood, k)
         if role == 'home':
-            if family in ('panel', 'brick', 'plaster'):
+            if family in ('brick', 'plaster'):
                 # four windows a repeat: never all dark, never all lit
                 lit = [0, 3] if photo.unit('pat', name) < .5 else [1, 2]
                 if photo.unit('third', name, mood) < .5:
@@ -143,10 +143,11 @@ def wall_glow(name, mood, colour_image=None):
             row = int(box[1] // (size / 2))
             if row not in floor_lit:
                 floor_lit[row] = photo.unit('floor', name, mood, row) < .6
-            if not floor_lit[row] or u < .12:
+            if not floor_lit[row] or u < .35:
                 continue
-            c = _pick(NEON, u) if mood == 'cyber' and u > .8 else OFFICE
-            gain = .7 + .2 * photo.unit('gain', name, mood, k)
+            # cold and warm panels, dimmer than a home window: an office floor is a broad surface
+            c = _pick(NEON, u) if mood == 'cyber' and u > .8 else (OFFICE if u < .7 else (255, 232, 196))
+            gain = .42 + .25 * photo.unit('gain', name, mood, k)
         elif role == 'shop':
             c, gain = (_pick(NEON, u) if mood == 'cyber' else SHOP), .9
         elif role == 'plate':
@@ -470,8 +471,8 @@ def environment(pack, real):
         info.update(fogColor='0.016 0.022 0.048 1', fogDensity='0.00045', canvasClearColor='3 5 12 255')
         clouds.update(coverage='0.25', exposure='0.15')
         env['lights'] = {'colors': [[1, .55, .2]], 'radius': 28, 'brightness': 6, 'height': 7.3, 'count': 28}
-        # stars instead of the day cubemap the level uses at night; a fixed exposure (EV) keeps it dark
-        sun.update(nightCubemap='BNG_Sky_Space', useNightCubemap='1')
+        # a fixed exposure (EV): the automatic one brightens the night back to dusk. (A night
+        # cubemap, BNG_Sky_Space, took in some sessions and not in others: vis-packs-podil-06/07.)
         env['exposure'] = 5
     if pack == 'cyber':
         sun.update(nightColor='0.04 0.012 0.07 1', nightFogColor='0.07 0.015 0.11 1', ambientScale='0.12 0.06 0.18 1')
@@ -495,7 +496,8 @@ def environment(pack, real):
                    colorizeAmount='0.7', ambientScale='0.52 0.56 0.66 1', sunScale='1 0.9 0.8 1', fogScale='0.75 0.8 0.9 1')
         info.update(fogColor='0.8 0.83 0.88 1', fogDensity='0.0006', canvasClearColor='196 204 216 255')
         clouds.update(coverage='0.75', exposure='0.7', baseColor='0.9 0.92 0.96 1')
-        env['precip'] = {'dataBlock': 'Snow_menu', 'numDrops': 6000, 'minSpeed': .15, 'maxSpeed': .3, 'dropSize': .3}
+        env['precip'] = {'dataBlock': 'Snow_menu', 'numDrops': 9000, 'minSpeed': .2, 'maxSpeed': .35, 'dropSize': .6,
+                         'turbulence': True}
     if pack == 'autumn':
         sun.update(elevation='11', azimuth='235', brightness='1.05', skyBrightness='20', colorize='0.98 0.7 0.42 1',
                    colorizeAmount='0.9', ambientScale='0.78 0.64 0.52 1', sunScale='1 0.74 0.44 1', fogScale='0.95 0.72 0.5 1')

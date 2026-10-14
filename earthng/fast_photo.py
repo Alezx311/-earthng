@@ -25,15 +25,16 @@ LOGGIA_M = 33.0
 PANEL_LAYERS = 6        # atlas: five windowed panels, then a blank one
 WINDOW_LAYERS = (0, 1, 3, 4)   # layer 2 has a window grille: not in a repeat
 PANEL_GAIN = 1.32
+PANEL_N = 4              # a panel repeat is 4 x 4 cells (12 m): lit windows at night do not form a checker
 
 # name: (family, colour 0..1, metres per repeat). Colours are the city's: grey and beige panels,
 # the pinkish and pale blue series, painted plaster of the old centre.
 PHOTO_WALLS = {
-    'pnl_grey':   ('panel',   (.80, .80, .78), 6.0),
-    'pnl_beige':  ('panel',   (.86, .80, .70), 6.0),
-    'pnl_pink':   ('panel',   (.86, .75, .71), 6.0),
-    'pnl_blue':   ('panel',   (.74, .80, .86), 6.0),
-    'pnl_white':  ('panel',   (.90, .90, .88), 6.0),
+    'pnl_grey':   ('panel',   (.80, .80, .78), 3.0 * PANEL_N),
+    'pnl_beige':  ('panel',   (.86, .80, .70), 3.0 * PANEL_N),
+    'pnl_pink':   ('panel',   (.86, .75, .71), 3.0 * PANEL_N),
+    'pnl_blue':   ('panel',   (.74, .80, .86), 3.0 * PANEL_N),
+    'pnl_white':  ('panel',   (.90, .90, .88), 3.0 * PANEL_N),
     'lgg_cream':  ('loggia',  (.87, .84, .77), LOGGIA_M),
     'lgg_grey':   ('loggia',  (.80, .80, .78), LOGGIA_M),
     'lgg_pink':   ('loggia',  (.86, .76, .72), LOGGIA_M),
@@ -116,11 +117,11 @@ def panel_atlas():
 
 
 def panel(colour, key, layers):
-    """2 x 2 photo panels: one window style per facade, an occasional different one."""
+    """PANEL_N x PANEL_N photo panels: one window style per facade, an occasional different one."""
     own = WINDOW_LAYERS[int(unit('own', key) * len(WINDOW_LAYERS))]
-    out = Image.new('RGB', (TILE_PX, TILE_PX))
-    for bx in range(2):
-        for sy in range(2):
+    out = Image.new('RGB', (CELL * PANEL_N, CELL * PANEL_N))
+    for bx in range(PANEL_N):
+        for sy in range(PANEL_N):
             swap = WINDOW_LAYERS[int(unit('flat', key, bx, sy) * len(WINDOW_LAYERS))]
             out.paste(layers[swap if unit('swap', key, bx, sy) < .2 else own], (bx * CELL, sy * CELL))
     return tint(out, colour, gain=PANEL_GAIN)

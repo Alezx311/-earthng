@@ -288,7 +288,7 @@ def environment(pack):
         return {k: (' '.join(map(str, o[k])) if isinstance(o[k], list) else str(o[k])) for k in keys if k in o}
     sun_keys = ('azimuth', 'elevation', 'brightness', 'skyBrightness', 'colorize', 'colorizeAmount', 'fogScale',
                 'sunScale', 'ambientScale', 'nightColor', 'nightFogColor', 'nightCubemap')
-    info_keys = ('fogColor', 'fogDensity', 'canvasClearColor')
+    info_keys = ('fogColor', 'fogDensity', 'canvasClearColor', 'globalEnviromentMap')
     if pack != 'synth':
         real = {'objects': {'sunsky': {**fields(sky['sunsky'], sun_keys), 'useNightCubemap': '0'}, 'theLevelInfo': fields(sky['theLevelInfo'], info_keys),
                             'clouds': fields(sky['clouds'], ('coverage', 'exposure', 'baseColor'))},

@@ -58,6 +58,7 @@ C:/js/Earth2Road/.venv/Scripts/python.exe earthng/region.py --pbf <ukraine-26091
 | `earthng/osm_tiles.py` | нарізка OSM-пакета на статичні тайли (сітка 0,05°, буфер 0,01°) |
 | `earthng/fast.py`, `earthng/fast_far.py` | генератор `fast`: дороги, сцена (будівлі, ґрунт, доріжки, паркани, дерева, авто), далекий план |
 | `earthng/fast_style.py`, `earthng/fast_photo.py`, `earthng/fast_art.py` | вигляд: матеріали, вибір фасаду за тегами OSM, фото-фасади й ґрунт, текстур-паки |
+| `earthng/fast_packs.py`, `earthng/fetch_textures.py` | паки на основі фото: ніч, дощовий вечір, кіберпанк, зима, осінь; CC0-сніг і листя з ambientCG |
 | `earthng/fast_dds.py` | кодер BC1 DDS з mip-ланцюгом і sRGB-заголовком (гра не «готує» PNG) |
 | `data/textures`, `data/art/<версія>` | CC0-фото (Panelka pack, ambientCG) і зібраний з них арт, не в git |
 | `earthng/s1.py`, `earthng/e2rstream.lua` | спайки S1–S3 (рантайм-тайли, ProceduralMesh, колізія) |
