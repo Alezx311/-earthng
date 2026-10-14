@@ -37,6 +37,7 @@ def main():
     p.add_argument('--drive-seconds', type=float, default=8)
     p.add_argument('--packs', action='store_true', help='after the drive: an overview shot in every texture pack')
     p.add_argument('--gallery', action='store_true', help='after the drive: fixed views round the car (e2r-g*.png)')
+    p.add_argument('--pack', help='texture pack to land and drive in (default real)')
     p.add_argument('--pack-gallery', help='comma list of packs: the gallery once in each (implies --gallery)')
     p.add_argument('--gallery-wait', type=float, default=1, help='seconds before the gallery (far tiles keep loading)')
     p.add_argument('--view', action='append', default=[], help='extra gallery view name:x,y,z:tx,ty,tz (world metres)')
@@ -79,6 +80,8 @@ def main():
         test['replay'] = True
     if a.packs:
         test['packs'] = True
+    if a.pack:
+        test['pack'] = a.pack
     if a.pack_gallery:
         a.gallery = True
         test['packGallery'] = [s for s in a.pack_gallery.split(',') if s]

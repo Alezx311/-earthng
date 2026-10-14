@@ -665,7 +665,14 @@ end
 local function showPrecip(cfg)
   local old = scenetree.findObject('e2r_precip')
   if old then old:delete() end
+  S.precipPending = nil
   if not cfg then return end
+  -- not before the car is on the road: the drops regenerate round a camera that jumps from 350 m
+  -- down to the car, and that touch-down frame took 114 ms (vis-packs-drive-cyber)
+  if S.state ~= 'driving' or S.now - (S.phaseAt or 0) < 1.5 then
+    S.precipPending = cfg
+    return
+  end
   local obj = createObject('Precipitation')
   obj:setField('dataBlock', 0, cfg.dataBlock)
   for k, v in pairs({numDrops = cfg.numDrops or 3000, boxWidth = cfg.boxWidth or 60, boxHeight = cfg.boxHeight or 40,
@@ -1507,6 +1514,7 @@ function M.onUpdate(dtReal)
     S.testCheckAt = S.now
     if FS:fileExists('/e2r-world-test.json') then
       test = jsonReadFile('/e2r-world-test.json')
+      if test and test.pack then S.pack = test.pack end     -- drive in a pack (applied at the landing)
       pcall(function() local tod = scenetree.tod; if tod then tod.play = false end end)
       result.status = 'picker_open'
       S.phaseAt = S.now
@@ -1530,6 +1538,7 @@ function M.tick(dt)
   placeSun()
   lightsStep()
   reloadStep()
+  if S.precipPending and S.state == 'driving' and S.now - (S.phaseAt or 0) >= 1.5 then showPrecip(S.precipPending) end
   envAgainStep()
   readStatus()
   replayStep(dt)
