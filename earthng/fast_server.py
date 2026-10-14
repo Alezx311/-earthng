@@ -143,7 +143,7 @@ def server_class(base):
                 self.art.result()                   # facades and texture packs (started with the server)
                 import fast_art
                 fast_art.ensure(self.user)
-                frame=sources.Frame(); i,j=frame.tile_of(req['lon'],req['lat'])
+                frame=sources.Frame.of(meta); i,j=frame.tile_of(req['lon'],req['lat'])
                 # Connections stay on scheduler thread; preparation owns no persistent SQLite reader.
                 with self.lock:
                     if generation!=self.generation:
@@ -309,12 +309,17 @@ def server_class(base):
                     wanted={k:v[0] for k,v in self.desired.items()},
                     buildP99=percentile(self.history),horizonSeconds=st.get('horizonSeconds',12),
                     loadRadius=st.get('loadRadius',1000),startupSeconds=time.monotonic()-self.landing['at'])
-                # how far the car is from the edge of the indexed window (the game warns near it)
+                # the widget's statistics: the frame and the car on the globe; how far the car is
+                # from the edge of the indexed window (the game warns near it)
                 pose,frame,b=self.pose,self.frame,st.get('bounds')
+                if frame:
+                    lon,lat=frame.geographic(0.,0.)
+                    status.update(origin=[round(float(lon),6),round(float(lat),6)],crs=frame.crs)
                 if pose and frame and b:
                     try:
                         lon,lat=frame.geographic(pose['x'],pose['y'])
                         lon,lat=float(lon),float(lat)
+                        status['car']=[round(lon,6),round(lat,6)]
                         status['edgeKm']=round(min((lon-b[0])*71.5,(b[2]-lon)*71.5,(lat-b[1])*111.2,(b[3]-lat)*111.2),2)
                     except Exception:
                         pass

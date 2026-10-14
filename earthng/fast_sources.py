@@ -19,13 +19,13 @@ import shapely
 from shapely.geometry import LineString, MultiPoint, Point, shape
 from shapely.ops import transform
 
-VERSION = 'fast-8'          # source index format (keys fast-index/<id>)
+VERSION = 'fast-9'          # source index format (keys fast-index/<id>); 9: frame per landing
 GEOMETRY = 'fast-30'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
-CRS = 'EPSG:32636'
-ORIGIN = (324000., 5590000.) # fixed UTM anchor, independent of landing and source bounds
+CRS = 'EPSG:32636'          # the frame before fast-9 (Kyiv): old replay routes are in it
+ORIGIN = (324000., 5590000.)
 DRIVABLE = {'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential',
             'unclassified', 'service', 'living_street', 'road'}
 
@@ -44,11 +44,37 @@ def road_width(tags):
     return min(35., max(2.5, number(tags.get('width'), fallback)))
 
 
+def utm_crs(lon, lat):
+    zone = int((lon + 180) // 6) % 60 + 1
+    return f'EPSG:{(32600 if lat >= 0 else 32700) + zone}'
+
+
 class Frame:
-    def __init__(self):
-        self.forward = pyproj.Transformer.from_crs('EPSG:4326', CRS, always_xy=True)
-        self.inverse = pyproj.Transformer.from_crs(CRS, 'EPSG:4326', always_xy=True)
-        self.cx, self.cy = ORIGIN
+    """World metres = UTM metres minus an origin. Every index has its own frame, at the landing
+    (Frame.at): BeamNG keeps positions in float32, and with one origin for the country Uzhhorod
+    lay 613 km from Kyiv's (steps of 6 cm); the UTM zone of the landing keeps the scale true in
+    the west as well."""
+    def __init__(self, crs=CRS, origin=ORIGIN):
+        self.crs = crs
+        self.forward = pyproj.Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+        self.inverse = pyproj.Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
+        self.cx, self.cy = float(origin[0]), float(origin[1])
+
+    @classmethod
+    def at(cls, lon, lat):
+        """The frame centred on a point (whole metres), in the point's UTM zone."""
+        crs = utm_crs(lon, lat)
+        x, y = pyproj.Transformer.from_crs('EPSG:4326', crs, always_xy=True).transform(lon, lat)
+        return cls(crs, (round(x), round(y)))
+
+    @classmethod
+    def of(cls, meta):
+        """The frame of an index (region.json, or its source index)."""
+        spec = meta.get('frame')
+        return cls(spec['crs'], spec['origin']) if spec else cls()
+
+    def spec(self):
+        return {'crs': self.crs, 'origin': [self.cx, self.cy]}
 
     def local(self, lon, lat):
         x, y = self.forward.transform(lon, lat)
@@ -90,7 +116,8 @@ def window_of(index, point):
         return index, None
     lon, lat = point
     cell = index.get('cell', .05)
-    cx, cy = round(lon / WINDOW_SNAP) * WINDOW_SNAP / cell, round(lat / WINDOW_SNAP) * WINDOW_SNAP / cell
+    centre = [round(round(lon / WINDOW_SNAP) * WINDOW_SNAP, 6), round(round(lat / WINDOW_SNAP) * WINDOW_SNAP, 6)]
+    cx, cy = centre[0] / cell, centre[1] / cell
     entries = []
     for k, v in index['tiles'].items():
         x, y = (v['cell'][0] + v['cell'][2]) / 2 / cell, (v['cell'][1] + v['cell'][3]) / 2 / cell
@@ -109,7 +136,7 @@ def window_of(index, point):
     xs = [c for v in tiles.values() for c in (v['cell'][0], v['cell'][2])]
     ys = [c for v in tiles.values() for c in (v['cell'][1], v['cell'][3])]
     window = [round(min(xs), 6), round(min(ys), 6), round(max(xs), 6), round(max(ys), 6)]
-    return dict(index, tiles=tiles, package_box=window, window=window), window
+    return dict(index, tiles=tiles, package_box=window, window=window, centre=centre), window
 
 
 def dem_tiles(box):
@@ -126,6 +153,12 @@ def source_identity(source, dem, point=None):
     PNG per landing for the oblast."""
     source, dem = Path(source), Path(dem)
     index, window = window_of(json.loads((source / 'index.json').read_bytes()), point)
+    # the frame's origin: the window's centre (the landing snapped to WINDOW_SNAP, so nearby
+    # landings share the index and its tiles; at most ~11 km from the car), else the package's
+    if 'centre' not in index:
+        w, s, e, n = index['package_box']
+        index = dict(index, centre=[round((w + e) / 2, 6), round((s + n) / 2, 6)])
+    index = dict(index, frame=Frame.at(*index['centre']).spec())
     h = hashlib.sha256(VERSION.encode() + json.dumps(index, sort_keys=True).encode())
     for x, y in dem_tiles(index['package_box']):
         p = dem / 'terrain' / '12' / str(x) / f'{y}.png'
@@ -219,7 +252,7 @@ def prepare(source, output, dem, emit=print, point=None):
     if final.exists():
         return target, json.loads((target / 'region.json').read_text())
     target.mkdir(parents=True, exist_ok=True)
-    frame = Frame()
+    frame = Frame.of(index)
     roads = {}
 
     files = [Path(source) / entry['file'] for entry in index['tiles'].values()]
@@ -342,7 +375,7 @@ def prepare(source, output, dem, emit=print, point=None):
     db.executemany('INSERT INTO nodes VALUES(?,?)', node_rows)
     db.executemany('INSERT INTO links VALUES(?,?)', link_rows)
     db.commit(); db.close()
-    meta = {'id':identity,'generator':VERSION,'bbox':index['package_box'],'center':[30.52,50.45],
+    meta = {'id':identity,'generator':VERSION,'bbox':index['package_box'],'center':index['centre'],'frame':index['frame'],
             'dem':str(Path(dem).resolve()), 'source':str(Path(source).resolve()),
             'coverage':[v['coverage'] for v in index['tiles'].values()],
             'seconds':time.perf_counter()-started,'roads':len(segments),'scenery':'lazy from raw OSM'}
@@ -357,7 +390,7 @@ class Store:
         self.directory = Path(directory).resolve()
         self.meta = json.loads((self.directory/'region.json').read_text())
         self.db = sqlite3.connect((self.directory/'sources.sqlite').as_uri()+'?mode=ro',uri=True)
-        self.frame = Frame()
+        self.frame = Frame.of(self.meta)
         self.terrain = Terrain(self.meta['dem'],self.frame)
         from shapely.geometry import box
         self.coverage = shapely.union_all([box(*r) for r in self.meta['coverage']])

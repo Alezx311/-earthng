@@ -64,6 +64,17 @@ class FastGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(float(x),-501,places=6)
         self.assertAlmostEqual(float(y),501,places=6)
 
+    def test_frame_at_landing(self):
+        # Uzhhorod: zone 34, origin on the point; far from Kyiv's old origin (-613 km)
+        f=sources.Frame.at(22.29,48.62)
+        self.assertEqual(f.crs,'EPSG:32634')
+        x,y=f.local(22.30,48.63)
+        self.assertTrue(abs(float(x))<1000 and abs(float(y))<1200)
+        g=sources.Frame.of({'frame':f.spec()})
+        lon,lat=g.geographic(x,y)
+        self.assertAlmostEqual(float(lon),22.30,places=7); self.assertAlmostEqual(float(lat),48.63,places=7)
+        self.assertEqual(sources.Frame.of({}).crs,sources.CRS)          # indexes before fast-9
+
     def test_large_package_is_indexed_as_a_window(self):
         cell=.05
         tiles={f'{x}_{y}':{'cell':[x*cell,y*cell,(x+1)*cell,(y+1)*cell]} for x in range(584,644) for y in range(983,1032)}
@@ -72,6 +83,7 @@ class FastGeometryTests(unittest.TestCase):
         self.assertIs(sources.window_of(small,(30.5,50.4))[0],small)
         a,wa=sources.window_of(index,(30.36,50.46)); b,wb=sources.window_of(index,(30.31,50.42))
         self.assertEqual(wa,wb)                                  # nearby landings share it
+        self.assertEqual(a['centre'],b['centre'])                # and the frame's origin
         self.assertTrue(140<=len(a['tiles'])<=17*11)               # ~ the Kyiv package (162)
         self.assertTrue(wa[0]<30.36-.15 and wa[2]>30.36+.15 and wa[1]<50.46-.1 and wa[3]>50.46+.1)
         with self.assertRaisesRegex(ValueError,'no_osm'):

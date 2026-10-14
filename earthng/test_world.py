@@ -49,17 +49,31 @@ def main():
     p.add_argument('--index-cache', type=Path, help='reuse a source index; report is NOT a cold-start test')
     p.add_argument('--stream-cache', type=Path, help='copy an earlier e2r_stream folder in (warm tiles)')
     a = p.parse_args()
-    if a.replay and a.lat is None and a.route:
-        # land where the replay starts: the route is in the fast frame (fast_sources.Frame)
+    route_frame = None
+    if a.route and a.generator == 'fast':
+        # a fast route is in the frame it was recorded in (route['frame']; before fast-9 the
+        # Kyiv one); the stream is in the landing's frame
         import fast_sources
-        x, y = json.loads(a.route.read_text(encoding='utf8'))['points'][0][:2]
-        lon, lat = fast_sources.Frame().geographic(x, y)
-        a.lat, a.lon = float(lat), float(lon)
+        route = json.loads(a.route.read_text(encoding='utf8'))
+        spec = route.get('frame')
+        route_frame = fast_sources.Frame.of({'frame': spec if isinstance(spec, dict) else None})
+        if a.replay and a.lat is None:
+            lon, lat = route_frame.geographic(*route['points'][0][:2])     # land where it starts
+            a.lat, a.lon = float(lat), float(lon)
     if a.lat is None or a.lon is None:
         p.error('--lat and --lon are required')
     out = a.out.resolve()
     if out.exists():
         raise SystemExit(f'{out} exists')
+    if route_frame:
+        import numpy as np
+        land = fast_sources.Frame.of(fast_sources.source_identity(a.tiles, paths.OUT / 'world' / 'cache', (a.lon, a.lat))[1])
+        pts = np.asarray(route['points'], dtype=float)
+        lon, lat = route_frame.geographic(pts[:, 0], pts[:, 1])
+        pts[:, 0], pts[:, 1] = land.local(lon, lat)
+        out.mkdir(parents=True)
+        a.route = out / 'route-landing.json'
+        a.route.write_text(json.dumps(dict(route, points=pts.round(3).tolist(), frame=land.spec())), encoding='utf8')
     user = out / 'user'
     profile = user / 'current'
     (profile / 'mods').mkdir(parents=True)

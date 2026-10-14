@@ -612,7 +612,14 @@ end
 -- --- texture packs (fast generator) -----------------------------------------------------------------
 -- packs.json (earthng/fast_art.py): pack -> material -> stage-0 fields. A switch rewrites the
 -- fields of the loaded materials in place; no tile is rebuilt or reloaded.
-local PACK_NAMES = {{'real', 'Реальний'}, {'toon', 'Мультяшний'}, {'model', 'Макет'}, {'synth', 'Синтвейв'}}
+-- Button names come from here first (the labels in packs.json are escaped JSON strings); a pack
+-- the table does not know shows its packs.json label or its id.
+local PACK_LABELS = {real = 'Реальний', toon = 'Мультяшний', model = 'Макет', synth = 'Синтвейв',
+  night = 'Ніч', rain = 'Дощ', cyber = 'Кіберпанк', winter = 'Зима', autumn = 'Осінь'}
+local PACK_NAMES = {}
+for _, name in ipairs({'real', 'toon', 'model', 'synth', 'night', 'rain', 'cyber', 'winter', 'autumn'}) do
+  table.insert(PACK_NAMES, {name, PACK_LABELS[name]})
+end
 
 -- Street lights of a night pack: a pool of PointLights moved onto the lamps nearest the camera
 -- (env.lights: colors, radius, brightness, height, count). Lamps are noted as tiles spawn them.
@@ -884,7 +891,9 @@ local function beginArrival(job)
     S.packEnv = okP and packs and packs.environment or nil
     if okP and packs and packs.order then
       PACK_NAMES = {}
-      for _, name in ipairs(packs.order) do table.insert(PACK_NAMES, {name, packs.labels and packs.labels[name] or name}) end
+      for _, name in ipairs(packs.order) do
+        table.insert(PACK_NAMES, {name, PACK_LABELS[name] or (packs.labels and packs.labels[name]) or name})
+      end
     end
     if okP and packs and packs.extra and not S.packsExtra then      -- the sun's material
       S.matSeq = (S.matSeq or 0) + 1
@@ -1135,6 +1144,75 @@ local function countTiles()
   return loaded, loading
 end
 
+-- texture packs: three equal buttons a row across the window, the active one lit
+local function drawPacks()
+  local current = S.pack or 'real'
+  local label = current
+  for _, p in ipairs(PACK_NAMES) do if p[1] == current then label = p[2] end end
+  im.Text('Стиль: ' .. label)
+  local spacing = im.GetStyle().ItemSpacing.x
+  local width = math.floor((im.GetContentRegionAvailWidth() - 2 * spacing) / 3)
+  for k, p in ipairs(PACK_NAMES) do
+    if (k - 1) % 3 ~= 0 then im.SameLine() end
+    local active = current == p[1]
+    if active then
+      im.PushStyleColor2(im.Col_Button, im.ImVec4(0.15, 0.55, 0.3, 1))
+      im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.2, 0.65, 0.35, 1))
+    end
+    if im.Button(p[2] .. '##pack_' .. p[1], im.ImVec2(width, 0)) and not active then applyPack(p[1]) end
+    if active then im.PopStyleColor(2) end
+  end
+end
+
+local function recentFrames()
+  local list, total, worst = {}, 0, 0
+  for _, ms in pairs(S.recent or {}) do
+    table.insert(list, ms); total = total + ms; worst = math.max(worst, ms)
+  end
+  if #list == 0 then return nil end
+  table.sort(list)
+  return 1000 * #list / math.max(total, 1e-3), list[math.ceil(#list * 0.99)], worst
+end
+
+local function drawStats(st, p, v)
+  local fps, p99, worst = recentFrames()
+  if fps then
+    im.Text(string.format('FPS %.0f   кадр p99 %.0f мс, найгірший %.0f мс', fps, p99, worst))
+  end
+  if p then
+    im.Text(string.format('Швидкість %.0f км/год   висота %.0f м', (v and v:length() or 0) * 3.6, p.z))
+  end
+  if st and st.car then im.Text(string.format('Авто: %.5f, %.5f', st.car[2], st.car[1])) end
+  -- tiles in the game
+  local roads, collided, scenes, loading, failed, far = 0, 0, 0, 0, 0, 0
+  for _, t in pairs(S.tiles) do
+    if t.failed then failed = failed + 1
+    elseif t.roadComplete then
+      roads = roads + 1
+      if t.collided then collided = collided + 1 end
+      if t.sceneComplete then scenes = scenes + 1 end
+    else loading = loading + 1 end
+  end
+  for _ in pairs(S.far) do far = far + 1 end
+  im.Text(string.format('У грі: доріг %d (з колізією %d), сцен %d, далеких %d', roads, collided, scenes, far))
+  im.Text(string.format('Вантажаться %d, збої %d, доставка p99 %.1f с', loading, failed, S.deliveryP99 or 0))
+  if st then
+    local nFailed = 0
+    for _ in pairs(st.failed or {}) do nFailed = nFailed + 1 end
+    im.Text(string.format('Компаньйон: готові %d, будуються %d, черга %d, збої %d',
+      st.readyCount or 0, st.building or 0, st.queued or 0, nFailed))
+    im.Text(string.format('Збірка тайла: середня %.1f с, p99 %.1f с, зібрано %d',
+      st.meanBuildSeconds or 0, st.buildP99 or 0, st.built or 0))
+    im.Text(string.format('Запас: %.0f с наперед, радіус %.1f км', st.horizonSeconds or 0, (st.loadRadius or 0) / 1000))
+    if st.edgeKm then im.Text(string.format('До краю вікна індексу: %.1f км', st.edgeKm)) end
+    if st.origin and p then
+      local grey = im.ImVec4(0.65, 0.65, 0.65, 1)
+      im.TextColored(grey, string.format('Початок координат: %.3f, %.3f, %s', st.origin[2], st.origin[1], st.crs or '?'))
+      im.TextColored(grey, string.format('Авто від початку: %.1f км', math.sqrt(p.x * p.x + p.y * p.y) / 1000))
+    end
+  end
+end
+
 local function drawWindow()
   if S.widgetHidden then
     im.Begin('Earth2Road##restore', nil, im.WindowFlags_AlwaysAutoResize)
@@ -1146,14 +1224,11 @@ local function drawWindow()
     im.SetNextWindowSize(im.ImVec2(392, 0), im.Cond_Always)
     im.Begin('Earth2Road##mini', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
     if im.Button('Приховати') then S.widgetHidden = true end
+    im.SameLine()
+    if im.Button('Обрати інше місце') then S.pickerOpen = true; S.viewDirty = true end
     drawMap(360, 220)
-    local loaded, loading = countTiles()
     local st = S.status and S.status.stream
-    im.Text(string.format('Тайли: %d у грі, %d вантажаться', loaded, loading))
-    if st then
-      im.Text(string.format('Компаньйон: %d готові, %d будуються, черга %d', st.readyCount or 0, st.building or 0, st.queued or 0))
-    end
-    local p = focus()
+    local p, v = focus()
     if st and st.edgeKm and st.edgeKm < 3 then
       im.TextColored(im.ImVec4(1, 0.5, 0.2, 1), string.format('Край завантаженої області: %.1f км. Далі доріг немає -', math.max(0, st.edgeKm)))
       im.TextColored(im.ImVec4(1, 0.5, 0.2, 1), 'висадьтеся ближче до нової точки ("Обрати інше місце").')
@@ -1164,14 +1239,8 @@ local function drawWindow()
     if AP then
       im.Text(string.format('Автопілот: %.1f км%s', AP.travelled / 1000, AP.waiting and ' (чекаю тайл)' or ''))
     end
-    if S.packs then
-      im.Text('Стиль:')
-      for k, p in ipairs(PACK_NAMES) do
-        if (k - 1) % 5 ~= 0 then im.SameLine() end
-        if im.Button(p[2] .. (S.pack == p[1] and ' *' or '')) then applyPack(p[1]) end
-      end
-    end
-    if im.Button('Обрати інше місце') then S.pickerOpen = true; S.viewDirty = true end
+    if S.packs then drawPacks() end
+    if im.CollapsingHeader1('Статистика', im.TreeNodeFlags_DefaultOpen) then drawStats(st, p, v) end
     im.End()
     return
   end
@@ -1494,6 +1563,9 @@ function M.onUpdate(dtReal)
   S.now, S.dt = S.now + dtReal, dtReal
   local frameMs = frameTimer:stopAndReset()
   table.insert(S.frames, frameMs)
+  S.recentAt = (S.recentAt or 0) % 240 + 1        -- the widget's FPS: the last 240 frames
+  S.recent = S.recent or {}
+  S.recent[S.recentAt] = frameMs
   if S.driveAcc and S.state == 'driving' then accFrame(S.driveAcc, frameMs, S.now) end
   if frameMs > 300 and S.stream then
     result.hitches = result.hitches or {}

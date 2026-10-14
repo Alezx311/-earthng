@@ -67,7 +67,7 @@ def main():
     store=sources.Store(directory)
     points,along=route(store,[(30.499,50.507),(30.5225,50.4475),(30.615,50.454),(30.64,50.405),(30.508,50.392)])
     (a.out/'route.json').write_text(json.dumps({'points':points.tolist(),'length':float(along[-1]),
-                                             'frame':'fast-utm36','speed':a.speed}),encoding='utf8')
+                                             'frame':store.frame.spec(),'speed':a.speed}),encoding='utf8')
     # Production server receives a cold tile cache and the timed source index above.
     args=SimpleNamespace(userfolder=str(a.out/'user'),work=str(a.out/'work'),tiles=a.sources,
                          regions=str(a.out/'none'),cache=a.dem,workers=a.workers,radius=800,generator='fast')
