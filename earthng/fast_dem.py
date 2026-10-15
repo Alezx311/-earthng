@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+import time
 import urllib.request
 
 
@@ -36,7 +37,12 @@ def fetch(path):
         if image.size!=(256,256):
             raise ValueError(f'invalid DEM {url}')
         image.verify()
-    os.replace(tmp,path)
+    for attempt in range(10):   # an antivirus may hold the fresh .part for a moment (WinError 32)
+        try:
+            os.replace(tmp,path); return
+        except PermissionError:
+            if attempt==9: raise
+            time.sleep(1)
 
 
 def main():

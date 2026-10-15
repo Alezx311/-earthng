@@ -47,6 +47,9 @@ def main():
     p.add_argument('--generator', choices=('v2','fast'), default='v2')
     p.add_argument('--replay', action='store_true', help='camera/pose replay at constant speed; not a physics test')
     p.add_argument('--index-cache', type=Path, help='reuse a source index; report is NOT a cold-start test')
+    p.add_argument('--traffic', type=int, help="after landing: the game's AI traffic, this many cars")
+    p.add_argument('--rain', type=int, help="after landing: the game's own rain (core_environment numOfDrops)")
+    p.add_argument('--mod', action='append', default=[], type=Path, help='another mod ZIP for the test profile (e.g. Agent Traffic)')
     p.add_argument('--stream-cache', type=Path, help='copy an earlier e2r_stream folder in (warm tiles)')
     a = p.parse_args()
     route_frame = None
@@ -78,6 +81,8 @@ def main():
     profile = user / 'current'
     (profile / 'mods').mkdir(parents=True)
     shutil.copy2(build_mod.build(out / 'mod'), profile / 'mods' / build_mod.ZIP)
+    for extra in a.mod:
+        shutil.copy2(extra, profile / 'mods' / extra.name)
     (profile / 'settings').mkdir()
     (profile / 'settings/settings.json').write_text(json.dumps({
         'GraphicDisplayResolutions': '1280 720', 'GraphicFullscreen': False, 'GraphicOverallQuality': 'Normal',
@@ -104,6 +109,10 @@ def main():
         test['galleryWait'] = a.gallery_wait
         test['views'] = [{'name': v.split(':')[0], 'cam': [float(c) for c in v.split(':')[1].split(',')],
                           'at': [float(c) for c in v.split(':')[2].split(',')]} for v in a.view]
+    if a.traffic:
+        test['traffic'] = a.traffic
+    if a.rain:
+        test['rain'] = a.rain
     if a.manual:
         test['manual'] = True
         a.timeout = 10**9

@@ -13,12 +13,11 @@ param(
     [ValidateSet('v2', 'fast')][string]$Generator = 'fast',
     [switch]$NoGame
 )
-# fast: the Ukraine package, else the Kyiv oblast one, when it is there (tiles are indexed as a
-# window round the landing)
+# fast: the Ukraine package when it is there (tiles are indexed as a window round the landing)
 if (-not $Tiles) {
     $Tiles = "$PSScriptRoot\data\osm_tiles\kyiv-260918"
     if ($Generator -eq 'fast') {
-        foreach ($name in @('ukraine-260918', 'kyiv-oblast-260918')) {
+        foreach ($name in @('ukraine-260918')) {
             $dir = "$PSScriptRoot\data\osm_tiles\$name"
             if (Test-Path "$dir\index.json") { $Tiles = $dir; break }
         }

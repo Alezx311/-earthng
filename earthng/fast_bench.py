@@ -74,7 +74,7 @@ def main():
     server=fast_server.server_class(Server)(args)
     lon,lat=store.frame.geographic(*points[0]); i,j=store.frame.tile_of(lon,lat)
     server.frame=store.frame
-    server.landing={'seq':1,'tile':[i,j],'lon':float(lon),'lat':float(lat),'at':time.monotonic()-prep}
+    server.landing={'seq':1,'tile':[i,j],'lon':float(lon),'lat':float(lat),'at':time.monotonic()-prep,'indexed':time.monotonic()}
     server.status['job']={'state':'working','seq':1}
     server.stream={'region':meta['id'],'dir':str(directory.resolve()),'tile':sources.TILE,
                    'ready':{},'scenes':{},'inflight':{},'failed':{},'queued':0,'built':0,

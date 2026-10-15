@@ -4,6 +4,7 @@ The index owns complete OSM ways and junction mouths, not tile-local decisions.
 SQLite/RTree readers are independent and bounded; workers never copy a city graph.
 """
 from collections import Counter, defaultdict, OrderedDict
+import gc
 import hashlib
 import json
 import math
@@ -20,7 +21,7 @@ from shapely.geometry import LineString, MultiPoint, Point, shape
 from shapely.ops import transform
 
 VERSION = 'fast-9'          # source index format (keys fast-index/<id>); 9: frame per landing
-GEOMETRY = 'fast-31'         # mesh/material semantics; bump to reject tiles built by older code
+GEOMETRY = 'fast-33'         # mesh/material semantics; bump to reject tiles built by older code
 TILE = 500.0
 ROAD_LIFT = 0.12            # road surface over its profile (the ground mesh sits 0.25 under the DEM)
 LIFT = 20.0                 # absolute DEM heights + lift; never the carrier plane
@@ -241,16 +242,186 @@ def read_roads(path, sha256):
     return roads
 
 
-def prepare(source, output, dem, emit=print, point=None):
+class Polylines:
+    """Many 1-D functions (xp[k], fp[k]) evaluated at once: value(x, k) == np.interp(x, xp[k], fp[k])
+    bit for bit (the same slope formula), without a Python step per call."""
+    def __init__(self, xp):
+        self.n = np.array([len(a) for a in xp])
+        self.start = np.concatenate([[0], np.cumsum(self.n)[:-1]])
+        self.X = np.concatenate(xp)
+        first, last = self.X[self.start], self.X[self.start + self.n - 1]
+        # the functions laid end to end (1 apart) only to find the bracketing pair
+        self.offset = np.concatenate([[0.], np.cumsum(last - first + 1.)[:-1]]) - first
+        self.shifted = self.X + np.repeat(self.offset, self.n)
+
+    def locate(self, x, k):
+        lo, hi = self.start[k], self.start[k] + self.n[k] - 1
+        j = np.clip(np.searchsorted(self.shifted, x + self.offset[k], side='right') - 1, lo, np.maximum(lo, hi - 1))
+        return j, np.minimum(j + 1, hi), lo, hi
+
+    def value(self, x, where, fp):
+        j, j1, lo, hi = where
+        X, F = self.X, fp
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out = (F[j1] - F[j]) / (X[j1] - X[j]) * (x - X[j]) + F[j]
+        out = np.where(x <= X[lo], F[lo], out)
+        return np.where(x >= X[hi], F[hi], out)
+
+
+def _dumps(objs, compact):
+    return [json.dumps(o, separators=(',', ':')) if compact else json.dumps(o) for o in objs]
+
+
+def write_index(segments, arcs, mouths, node_h, path, emit=print):
+    """The read-only index (features, their bounds, nodes, links) into a new SQLite file at path.
+    Mouths are done as arrays (a Python step per mouth was ~90 s of London's cold index), the JSON
+    of the rows is encoded in parallel (~60 s in one process), and the rows go in key / spatial
+    order into a database without a journal: a temporary file, renamed only once complete."""
+    from concurrent.futures import ProcessPoolExecutor
+    started = time.perf_counter()
+    pool = ProcessPoolExecutor(min(6, os.cpu_count() or 2)) if len(segments) > 50_000 else None
+    try:
+        # every mouth, node by node in mouths order
+        nids = list(mouths)
+        counts = np.array([len(mouths[n]) for n in nids])
+        flat = [e for n in nids for e in mouths[n]]
+        sid = np.array([e[0] for e in flat]); end = np.array([e[1] for e in flat])
+        width = np.array([e[4] for e in flat], dtype=float); length = np.array([e[5] for e in flat], dtype=float)
+        del flat
+        first = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        radius = np.where(counts > 1, np.maximum.reduceat(width, first) * .8, 0.)
+        cut = np.minimum(np.repeat(radius, counts), length * .25)
+        s = np.where(end == 0, cut, length - cut)
+        k = sid - 1
+        arc = Polylines([a[1] for a in arcs])
+        ax_, ay_ = np.concatenate([a[0][:, 0] for a in arcs]), np.concatenate([a[0][:, 1] for a in arcs])
+        def at(x):
+            w = arc.locate(x, k)
+            return arc.value(x, w, ax_), arc.value(x, w, ay_)
+        px, py = at(s)
+        fx, fy = at(np.minimum(length, s + .25))
+        bx, by = at(np.maximum(0, s - .25))
+        dx, dy = fx - bx, fy - by
+        norm = np.maximum(1e-9, np.sqrt(dx * dx + dy * dy))
+        dx, dy = dx / norm, dy / norm
+        nx, ny = -dy * width / 2, dx * width / 2
+        plus = np.round(np.column_stack([px + nx, py + ny]), 3).tolist()
+        minus = np.round(np.column_stack([px - nx, py - ny]), 3).tolist()
+        prof = Polylines([np.asarray(seg['prof'][0], dtype=float) for seg in segments])
+        cz = (prof.value(s, prof.locate(s, k), np.concatenate([np.asarray(seg['prof'][1], dtype=float) for seg in segments]))
+              + ROAD_LIFT).tolist()
+        bridge = np.array([max(1, number(seg['tags'].get('layer'), 1)) * 6.5
+                           if seg['tags'].get('bridge') not in (None, 'no') else 0. for seg in segments])
+        level = np.maximum(np.maximum.reduceat(bridge[k], first), 0.).tolist()
+        cuts = np.zeros((len(segments) + 1, 2)); cuts[sid, end] = cut
+        cuts = cuts.tolist()
+        emit(f'mouths: {time.perf_counter()-started:.1f}s')
+        nodes, junctions = [], []
+        for n, nid, a, lev in zip(counts.tolist(), nids, first.tolist(), level):
+            entries = mouths[nid]
+            data = {'xy': entries[0][2], 'raise': lev, 'segments': [e[0] for e in entries], 'h': node_h[nid] + ROAD_LIFT}
+            nodes.append(data)
+            if n > 1:
+                junctions.append((nid, data, [c for i in range(a, a + n) for c in (plus[i], minus[i])],
+                                  [z for i in range(a, a + n) for z in (cz[i], cz[i])]))
+        del plus, minus, cz
+        bound_rows, kept = [], []
+        if junctions:
+            jc = [len(j[2]) for j in junctions]
+            hulls = shapely.convex_hull(shapely.multipoints(np.concatenate([j[2] for j in junctions]),
+                                                            indices=np.repeat(np.arange(len(junctions)), jc)))
+            areas, wkbs, bounds = shapely.area(hulls), shapely.to_wkb(hulls), shapely.bounds(hulls)
+            for (nid, data, corners, z), area, wkb, (x0, y0, x1, y1) in zip(junctions, areas, wkbs, bounds):
+                if area > .01:
+                    kept.append((-nid, dict(data, node=nid, corners=corners, cz=z), wkb))
+                    bound_rows.append((-nid, x0, x1, y0, y1))
+        del junctions
+        lines = shapely.linestrings(np.concatenate([a[0] for a in arcs]),
+                                    indices=np.repeat(np.arange(len(arcs)), [len(a[0]) for a in arcs]))
+        seg_wkb = shapely.to_wkb(lines)
+        for seg, (x0, y0, x1, y1) in zip(segments, shapely.bounds(lines)):
+            seg['cuts'] = cuts[seg['id']]
+            # Bounds include end mouths so a query always includes the owning segment.
+            pad = seg['width'] / 2 + 1
+            bound_rows.append((seg['id'], x0 - pad, x1 + pad, y0 - pad, y1 + pad))
+        del lines
+        emit(f'rows: {time.perf_counter()-started:.1f}s')
+        def dumps(objs, compact):
+            if pool is None:
+                out = _dumps(objs, compact)
+                return lambda: out
+            step = max(1, len(objs) // 48 + 1)
+            futures = [pool.submit(_dumps, objs[i:i + step], compact) for i in range(0, len(objs), step)]
+            return lambda: [t for f in futures for t in f.result()]
+        node_json = dumps(nodes, False)
+        junction_json = dumps([j[1] for j in kept], True)
+        segment_json = dumps(segments, True)
+        # the R-tree fills far faster in spatial order: 1 km cells along a Morton curve
+        b = np.array([r[1:] for r in bound_rows])
+        code = np.zeros(len(b), dtype=np.int64)
+        cx, cy = ((b[:, 0] + b[:, 1]) / 2000).astype(np.int64) & 0xffff, ((b[:, 2] + b[:, 3]) / 2000).astype(np.int64) & 0xffff
+        for bit in range(16):
+            code |= ((cx >> bit) & 1) << (2 * bit) | ((cy >> bit) & 1) << (2 * bit + 1)
+        bound_rows = [bound_rows[i] for i in np.argsort(code, kind='stable')]
+        link_rows = sorted(zip(np.repeat(nids, counts).tolist(), sid.tolist()), key=lambda r: r[0])
+        db = sqlite3.connect(path)
+        db.executescript('''PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-262144;
+            PRAGMA temp_store=MEMORY;
+            CREATE TABLE features(id INTEGER PRIMARY KEY, kind TEXT, data TEXT, geom BLOB);
+            CREATE VIRTUAL TABLE bounds USING rtree(id,x0,x1,y0,y1);
+            CREATE TABLE nodes(id INTEGER PRIMARY KEY, data TEXT);
+            CREATE TABLE links(node INTEGER, segment INTEGER);''')
+        db.executemany('INSERT INTO bounds VALUES(?,?,?,?,?)', bound_rows)
+        db.executemany('INSERT INTO links VALUES(?,?)', link_rows)
+        db.execute('CREATE INDEX links_node ON links(node)')
+        db.executemany('INSERT INTO nodes VALUES(?,?)', sorted(zip(nids, node_json())))
+        # junctions (negative ids) before roads: features in key order
+        db.executemany('INSERT INTO features VALUES(?,?,?,?)',
+                       [(fid, 'junction', text, wkb) for (fid, _, wkb), text in sorted(zip(kept, junction_json()), key=lambda r: r[0][0])])
+        db.executemany('INSERT INTO features VALUES(?,?,?,?)',
+                       ((seg['id'], 'road', text, wkb) for seg, text, wkb in zip(segments, segment_json(), seg_wkb)))
+        db.commit(); db.close()
+        emit(f'written: {time.perf_counter()-started:.1f}s')
+    finally:
+        if pool:
+            pool.shutdown(cancel_futures=True)
+
+
+class Cancelled(Exception):
+    """A newer landing replaced the one this index was being built for."""
+
+
+def prepare(*args, **kw):
+    """_prepare without the cyclic garbage collector: with millions of live lists and dicts
+    (London's window: 650 k roads) each collection walked them all again; the index was built
+    ~2x slower and a pickle of it loaded 10x slower. Reference counting still frees them.
+    The collector is process-wide, so the companion's other threads run without it for the
+    build too; they make no cycles worth collecting meanwhile."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return _prepare(*args, **kw)
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def _prepare(source, output, dem, emit=print, point=None, cancelled=None):
     """Parse source tiles once, split roads at shared nodes, publish a read-only index.
-    A large package is indexed as a window round point (the landing)."""
+    A large package is indexed as a window round point (the landing). cancelled() is asked
+    between the stages: a window of a big city takes minutes, and the single preparer must not
+    finish it for a landing the player has already left (the next landing waited behind it)."""
     import osmium
     started = time.perf_counter()
+    def check():
+        if cancelled and cancelled():
+            raise Cancelled(point)
     identity, index = source_identity(source, dem, point)
     target = Path(output) / identity
     final = target / 'sources.sqlite'
     if final.exists():
         return target, json.loads((target / 'region.json').read_text())
+    check()
     target.mkdir(parents=True, exist_ok=True)
     frame = Frame.of(index)
     roads = {}
@@ -270,6 +441,7 @@ def prepare(source, output, dem, emit=print, point=None):
             roads.setdefault(wid, road)
     del parts
     emit(f'roads parsed in {time.perf_counter()-started:.1f}s')
+    check()
     refs = Counter(n[0] for _, nodes in roads.values() for n in nodes)
     order = sorted(roads)
     lens = [len(roads[w][1]) for w in order]
@@ -313,68 +485,10 @@ def prepare(source, output, dem, emit=print, point=None):
         seg['prof'] = [np.round(ps, 2).tolist(), np.round(ph, 3).tolist()]
     del mosaic, profiles
     emit(f'profile ready: {time.perf_counter()-started:.1f}s')
+    check()
     tmp = target / f'sources.{os.getpid()}.tmp'
-    db = sqlite3.connect(tmp)
-    db.executescript('''CREATE TABLE features(id INTEGER PRIMARY KEY, kind TEXT, data TEXT, geom BLOB);
-        CREATE VIRTUAL TABLE bounds USING rtree(id,x0,x1,y0,y1);
-        CREATE TABLE nodes(id INTEGER PRIMARY KEY, data TEXT);
-        CREATE TABLE links(node INTEGER, segment INTEGER);
-        CREATE INDEX links_node ON links(node);''')
-    # rows collected and written with executemany; geometry made in shapely's vector calls
-    # (one call per mouth/segment cost ~60 s of the cold start)
-    def along(sid, at):
-        pts, cum = arcs[sid-1]
-        return np.array([np.interp(at, cum, pts[:,0]), np.interp(at, cum, pts[:,1])])
-    cutbacks, node_rows, link_rows, junctions = {}, [], [], []
-    for nid, entries in mouths.items():
-        # Complete shared node ownership; endpoints use square caps, junctions shared mouths.
-        radius = max(e[4] for e in entries)*.8 if len(entries)>1 else 0.
-        corners, cz = [], []
-        level = 0.
-        for sid, end, pos, direction, width, length in entries:
-            tags = segments[sid-1]['tags']
-            if tags.get('bridge') not in (None,'no'):
-                level = max(level, max(1,number(tags.get('layer'),1))*6.5)
-            cut = min(radius, length*.25)
-            cutbacks[sid,end] = cut
-            s = cut if end == 0 else length-cut
-            q = along(sid, [s, min(length,s+.25), max(0,s-.25)])
-            p, d = q[:,0], q[:,1]-q[:,2]
-            d /= max(1e-9,np.linalg.norm(d))
-            normal = np.array([-d[1],d[0]])*width/2
-            corners.extend([np.round(p+normal,3).tolist(),np.round(p-normal,3).tolist()])
-            # the corner sits on its own road's profile at the mouth: the strip meets it exactly
-            ps, ph = segments[sid-1]['prof']
-            cz.extend([float(np.interp(s, ps, ph)) + ROAD_LIFT]*2)
-            link_rows.append((nid,sid))
-        data = {'xy': entries[0][2], 'raise': level, 'segments': [e[0] for e in entries],
-                'h': node_h[nid] + ROAD_LIFT}
-        node_rows.append((nid,json.dumps(data)))
-        if len(entries)>1:
-            junctions.append((nid, data, corners, cz))
-    feature_rows, bound_rows = [], []
-    if junctions:
-        counts = [len(j[2]) for j in junctions]
-        hulls = shapely.convex_hull(shapely.multipoints(np.concatenate([j[2] for j in junctions]),
-                                                        indices=np.repeat(np.arange(len(junctions)), counts)))
-        areas, wkbs, bounds = shapely.area(hulls), shapely.to_wkb(hulls), shapely.bounds(hulls)
-        for (nid, data, corners, cz), area, wkb, (x0,y0,x1,y1) in zip(junctions, areas, wkbs, bounds):
-            if area > .01:
-                feature_rows.append((-nid,'junction',json.dumps(dict(data,node=nid,corners=corners,cz=cz),separators=(',',':')),wkb))
-                bound_rows.append((-nid,x0,x1,y0,y1))
-    lines = shapely.linestrings(np.concatenate([a[0] for a in arcs]),
-                                indices=np.repeat(np.arange(len(arcs)), [len(a[0]) for a in arcs]))
-    for seg, wkb, (x0,y0,x1,y1) in zip(segments, shapely.to_wkb(lines), shapely.bounds(lines)):
-        seg['cuts'] = [cutbacks[seg['id'],0],cutbacks[seg['id'],1]]
-        # Bounds include end mouths so a query always includes the owning segment.
-        pad = seg['width']/2+1
-        feature_rows.append((seg['id'],'road',json.dumps(seg,separators=(',',':')),wkb))
-        bound_rows.append((seg['id'],x0-pad,x1+pad,y0-pad,y1+pad))
-    db.executemany('INSERT INTO features VALUES(?,?,?,?)', feature_rows)
-    db.executemany('INSERT INTO bounds VALUES(?,?,?,?,?)', bound_rows)
-    db.executemany('INSERT INTO nodes VALUES(?,?)', node_rows)
-    db.executemany('INSERT INTO links VALUES(?,?)', link_rows)
-    db.commit(); db.close()
+    tmp.unlink(missing_ok=True)         # left by an earlier run of this process
+    write_index(segments, arcs, mouths, node_h, tmp, emit)
     meta = {'id':identity,'generator':VERSION,'bbox':index['package_box'],'center':index['centre'],'frame':index['frame'],
             'dem':str(Path(dem).resolve()), 'source':str(Path(source).resolve()),
             'coverage':[v['coverage'] for v in index['tiles'].values()],

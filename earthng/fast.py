@@ -204,6 +204,55 @@ def uv(kind, verts, normals):
 
 GRID = 25.0       # ground cells, m; global grid (tiles are multiples of it)
 SHOULDER = 3.0    # verge from the road edge down/up to the ground, m
+PULL_FULL = 12.   # m from a road's edge: the ground lies at the road's own profile
+PULL_ZERO = 70.   # m from a road's edge: the DEM alone
+
+
+def ground_corners(store, ij):
+    """Ground heights at global grid corners (integer i, j; metres = ij*GRID): the DEM pulled to
+    the profile of the roads round it, fully within PULL_FULL of a road's edge and fading out by
+    PULL_ZERO. The DEM (SRTM: roofs and canopy in it) stood metres above or below the smoothed
+    road in places. A profile is the whole graph's, so a corner gets the same height in every
+    tile (no seams). Bridges and tunnels do not pull. Cached per store."""
+    cache=store.__dict__.setdefault('ground_cache',OrderedDict())
+    ij=np.asarray(ij,dtype=float).reshape(-1,2)
+    keys=[(int(a),int(b)) for a,b in np.rint(ij)]
+    miss=list(dict.fromkeys(k for k in keys if k not in cache))
+    if miss:
+        pts=np.array(miss,dtype=float)*GRID
+        dem=store.terrain.sample(pts)
+        h=dem.copy()
+        x0,y0=pts.min(axis=0)-PULL_ZERO-1; x1,y1=pts.max(axis=0)+PULL_ZERO+1
+        roads=[(geom,data['width']/2,data['prof']) for _,_,data,geom in store.query((x0,y0,x1,y1),{'road'})
+               if fast_profile.kind(data['tags'])=='road']
+        if roads:
+            lines=np.array([r[0] for r in roads],dtype=object)
+            points=shapely.points(pts)
+            pi,li=shapely.STRtree(lines).query(points,predicate='dwithin',distance=PULL_ZERO+max(r[1] for r in roads))
+            if len(pi):
+                d=np.maximum(shapely.distance(lines[li],points[pi])-np.array([roads[k][1] for k in li]),0.)
+                s=shapely.line_locate_point(lines[li],points[pi])
+                z=np.array([np.interp(a,*roads[k][2]) for a,k in zip(s,li)])
+                t=np.clip((PULL_ZERO-d)/(PULL_ZERO-PULL_FULL),0.,1.)
+                w=t*t*(3-2*t)
+                # the road's height: the nearer roads count more; the pull: the strongest of them
+                a=w/np.maximum(d,1.)
+                sa=np.bincount(pi,a,len(pts)); sz=np.bincount(pi,a*z,len(pts))
+                pull=np.zeros(len(pts)); np.maximum.at(pull,pi,w)
+                road=np.divide(sz,sa,out=dem.copy(),where=sa>0)
+                h=dem+(road-dem)*pull
+        for k,v in zip(miss,h-.25):
+            cache[k]=float(v)
+        while len(cache)>400_000:
+            cache.popitem(last=False)
+    return np.array([cache[k] for k in keys])
+
+
+def prime_ground(store, rect, pad=SHOULDER+GRID+1):
+    """Every ground corner a tile may touch, in one pass: verges ask road by road."""
+    i0,j0=math.floor((rect[0]-pad)/GRID),math.floor((rect[1]-pad)/GRID)
+    i1,j1=math.ceil((rect[2]+pad)/GRID),math.ceil((rect[3]+pad)/GRID)
+    ground_corners(store,[(i,j) for j in range(j0,j1+1) for i in range(i0,i1+1)])
 
 
 def ground_z(store, xy):
@@ -211,8 +260,8 @@ def ground_z(store, xy):
     edge meets the ground exactly instead of leaving a step (fast-game-04 hung a wheel in one)."""
     xy=np.asarray(xy,dtype=float).reshape(-1,2)
     i=np.floor(xy[:,0]/GRID); j=np.floor(xy[:,1]/GRID)
-    corners=np.array([np.column_stack([i+di,j+dj])*GRID for di,dj in ((0,0),(1,0),(0,1),(1,1))]).reshape(-1,2)
-    h=(store.terrain.sample(corners)-.25).reshape(4,-1)
+    corners=np.array([np.column_stack([i+di,j+dj]) for di,dj in ((0,0),(1,0),(0,1),(1,1))]).reshape(-1,2)
+    h=ground_corners(store,corners).reshape(4,-1)
     u=xy[:,0]/GRID-i; v=xy[:,1]/GRID-j
     return (h[0]*(1-u)+h[1]*u)*(1-v)+(h[2]*(1-u)+h[3]*u)*v
 
@@ -460,6 +509,7 @@ def clip_verges(verges, asphalt):
 
 
 def build_road(store, rect, center=None):
+    prime_ground(store,rect)
     mesh=Mesh(rect); candidates=[]; verges=[]; asphalt=[]; walks=[]; paving=[]; ring_walks=[]; rings=[]; curbs=[]
     pad=SHOULDER+1   # a verge reaches into the tile from a road whose bounds do not
     for fid,kind,data,geom in store.query((rect[0]-pad,rect[1]-pad,rect[2]+pad,rect[3]+pad),{'road','junction'}):
@@ -533,6 +583,7 @@ def overlay(op, a, b):
 
 
 def build_scene(store,rect):
+    prime_ground(store,rect)
     mesh=Mesh(rect)
     cx,cy=store.frame.local(*CENTRE)
     centre=math.hypot((rect[0]+rect[2])/2-float(cx),(rect[1]+rect[3])/2-float(cy))<CENTRE_RADIUS
@@ -584,7 +635,7 @@ def build_scene(store,rect):
                 shapely.prepare(u); cover.append((k,u))
     # Fixed 25 m grid (20 intervals/tile); vector sample once, then interpolate planar cells.
     xs=np.arange(rect[0],rect[2]+1,GRID); ys=np.arange(rect[1],rect[3]+1,GRID)
-    points=np.array([(x,y) for y in ys for x in xs]); heights=store.terrain.sample(points).reshape(len(ys),len(xs))-.25
+    points=np.array([(x,y) for y in ys for x in xs]); heights=ground_corners(store,points/GRID).reshape(len(ys),len(xs))
     for j in range(len(ys)-1):
         for i in range(len(xs)-1):
             cell=box(xs[i],ys[j],xs[i+1],ys[j+1])
@@ -699,7 +750,7 @@ def add_building(store, mesh, rect, fid, tags, geom, centre):
     min_h=sources.number(tags.get('min_height'),0.)
     ring_xy=np.vstack([np.asarray(r.coords)[:,:2] for r in [g.exterior for g in shapely.get_parts(geom) if g.geom_type=='Polygon']] or [np.zeros((1,2))])
     ground=ground_z(store,ring_xy)
-    base=float(store.terrain.sample([[p.x,p.y]])[0])
+    base=float(ground_z(store,[[p.x,p.y]])[0])+.25     # on the ground pulled to the roads, not the raw DEM
     bottom=float(ground.min())-.3 if min_h<=0 else base+min_h
     top=base+height
     kind=style.wall(tags,height,fid,centre)
@@ -1088,6 +1139,83 @@ def add_fence(store, mesh, rect, tags, line):
     mesh.add_many(kind,tris)
 
 
+# AI navgraph for the game's traffic (map.reset with custom nodes, world.lua): km/h by default
+# and drivability (the share of AI routes and spawns) per road class
+# (no service roads: yards and parking aisles were a third of the graph; map.reset costs ~30 us a node)
+NAV_SPEED = {'motorway': 110, 'trunk': 90, 'primary': 60, 'secondary': 60, 'tertiary': 50, 'unclassified': 50,
+             'residential': 40, 'living_street': 20}
+NAV_DRIVE = {'motorway': 1., 'trunk': 1., 'primary': 1., 'secondary': 1., 'tertiary': .9, 'unclassified': .7,
+             'residential': .7, 'living_street': .4}
+NAV_STEP = 80.    # m: longest navgraph edge
+NAV_TOL = .6      # m: the line simplified this much (curves keep their nodes, straights lose them)
+
+
+def nav_speed(tags, default):
+    """maxspeed in km/h: '50', '35 mph', 'UA:urban', 'none'."""
+    v=str(tags.get('maxspeed','')).strip().lower()
+    if v=='none':
+        return 130.
+    if 'rural' in v:
+        return 90.
+    if 'urban' in v or 'living' in v:
+        return 20. if 'living' in v else 50.
+    head=v.split()[0] if v else ''
+    try:
+        n=float(head.replace(',','.'))
+    except ValueError:
+        return float(default)
+    return n*1.609 if 'mph' in v else n
+
+
+def nav_lanes(tags, width):
+    """BeamNG lanes string from the in node to the out node: '-' backward, '+' forward, left to
+    right (right-hand traffic); and whether the segment runs against its OSM direction."""
+    oneway=str(tags.get('oneway','')).lower()
+    if tags.get('junction') in ('roundabout','circular') and oneway not in ('no','-1'):
+        oneway='yes'
+    total=int(max(1,min(8,sources.number(tags.get('lanes'),0) or round(width/3.5) or 1)))
+    if oneway in ('yes','true','1','-1'):
+        return '+'*max(1,min(4,total)), oneway=='-1'
+    fwd=sources.number(tags.get('lanes:forward'),0); back=sources.number(tags.get('lanes:backward'),0)
+    if not (fwd and back):
+        back=max(1,total//2); fwd=max(1,total-back)
+    return '-'*int(min(4,back))+'+'*int(min(4,fwd)), False
+
+
+def nav_segments(store, rect):
+    """The tile's drivable segments for the game's AI: [id, node a, node b, lanes, m/s, radius,
+    drivability, x,y,z,x,y,z...] with heights on the road surface. Segments crossing tiles repeat;
+    the game keeps one per id."""
+    out=[]
+    for fid,kind,data,geom in store.query(rect,{'road'}):
+        tags=data['tags']; hw=tags.get('highway','').replace('_link','')
+        if hw not in NAV_SPEED or tags.get('access') in ('private','no') or tags.get('area')=='yes':
+            continue
+        xy=np.asarray(data['xy'],dtype=float)
+        if len(xy)<2:
+            continue
+        cum=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(xy,axis=0),axis=1))]
+        if cum[-1]<1.:
+            continue
+        simple=np.asarray(LineString(xy).simplify(NAV_TOL).coords)
+        at=np.array([LineString(xy).project(shapely.Point(q)) for q in simple])
+        s=[0.]
+        for b in at[1:]:
+            n=max(1,math.ceil((b-s[-1])/NAV_STEP))
+            s.extend(np.linspace(s[-1],b,n+1)[1:].tolist())
+        s=np.array(s); s[-1]=cum[-1]
+        z=np.interp(s,*data['prof'])+sources.ROAD_LIFT
+        pts=np.column_stack([np.interp(s,cum,xy[:,0]),np.interp(s,cum,xy[:,1]),z])
+        a,b=data['nodes']
+        lanes,flip=nav_lanes(tags,data['width'])
+        if flip:
+            a,b,pts=b,a,pts[::-1]
+        speed=nav_speed(tags,NAV_SPEED[hw])/3.6
+        out.append([fid,a,b,lanes,round(speed,2),round(data['width']/2,2),NAV_DRIVE[hw],
+                    *np.round(pts,2).ravel().tolist()])
+    return out
+
+
 def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
     started=time.perf_counter(); store=store_at(directory); rect=store.frame.rect(i,j)
     if not store.covered(rect):
@@ -1109,9 +1237,16 @@ def run(directory,i,j,work,dest_root,cache=None,center=None,layer='road'):
         items.append(dict(it,name=f'e2rf_{key}_{layer}_static_{n}',layer=layer,decor=True))
     mat=dest/'tiles'/f'{key}.{layer}.mats.json'; mat.parent.mkdir(parents=True,exist_ok=True)
     mat.write_text(json.dumps(MATERIALS),encoding='utf8'); warm(mat)
+    nav=None
+    if layer=='road':
+        nav=dest/'tiles'/f'{key}.nav.json'
+        tmp=nav.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps({'segments':nav_segments(store,rect)},separators=(',',':')),encoding='utf8')
+        os.replace(tmp,nav); warm(nav)
     manifest={'version':1,'generator':sources.GEOMETRY,'source':region,'layer':layer,'tile':[i,j],
               'rect':rect,'lift':sources.LIFT,'materials':f'/e2r_stream/{region}/tiles/{mat.name}',
               'mats':list(MATERIALS),'items':items,'spawn':spawn,
+              'nav':f'/e2r_stream/{region}/tiles/{nav.name}' if nav else None,
               'drivable':bool(mesh.faces.get('road') or mesh.faces.get('road_major')),
               'warmShapes':style.ALL_TREES+[style.LAMP,style.BUS_STOP,style.TRAFFIC_LIGHT],'packs':style.ART+'/packs.json',
               'triangles':sum(it['triangles'] for it in items)}

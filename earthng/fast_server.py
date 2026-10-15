@@ -14,6 +14,7 @@ import traceback
 
 import fast
 import fast_sources as sources
+import lang
 
 
 FAR_R = float(os.environ.get('EARTHNG_FAR_R', 3000))   # m round the car: the far city (fast_far)
@@ -135,14 +136,28 @@ def server_class(base):
                 generation=self.generation
                 self.stream=None; self.pose=None; self.desired={}; self.far_covered={}
                 self.landing={'seq':req['seq'],'lat':req['lat'],'lon':req['lon'],'at':time.monotonic()}
+                # builds of the old place that have not started yet free their workers for the
+                # new landing; running ones cannot be stopped in a process pool and finish
+                for task,(future,*_) in list(self.future_jobs.items()):
+                    if future.cancel():
+                        del self.future_jobs[task]
             self.set_job(id=f'fast-{generation}',seq=req['seq'],lat=req['lat'],lon=req['lon'],
-                         state='working',stage='Індекс джерел',progress=.02,message=None)
+                         state='working',stage=lang.text(self.lang,'Індекс джерел','Source index'),progress=.02,message=None)
             self.preparer.submit(self.prepare_landing,dict(req),generation)
 
         def prepare_landing(self,req,generation):
+            # the index of a big city's window takes minutes: its stages go to the game's
+            # progress bar, so a long start reads as work, not as a hang
+            stages={'roads parsed':(lang.text(self.lang,'Індекс: профіль доріг','Index: road profiles'),.08),
+                    'profile ready':(lang.text(self.lang,'Індекс: запис','Index: writing'),.14)}
+            def emit(msg):
+                print(msg,flush=True)
+                for prefix,(stage,progress) in stages.items():
+                    if msg.startswith(prefix) and generation==self.generation:
+                        self.set_job(stage=stage,progress=progress)
             try:
-                directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,
-                                              emit=lambda msg: print(msg,flush=True),point=(req['lon'],req['lat']))
+                directory,meta=sources.prepare(self.tiles_src,self.work/'fast-index',self.cache,emit=emit,
+                                              point=(req['lon'],req['lat']),cancelled=lambda: generation!=self.generation)
                 self.art.result()                   # facades and texture packs (started with the server)
                 import fast_art
                 fast_art.ensure(self.user)
@@ -153,6 +168,7 @@ def server_class(base):
                         return
                     self.frame=frame
                     self.landing['tile']=[i,j]
+                    self.landing['indexed']=time.monotonic()
                     dest=self.user/'e2r_stream'/meta['id']/'tiles'
                     ready={}; scenes={}; far={}
                     for p in dest.glob('*.json'):
@@ -173,7 +189,9 @@ def server_class(base):
                                  'built':0,'buildSeconds':0.,'bounds':meta['bbox'],'generator':sources.GEOMETRY}
                     self.out_of_region=set(); self.next_schedule=0
                 self.set_job(region=meta['id'],tileSize=sources.TILE,tile=[i,j],
-                             stage='Дороги і стартовий запас',progress=.2,generator=sources.GEOMETRY)
+                             stage=lang.text(self.lang,'Дороги і стартовий запас','Roads and the first stock'),progress=.2,generator=sources.GEOMETRY)
+            except sources.Cancelled:
+                print('index cancelled: a newer landing',flush=True)
             except Exception as e:
                 traceback.print_exc()
                 if generation==self.generation:
@@ -225,19 +243,23 @@ def server_class(base):
                     st['pose']=pose; self.next_schedule=now+.5
                 landing_key='_'.join(map(str,self.landing['tile']))
                 job=self.status['job'] or {}
+                # No time budget: a big city's first tiles may take minutes on a slow machine, and a
+                # timeout used to end the landing for good while its tile was a few seconds away
+                # (London, LA, New York). Only a real failure ends it.
                 if job.get('state')=='working':
                     elapsed=now-self.landing['at']
-                    if elapsed>120:
-                        self.set_job(state='error',message='startup_budget_exceeded: 120 seconds')
+                    if st['failed'].get(landing_key+':road',0)>=2:
+                        self.set_job(state='error',message=f'tile {landing_key} failed twice; see the companion log')
                     elif landing_key in st['ready']:
                         path=self.user/'e2r_stream'/st['region']/'tiles'/f'{landing_key}.json'
                         m=json.loads(path.read_text())
                         if not m.get('spawn'):
                             self.set_job(state='error',message='no_drivable_spawn: select a road')
                         else:
-                            self.set_job(state='ready',progress=1,stage='Завантаження доріг',
+                            self.set_job(state='ready',progress=1,stage=lang.text(self.lang,'Завантаження доріг','Loading roads'),
                                 manifest=f'/e2r_stream/{st["region"]}/tiles/{landing_key}.json',
-                                timings={'first_tile':elapsed},horizonZ=self.horizon_z(m['spawn']['pos']))
+                                timings={'first_tile':elapsed,'index':self.landing['indexed']-self.landing['at'],
+                                         'tile':now-self.landing['indexed']},horizonZ=self.horizon_z(m['spawn']['pos']))
                 # No unbounded executor backlog. Roads and scenes share one order: the car's arrival
                 # at the tile (desired deadline), a scene SCENE_LAG s behind its road. Scenes used to
                 # wait for an empty road queue and run one at a time (p50 1.2 s, p90 4 s in the
@@ -323,6 +345,16 @@ def server_class(base):
                 if frame:
                     lon,lat=frame.geographic(0.,0.)
                     status.update(origin=[round(float(lon),6),round(float(lat),6)],crs=frame.crs)
+                if frame:
+                    # the game's map puts the car by a local affine of the frame round it (x, y
+                    # -> lon, lat; 100 m differences), redone at every status: a smooth arrow
+                    # every frame without the UTM maths in Lua
+                    x0,y0=(float(pose['x']),float(pose['y'])) if pose else (0.,0.)
+                    g=frame.geographic(np.array([x0,x0+100.,x0]),np.array([y0,y0,y0+100.]))
+                    lon_,lat_=np.asarray(g[0],dtype=float),np.asarray(g[1],dtype=float)
+                    status['geo']=[round(x0,2),round(y0,2),round(float(lon_[0]),7),round(float(lat_[0]),7),
+                                   float(lon_[1]-lon_[0])/100,float(lon_[2]-lon_[0])/100,
+                                   float(lat_[1]-lat_[0])/100,float(lat_[2]-lat_[0])/100]
                 if pose and frame and b:
                     try:
                         lon,lat=frame.geographic(pose['x'],pose['y'])

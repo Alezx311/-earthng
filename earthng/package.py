@@ -2,9 +2,12 @@
 
     C:/js/Earth2Road/.venv/Scripts/python.exe earthng/package.py --out out/package
 
-<out>/EarthNG-<Area>/  (Ukraine for ukraine-* tiles, KyivOblast for kyiv-oblast-*)
-    start.bat, start.ps1        install the mod, start the companion and the game
-    ІНСТРУКЦІЯ.txt              install and run (Ukrainian)
+<out>/EarthNG-<Area>/  (Ukraine for ukraine-* tiles, UK, California, NewYork)
+    EarthNG.bat                 launcher window (earthng/launcher.py): settings, mod, companion, game
+    start.bat, start.ps1        the same from a console, default settings
+    ІНСТРУКЦІЯ.txt | README.txt install and run: Ukrainian for Ukraine, English for the rest (lang.py;
+                                the mod is built with the same --lang, earthng/package/en/ has the
+                                English start.ps1 and README.txt)
     python/                     Python 3.14 with numpy, shapely, pyproj, osmium, Pillow
     earthng/                    the companion (fast generator); needs nothing from Earth2Road
     mod/earth2road_world.zip    the BeamNG mod
@@ -27,13 +30,26 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import build_mod  # noqa: E402
 import fast_dem  # noqa: E402
+import lang  # noqa: E402
 
 PYTHON = Path(sys.base_prefix)                      # the venv's base install (C:/Python314)
 SITE = Path(sys.prefix) / 'Lib' / 'site-packages'   # the venv's packages
 PACKAGES = ['PIL', 'numpy', 'numpy.libs', 'osmium', 'osmium.libs', 'pyproj', 'pyproj.libs', 'shapely', 'shapely.libs', 'certifi']
 DIST = ['pillow', 'numpy', 'osmium', 'pyproj', 'shapely', 'certifi']
-SKIP_LIB = {'test', 'idlelib', 'tkinter', 'turtledemo', 'ensurepip', 'site-packages', '__pycache__', 'pydoc_data'}
-AREAS = {'ukraine': 'Ukraine', 'kyiv-oblast': 'KyivOblast', 'kyiv': 'Kyiv'}
+SKIP_LIB = {'test', 'idlelib', 'turtledemo', 'ensurepip', 'site-packages', '__pycache__', 'pydoc_data'}
+AREAS = {'ukraine': 'Ukraine', 'kyiv': 'Kyiv', 'california': 'California',
+         'united-kingdom': 'UK', 'new-york': 'NewYork', 'zanzibar': 'Zanzibar', 'romania': 'Romania',
+         # the UK cut into regions (the whole country's archive is ~25 GB)
+         'uk-london-south-east': 'UK-LondonSouthEast', 'uk-south-west': 'UK-SouthWest', 'uk-central-england': 'UK-CentralEngland',
+         'uk-north-england': 'UK-NorthEngland', 'uk-wales': 'UK-Wales', 'uk-northern-ireland': 'UK-NorthernIreland',
+         'uk-south-scotland': 'UK-SouthScotland', 'uk-scotland-east': 'UK-ScotlandEast', 'uk-scotland-west': 'UK-ScotlandWest'}
+# the packaged-Python check builds one tile here (lat, lon); other packages: their first tile's centre
+SMOKE = {'ukraine': (49.796, 30.115), 'kyiv': (50.4475, 30.5225),
+         'california': (34.0505, -118.2475), 'united-kingdom': (51.5080, -0.1281),
+         'new-york': (40.7580, -73.9855), 'zanzibar': (-6.1630, 39.1910), 'romania': (44.4355, 26.1025),
+         'uk-london-south-east': (51.5080, -0.1281), 'uk-south-west': (51.4545, -2.5879), 'uk-central-england': (52.4796, -1.9026),
+         'uk-north-england': (53.7965, -1.5478), 'uk-wales': (51.4816, -3.1791), 'uk-northern-ireland': (54.5973, -5.9301),
+         'uk-south-scotland': (55.8609, -4.2514), 'uk-scotland-east': (57.1497, -2.0943), 'uk-scotland-west': (56.6826, -5.1023)}
 
 
 def package_name(tiles):
@@ -47,7 +63,10 @@ def copy_python(dst):
     for f in PYTHON.iterdir():
         if f.is_file() and f.suffix.lower() in ('.exe', '.dll') or f.name == 'LICENSE.txt':
             shutil.copy2(f, dst / f.name)
-    shutil.copytree(PYTHON / 'DLLs', dst / 'DLLs', ignore=shutil.ignore_patterns('*tcl*', '*tk*', '_tkinter*'))
+    shutil.copytree(PYTHON / 'DLLs', dst / 'DLLs')
+    # Tcl/Tk for the launcher window (earthng/launcher.py), ~7 MB
+    for name in ('tcl8', 'tcl8.6', 'tk8.6'):
+        shutil.copytree(PYTHON / 'tcl' / name, dst / 'tcl' / name, ignore=shutil.ignore_patterns('demos', '*.lib'))
     (dst / 'Lib').mkdir()
     for f in (PYTHON / 'Lib').iterdir():
         if f.name in SKIP_LIB:
@@ -74,6 +93,7 @@ def main():
     a = p.parse_args()
     a.out, a.tiles, a.dem = a.out.resolve(), a.tiles.resolve(), a.dem.resolve()
     NAME = package_name(a.tiles)
+    LANG = lang.of(a.tiles)
     pkg = a.out / NAME
     if pkg.exists():
         shutil.rmtree(pkg)
@@ -83,7 +103,7 @@ def main():
     print('companion and mod ...', flush=True)
     shutil.copytree(HERE, pkg / 'earthng', ignore=shutil.ignore_patterns('__pycache__', 'test_*.py', 'package.py', 'package'))
     (pkg / 'mod').mkdir()
-    shutil.copy2(build_mod.build(a.out / 'mod-build'), pkg / 'mod' / build_mod.ZIP)
+    shutil.copy2(build_mod.build(a.out / 'mod-build' / NAME, LANG), pkg / 'mod' / build_mod.ZIP)
     print('data ...', flush=True)
     index = json.loads((a.tiles / 'index.json').read_text(encoding='utf8'))
     shutil.copytree(a.tiles, pkg / 'data' / 'osm_tiles' / a.tiles.name)
@@ -99,22 +119,31 @@ def main():
     # ready, so a tester's first landing does not spend ~40 s on it
     import fast_art
     shutil.copytree(fast_art.prebuild(), pkg / 'data' / 'art' / fast_art.VERSION)
-    for name in ('start.ps1', 'start.bat', 'ІНСТРУКЦІЯ.txt'):
+    for name in ('EarthNG.bat', 'start.bat'):
         shutil.copy2(HERE / 'package' / name, pkg / name)
+    texts = HERE / 'package' / 'en' if LANG == 'en' else HERE / 'package'
+    for name in ('start.ps1', 'README.txt' if LANG == 'en' else 'ІНСТРУКЦІЯ.txt'):
+        shutil.copy2(texts / name, pkg / name)
 
     print('check with the packaged Python ...', flush=True)
     env = dict(os.environ, EARTH2ROAD=str(pkg / 'none'), PYTHONNOUSERSITE='1')
     env.pop('PYTHONPATH', None)
     check = ("import sys, json; sys.path.insert(0, 'earthng');"
-             "import world_server, fast_server, fast, fast_art, fast_far;"
+             "import world_server, fast_server, fast, fast_art, fast_far, launcher; launcher.tk.Tcl();"
              "import paths; assert (paths.PROJECT / 'data' / 'art' / fast_art.VERSION / 'packs.json').exists(), 'art missing';"
              "import fast_sources as S;"
              "assert not any('Earth2Road' in (getattr(m,'__file__','') or '') for m in sys.modules.values()), 'Earth2Road imported';"
              "print('imports ok, python', sys.version.split()[0])")
     subprocess.run([str(pkg / 'python' / 'python.exe'), '-c', check], cwd=pkg, env=env, check=True)
     smoke = pkg / 'work-check'
+    stem = a.tiles.name.rsplit('-', 1)[0]
+    if stem in SMOKE:
+        lat, lon = SMOKE[stem]
+    else:
+        w, s_, e, n = next(iter(index['tiles'].values()))['coverage']
+        lat, lon = (s_ + n) / 2, (w + e) / 2
     subprocess.run([str(pkg / 'python' / 'python.exe'), 'earthng/fast.py', '--sources', f'data/osm_tiles/{a.tiles.name}',
-                    '--dem', 'data/dem', '--out', str(smoke), '--lat', '49.796', '--lon', '30.115'],
+                    '--dem', 'data/dem', '--out', str(smoke), '--lat', str(lat), '--lon', str(lon)],
                    cwd=pkg, env=env, check=True)
     shutil.rmtree(smoke)
     if a.no_zip:

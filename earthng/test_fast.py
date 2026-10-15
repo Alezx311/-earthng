@@ -96,6 +96,7 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return {1:40.12,2:55.12}[n]
+            def query(self,rect,kinds=None): return []   # no roads pull the ground
         data={'xy':[[0,0],[1000,0]],'cuts':[5,5],'width':7,'tags':{},'nodes':[1,2],
               'prof':[[0,333,1000],[40,47,55]]}
         tris,*_=fast.road_surface(Store(),data)
@@ -111,6 +112,7 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return 43.
+            def query(self,rect,kinds=None): return []   # no roads pull the ground
         data={'xy':[[10,10],[300,40]],'cuts':[0,0],'width':6,'tags':{},'nodes':[1,2],
               'prof':[[0,291.5],[43,44]]}
         tris,_,_,_,_,_,verge,*_=fast.road_surface(Store(),data)
@@ -133,6 +135,7 @@ class FastGeometryTests(unittest.TestCase):
         class Store:
             terrain=Terrain()
             def height(self,n): return 48.
+            def query(self,rect,kinds=None): return []   # no roads pull the ground
         data={'xy':[[0,0],[200,0]],'cuts':[0,0],'width':8,'tags':{'bridge':'yes'},'nodes':[1,2],
               'prof':[[0,200],[48,48]]}
         self.assertEqual(fast.road_surface(Store(),data)[6],[])
@@ -224,6 +227,19 @@ class FastGeometryTests(unittest.TestCase):
             b.add_many(kind,tris)
             key=lambda faces: sorted((tuple(np.round(v,6).ravel()),tuple(np.round(n,6))) for v,n in faces)
             self.assertEqual(key(a.faces[kind]),key(b.faces[kind]))
+
+    def test_polylines_match_np_interp_bit_for_bit(self):
+        # the index's mouths and junction heights are computed as arrays (write_index): they must
+        # equal the per-mouth np.interp they replaced, ends and exact vertices included
+        rng=np.random.default_rng(3)
+        xp=[np.cumsum(rng.uniform(.01,50,n)) - (5. if n%2 else 0.) for n in rng.integers(2,40,300)]
+        fp=[rng.normal(100,30,len(a)) for a in xp]
+        k=rng.integers(0,len(xp),5000)
+        x=np.array([rng.choice([a[0]-1,a[0],a[-1],a[-1]+1,rng.choice(a),rng.uniform(a[0],a[-1])]) for a in (xp[i] for i in k)])
+        lines=sources.Polylines(xp)
+        got=lines.value(x,lines.locate(x,k),np.concatenate(fp))
+        want=np.array([np.interp(v,xp[i],fp[i]) for v,i in zip(x,k)])
+        self.assertTrue(np.array_equal(got,want))
 
 
 

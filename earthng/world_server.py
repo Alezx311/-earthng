@@ -25,6 +25,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from PIL import Image, ImageDraw
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402  (puts Earth2Road on sys.path)
+import lang  # noqa: E402
 import osm_tiles  # noqa: E402
 import tiles  # noqa: E402
 
@@ -82,6 +84,7 @@ class Server:
         self.work = Path(args.work).resolve()
         (self.work / 'maptiles').mkdir(parents=True, exist_ok=True)
         self.tiles_src = args.tiles
+        self.lang = lang.of(args.tiles)   # the stage messages the game shows
         self.index = json.loads((Path(self.tiles_src) / 'index.json').read_text(encoding='utf8'))
         self.regions = Path(args.regions).resolve()
         self.cache = Path(args.cache).resolve()
@@ -94,10 +97,14 @@ class Server:
         # which the game reads four times a second
         self.coverage = self.region_boxes()
         self.status = {'server': 'up', 'started': time.time(), 'tilesSource': self.index['source'],
-                       'job': None, 'view': None, 'stream': None}
+                       'packageBox': self.index.get('package_box'), 'job': None, 'view': None, 'stream': None,
+                       # the tile package's area (uk-wales-261013 -> uk-wales): a regional UK package
+                       # offers only its own city buttons
+                       'area': Path(self.tiles_src).name.rsplit('-', 1)[0]}
         self.view_worker = ThreadPoolExecutor(1)
         self.view_future = None
         self.pending_view = None
+        self.map_giving = set()
         self.pool = ThreadPoolExecutor(6)       # map pictures
         self.builders = ProcessPoolExecutor(self.workers, initializer=warm,
                                            initargs=(getattr(args, 'generator', 'v2'),))
@@ -161,7 +168,8 @@ class Server:
         self.write_status()
 
     # --- map pictures ---------------------------------------------------------------------------
-    def map_tile(self, z, x, y):
+    def map_tile_file(self, z, x, y):
+        """The OSM tile in the work cache (downloaded once), or None off the map."""
         n = 2 ** z
         x %= n
         if not 0 <= y < n:
@@ -172,8 +180,48 @@ class Server:
             req = urllib.request.Request(TILE_URL.format(z=z, x=x, y=y), headers={'User-Agent': USER_AGENT})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
-            path.write_bytes(data)
-        return Image.open(path).convert('RGB')
+            tmp = path.with_suffix(f'.{threading.get_ident()}.part')
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
+        return path
+
+    def map_tile(self, z, x, y):
+        path = self.map_tile_file(z, x, y)
+        return Image.open(path).convert('RGB') if path else None
+
+    def give_map_tile(self, z, x, y):
+        """One tile into the game's folder (e2r_world/maptiles/z/x/y.png): the game draws the
+        map itself from 256 px tiles (a composed 720x440 picture per pan was slow and, shifted
+        while the next one came, wrapped round over itself)."""
+        dst = self.io / 'maptiles' / str(z) / str(x) / f'{y}.png'
+        if dst.exists():
+            return
+        try:
+            src = self.map_tile_file(z, x, y)
+        except Exception as e:
+            print(f'map tile {z}/{x}/{y}: {e}', flush=True)
+            return
+        if src:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_suffix(f'.{threading.get_ident()}.part')
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+
+    def give_map_tiles(self, req):
+        for z, x, y in req.get('tiles', [])[:96]:
+            key = (int(z), int(x), int(y))
+            if key not in self.map_giving:
+                self.map_giving.add(key)
+                self.pool.submit(self.give_map_tile, *key).add_done_callback(lambda _f, k=key: self.map_giving.discard(k))
+
+    def write_coverage(self):
+        """The green zone for the game's map (kept out of status.json, see coverage). The game's
+        first start in a new profile moves unknown files away, so it is rewritten when missing."""
+        path = self.io / 'coverage.json'
+        if not path.exists():
+            tmp = path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps({'boxes': self.coverage}), encoding='utf8')
+            os.replace(tmp, path)
 
     def queue_view(self, req):
         # Only retain the newest pan/zoom request while a map is downloading.
@@ -280,7 +328,7 @@ class Server:
             self.set_job(**job, **common, state='ready', stage='ready', progress=1.0,
                          manifest=f"/e2r_stream/{meta['id']}/tiles/{key}.json", cached=True)
         else:
-            self.set_job(**job, **common, state='working', stage='перший тайл (roadgen v2)', progress=0.05)
+            self.set_job(**job, **common, state='working', stage=lang.text(self.lang, 'перший тайл (roadgen v2)', 'first tile (roadgen v2)'), progress=0.05)
         self.schedule()
 
     def tile_wanted(self, i, j):
@@ -422,10 +470,13 @@ class Server:
                 except (json.JSONDecodeError, OSError):
                     continue   # still being written; next round
                 path.unlink(missing_ok=True)
-                print('request', req, flush=True)
+                if req.get('type') != 'maptiles':
+                    print('request', req, flush=True)
                 try:
                     if req.get('type') == 'view':
                         self.queue_view(req)
+                    elif req.get('type') == 'maptiles':
+                        self.give_map_tiles(req)
                     elif req.get('type') == 'land':
                         self.land(req)
                 except Exception as e:
@@ -441,6 +492,7 @@ class Server:
             if time.time() - last_beat > 0.5:
                 try:
                     self.write_status()
+                    self.write_coverage()
                 except OSError:
                     traceback.print_exc()
                 last_beat = time.time()

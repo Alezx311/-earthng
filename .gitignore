@@ -2,3 +2,4 @@ out/
 data/
 __pycache__/
 *.pyc
+launcher.json

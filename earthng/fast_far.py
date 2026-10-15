@@ -23,6 +23,7 @@ SIMPLIFY = 1.0           # m
 
 
 def build_far(store, rect):
+    fast.prime_ground(store, rect, pad=0.)
     mesh = fast.Mesh(rect)
     tile = box(*rect)
     cx, cy = store.frame.local(*fast.CENTRE)
@@ -51,7 +52,7 @@ def build_far(store, rect):
             # a building belongs to the far tile holding its point: no clipping, no doubles
             if not (rect[0] <= p.x < rect[2] and rect[1] <= p.y < rect[3]):
                 continue
-            base = float(store.terrain.sample([[p.x, p.y]])[0])
+            base = float(fast.ground_z(store, [[p.x, p.y]])[0]) + .25
             simple = geom.simplify(SIMPLIFY)
             if simple.is_empty:
                 continue
@@ -71,7 +72,7 @@ def build_far(store, rect):
     # coarse ground under it all, a little below the scene's own ground
     xs = np.arange(rect[0], rect[2] + 1, FAR_GRID); ys = np.arange(rect[1], rect[3] + 1, FAR_GRID)
     pts = np.array([(x, y) for y in ys for x in xs])
-    hz = store.terrain.sample(pts).reshape(len(ys), len(xs)) - .6
+    hz = fast.ground_corners(store, pts / fast.GRID).reshape(len(ys), len(xs)) - .35   # the scene's ground, pulled to the roads
     water = shapely.union_all(holes) if holes else None
     tris = []
     for j in range(len(ys) - 1):

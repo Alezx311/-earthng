@@ -4,7 +4,18 @@
 `out/package/EarthNG-Ukraine-<дата>.zip` (~4,5 ГБ: Python, компаньйон, мод, 34 946 тайлів OSM, DEM і готовий арт).
 Отримувачу досить розпакувати й запустити `start.bat`; інструкція всередині — `ІНСТРУКЦІЯ.txt`. Потрібні
 `data/osm_tiles/ukraine-260918` (`earthng/osm_tiles_country.py`) і DEM (`earthng/fast_dem.py --download`).
-`--tiles data/osm_tiles/kyiv-oblast-260918` дає старий пакет області (`EarthNG-KyivOblast`).
+`--tiles data/osm_tiles/california-261013` — пакет усього штату Каліфорнія (`EarthNG-California`; тайли з
+`california-261013.osm.pbf` Geofabrik через `osm_tiles_country.py`, DEM — `fast_dem.py --download`).
+`--tiles data/osm_tiles/united-kingdom-261013` — уся Велика Британія з Північною Ірландією (`EarthNG-UK`, ~25 ГБ;
+публічно — 9 регіональних паків `uk-<регіон>-261013`, `EarthNG-UK-<Регіон>`: жорсткі посилання на тайли країни),
+`--tiles data/osm_tiles/new-york-261013` — штат Нью-Йорк (`EarthNG-NewYork`),
+`--tiles data/osm_tiles/zanzibar-261013` — Занзібар, острови Унгуджа й Пемба (`EarthNG-Zanzibar`),
+`--tiles data/osm_tiles/romania-261014` — уся Румунія (`EarthNG-Romania`).
+Пакети Великої Британії, Каліфорнії та Нью-Йорка — повністю англійською (`earthng/lang.py`): вікно запуску, мод
+(`build_mod.py --lang en`), повідомлення компаньйона, `start.ps1` і `README.txt` з `earthng/package/en/`.
+
+У грі: **трафік** (кнопки в міні-вікні; граф для AI будується з тайлів, `fast.nav_segments` → `map.reset`), **погода й
+час доби** — штатне меню гри «Середовище» (рівень має `TimeOfDay`, `Precipitation`, `ForestWindEmitter`).
 
 Поточна незавершена робота над генератором для 300 км/год: **[передача Claude, заміри й наступні кроки](docs/HANDOFF_FAST_STREAMING.md)**. Типовий режим запуску — `fast` по всій Україні; `-Generator v2` — старий генератор у підготовленому регіоні Києва.
 
@@ -16,6 +27,14 @@ BeamNG-експортер). EarthNG — усе, що потрібно для с�
 джерел, заміри й експерименти.
 
 ## Запуск
+
+**`EarthNG.bat`** — вікно запуску (`earthng/launcher.py`, Tk): тека профілю BeamNG, шлях до Earth2Road, пакет
+тайлів OSM, генератор `fast`/`v2`, процеси генерації, далекий план (`EARTHNG_FAR_R`), радіус тайлів `v2`,
+запуск гри й перезбирання мода. Налаштування — у `launcher.json` (не в git), журнал компаньйона — у вікні,
+«Зупинити» або закриття вікна гасять компаньйон разом зі збирачами. У пакеті для тестувальників те саме вікно
+відкриває `EarthNG.bat` у корені пакета.
+
+Консольний запасний варіант:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\js\EarthNG\run_world.ps1
