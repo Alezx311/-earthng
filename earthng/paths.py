@@ -10,8 +10,8 @@ import sys
 
 PROJECT = Path(__file__).resolve().parents[1]
 EARTH2ROAD = Path(os.environ.get('EARTH2ROAD', 'C:/js/Earth2Road')).resolve()
-E2R_PYTHON = EARTH2ROAD / '.venv/Scripts/python.exe'
-E2R_CLI = EARTH2ROAD / '.venv/Scripts/earth2road.exe'
+E2R_PYTHON = EARTH2ROAD / ('.venv/Scripts/python.exe' if os.name == 'nt' else '.venv/bin/python')
+E2R_CLI = EARTH2ROAD / ('.venv/Scripts/earth2road.exe' if os.name == 'nt' else '.venv/bin/earth2road')
 TILES = PROJECT / 'data/osm_tiles/kyiv-260918'
 OUT = PROJECT / 'out'
 

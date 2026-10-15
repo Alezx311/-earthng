@@ -44,6 +44,13 @@ powershell -ExecutionPolicy Bypass -File C:\js\EarthNG\run_world.ps1
 Freeroam → «Earth2Road - Планета». Вікно скрипта тримати відкритим. Параметри: `-NoGame`
 (гра вже відкрита), `-Workers N` (процеси-збирачі тайлів, типово 8), `-Earth2Road <шлях>`.
 
+**Linux (експериментально):** `bash run_world.sh` — те саме для BeamNG нативно або під Proton (профіль
+шукається в обох, `--userfolder` / `BEAMNG_USERFOLDER` — вручну). Python — `.venv` Earth2Road, якщо є
+(`--earth2road`, `EARTH2ROAD`, типово `~/Earth2Road`), інакше `.venv-linux/` з `requirements-fast.txt`: генератору
+`fast` Earth2Road не потрібен, `v2` — лише з ним. Тайли й DEM у `data/` (не в git) — як для Windows.
+Параметри: `--tiles`, `--workers`, `--generator fast|v2`, `--nogame`, `--help`. У пакеті для тестувальників —
+`start.sh`. Вікно запуску (`launcher.py`) поки лише Windows.
+
 Висадка працює всередині підготовленого регіону (зелена зона на мапі). Регіон Київ
 (Оболонь…Голосіїв) готується раз, ~20 хв:
 

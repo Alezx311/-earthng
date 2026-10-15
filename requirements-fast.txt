@@ -1,0 +1,6 @@
+# Python packages for the fast generator (no Earth2Road needed): run_world.sh installs them on Linux
+numpy
+shapely
+pyproj
+osmium
+Pillow

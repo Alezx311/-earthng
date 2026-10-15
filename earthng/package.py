@@ -119,7 +119,7 @@ def main():
     # ready, so a tester's first landing does not spend ~40 s on it
     import fast_art
     shutil.copytree(fast_art.prebuild(), pkg / 'data' / 'art' / fast_art.VERSION)
-    for name in ('EarthNG.bat', 'start.bat'):
+    for name in ('EarthNG.bat', 'start.bat', 'start.sh'):
         shutil.copy2(HERE / 'package' / name, pkg / name)
     texts = HERE / 'package' / 'en' if LANG == 'en' else HERE / 'package'
     for name in ('start.ps1', 'README.txt' if LANG == 'en' else 'ІНСТРУКЦІЯ.txt'):

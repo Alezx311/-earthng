@@ -69,6 +69,8 @@ def warm(generator='v2'):
     if os.name == 'nt':
         import ctypes
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+    else:
+        os.nice(5)
     if generator == 'v2':
         import direct
         direct.warm()
@@ -502,7 +504,7 @@ class Server:
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--tiles', default=str(paths.TILES), help='OSM source tiles (osm_tiles.py), a directory')
-    p.add_argument('--userfolder', default=str(Path(os.environ['LOCALAPPDATA']) / 'BeamNG/BeamNG.drive/current'))
+    p.add_argument('--userfolder', default=str(Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'BeamNG/BeamNG.drive/current'))
     p.add_argument('--work', default=str(paths.OUT / 'world'))
     p.add_argument('--cache', default=str(paths.OUT / 'world' / 'cache'), help='generator source cache (DEM tiles)')
     p.add_argument('--regions', default=str(paths.OUT / 'region'), help='prepared regions (earthng/region.py)')

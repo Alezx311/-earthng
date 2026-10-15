@@ -22,6 +22,16 @@ Installation
    for example C:\EarthNG.
 2. Nothing else to install: Python and all the data are already inside.
 
+Linux (experimental)
+--------------------
+The bundled Python is Windows-only, so Linux needs the system python3 (3.10+) with venv
+(Debian/Ubuntu: sudo apt install python3 python3-venv). In the package folder:
+    bash start.sh
+The first run installs the Python packages into venv-linux/ (needs internet). The BeamNG
+profile is looked up for both the native build and Proton; if it is not found:
+    bash start.sh --userfolder "/path/to/BeamNG.drive/current"
+Other options: --workers N, --nogame. The launcher window (EarthNG.bat) is Windows-only for now.
+
 Starting
 --------
 1. Double-click EarthNG.bat. A launcher window opens with the settings: the BeamNG user

@@ -37,9 +37,12 @@ def game_dir():
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as k:
             steam.append(Path(winreg.QueryValueEx(k, 'SteamPath')[0]))
-    except OSError:
+    except (OSError, ImportError):   # ImportError: no winreg off Windows
         pass
     steam.append(Path(r'C:/Program Files (x86)/Steam'))
+    home = Path.home()   # Linux (the game under Proton): native and Flatpak Steam
+    steam += [home / '.steam/steam', home / '.local/share/Steam',
+              home / '.var/app/com.valvesoftware.Steam/.local/share/Steam']
     for root in steam:
         vdf = root / 'steamapps' / 'libraryfolders.vdf'
         libs = [root]
