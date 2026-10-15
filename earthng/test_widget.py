@@ -28,7 +28,7 @@ class WidgetTests(unittest.TestCase):
           ui_imgui = setmetatable({ArrayChar=function() return {} end}, {__index=function() return function() end end})
           require=function() return {} end
           hptimer=function() return {stopAndReset=function() return 1 end} end''')
-        src = (Path(__file__).resolve().parents[1] / 'mod/lua/ge/extensions/e2r/world.lua').read_text(encoding='utf8')
+        src = (Path(__file__).resolve().parents[1] / 'mod/lua/ge/extensions/e2r/world.lua').read_text(encoding='utf8').replace('local NATIVE = true', 'local NATIVE = false')
         lua.globals().mod = lua.execute(src)
         shown = lua.eval('''function(status)
           local function up(fn, name)
@@ -92,7 +92,7 @@ class WidgetTests(unittest.TestCase):
             error('missing upvalue '..name)
           end
         ''')
-        src = (Path(__file__).resolve().parents[1] / 'mod/lua/ge/extensions/e2r/world.lua').read_text(encoding='utf8')
+        src = (Path(__file__).resolve().parents[1] / 'mod/lua/ge/extensions/e2r/world.lua').read_text(encoding='utf8').replace('local NATIVE = true', 'local NATIVE = false')
         mod = lua.execute(src.replace("local LANG = 'uk'", f"local LANG = '{lang}'"))
         lua.globals().mod = mod
         for key, label in labels.items():

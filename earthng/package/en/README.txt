@@ -37,7 +37,7 @@ Starting
 1. Double-click EarthNG.bat. A launcher window opens with the settings: the BeamNG user
    folder, the OSM data, the number of generation processes, the far view radius and whether
    to start the game. Settings are remembered (launcher.json). The "Start" button:
-   - copies the mod to <user folder>\mods\earth2road_world.zip;
+   - copies the mod to <user folder>\mods\earthng_planet.zip;
    - starts BeamNG.drive via Steam (if ticked);
    - starts the companion; its log is shown at the bottom of the window. Do NOT close the
      window while you play.

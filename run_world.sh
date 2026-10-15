@@ -101,7 +101,7 @@ if [ "$workers" -gt "$n" ]; then workers=$n; fi
 if [ "$workers" -lt 1 ]; then workers=1; fi
 
 cd "$root"
-"$py" earthng/build_mod.py --out out/mod --install "$userfolder"
+"$py" earthng/build_mod.py --legacy --out out/mod --install "$userfolder"
 if [ "$nogame" -eq 0 ]; then
 	echo 'Starting BeamNG.drive via Steam...'
 	if command -v steam >/dev/null; then

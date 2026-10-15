@@ -5,7 +5,7 @@
 
 Replaces run_world.ps1 / package start.ps1 for everyday use (they stay as console fallbacks).
 Works in both layouts: the repository (Python and the generator from Earth2Road's .venv, the mod
-is rebuilt from mod/) and the tester package (its own python/, the ready mod/earth2road_world.zip).
+is rebuilt from mod/) and the tester package (its own python/, the ready mod/earthng_planet.zip).
 Settings are kept in launcher.json next to earthng/. The companion's output goes to the log pane;
 closing the window stops the companion and its tile builders. The window speaks the language of the
 tile package (lang.py): Ukrainian for Ukraine, English for the UK and California.
@@ -28,7 +28,7 @@ ROOT = HERE.parent
 PACKAGED = (ROOT / 'python' / 'python.exe').exists()
 SETTINGS = ROOT / 'launcher.json'
 STEAM_GAME = 'steam://rungameid/284160'
-MOD_ZIP = 'earth2road_world.zip'
+MOD_ZIP = 'earthng_planet.zip'
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
@@ -269,7 +269,7 @@ class Launcher:
                 self.lines.put(T('Мод встановлено: ', 'Mod installed: ') + f'{user / "mods" / MOD_ZIP}\n')
             else:
                 code = self.execute([py, HERE / 'build_mod.py', '--out', ROOT / 'out' / 'mod', '--install', user,
-                                     '--lang', lang.of(s['tiles'])], env)
+                                     '--lang', lang.of(s['tiles']), '--legacy'], env)
                 if code:
                     raise RuntimeError(T(f'build_mod.py завершився з кодом {code}', f'build_mod.py exited with code {code}'))
             if s['launch_game']:

@@ -45,6 +45,9 @@ def main():
     p.add_argument('--min-distance', type=float, default=20, help='physics test fails below this, m')
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--generator', choices=('v2','fast'), default='v2')
+    p.add_argument('--native', action='store_true', help='only BeamNG + country ZIPs; never start the companion')
+    p.add_argument('--picker-only', action='store_true', help='verify native picker without landing')
+    p.add_argument('--expected-countries', type=int, default=0, help='country count for --picker-only')
     p.add_argument('--replay', action='store_true', help='camera/pose replay at constant speed; not a physics test')
     p.add_argument('--index-cache', type=Path, help='reuse a source index; report is NOT a cold-start test')
     p.add_argument('--traffic', type=int, help="after landing: the game's AI traffic, this many cars")
@@ -63,6 +66,8 @@ def main():
         if a.replay and a.lat is None:
             lon, lat = route_frame.geographic(*route['points'][0][:2])     # land where it starts
             a.lat, a.lon = float(lat), float(lon)
+    if a.picker_only:
+        a.lat, a.lon = a.lat or 0, a.lon or 0
     if a.lat is None or a.lon is None:
         p.error('--lat and --lon are required')
     out = a.out.resolve()
@@ -80,7 +85,7 @@ def main():
     user = out / 'user'
     profile = user / 'current'
     (profile / 'mods').mkdir(parents=True)
-    shutil.copy2(build_mod.build(out / 'mod'), profile / 'mods' / build_mod.ZIP)
+    shutil.copy2(build_mod.build(out / 'mod', legacy=not a.native), profile / 'mods' / build_mod.ZIP)
     for extra in a.mod:
         shutil.copy2(extra, profile / 'mods' / extra.name)
     (profile / 'settings').mkdir()
@@ -90,6 +95,8 @@ def main():
         # the first-run "Input Changes" page pauses the simulation (fast-game-02 never moved under it)
         'showedInputLayoutPopupV37': True}), encoding='utf8')
     test = {'lat': a.lat, 'lon': a.lon, 'driveSeconds': a.drive_seconds, 'skipMap': True, 'minDistance': a.min_distance}
+    if a.picker_only:
+        test.update(pickerOnly=True, expectedCountries=a.expected_countries)
     if a.route:
         shutil.copy2(a.route, profile / 'e2r-route.json')
         test.update(route='/e2r-route.json', speed=a.speed)
@@ -121,7 +128,11 @@ def main():
     if a.stream_cache:
         shutil.copytree(a.stream_cache, profile / 'e2r_stream')
     (profile / 'e2r-world-test.json').write_text(json.dumps(test), encoding='utf8')
-    server = subprocess.Popen([sys.executable, str(HERE / 'world_server.py'), '--tiles', a.tiles,
+    if a.native:
+        test['skipMap'] = True  # native picker has an offline vector map instead of downloaded textures
+        test_file = profile / 'e2r-world-test.json'
+        test_file.write_text(json.dumps(test), encoding='utf8')
+    server = None if a.native else subprocess.Popen([sys.executable, str(HERE / 'world_server.py'), '--tiles', a.tiles,
                                '--userfolder', str(profile), '--work', str(out / 'work'),
                                '--workers', str(a.workers), '--generator', a.generator],
                               cwd=paths.PROJECT, stdout=open(out / 'server.log', 'w'), stderr=subprocess.STDOUT)
@@ -145,7 +156,8 @@ def main():
             game.kill()
     finally:
         # the companion's tile builders are child processes: end the whole tree
-        subprocess.run(['taskkill', '/T', '/F', '/PID', str(server.pid)], capture_output=True)
+        if server:
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(server.pid)], capture_output=True)
     res_path = profile / 'e2r-world-result.json'
     result = json.loads(res_path.read_text(encoding='utf8')) if res_path.exists() else {'status': 'no_result'}
     for png in sorted((profile / 'screenshots').rglob('e2r-*.png')):
@@ -153,9 +165,13 @@ def main():
     if (profile / 'beamng.log').exists():
         shutil.copy2(profile / 'beamng.log', out / 'beamng.log')
     report = {'status': result.get('status'), 'exit_code': game.returncode,
-              'cold_index': a.index_cache is None, 'physics_test': not a.replay,
+              'native': a.native, 'cold_index': a.index_cache is None, 'physics_test': not a.replay and not a.picker_only,
               'total_s': round(time.perf_counter() - started, 1), 'peak_private_mb': round(peak / 2**20),
               'game': result, 'log': log_metrics(out / 'beamng.log')}
+    if 'failures' in result:
+        functional = [f for f in result['failures'] if f != 'frame_over_100ms']
+        report['functional_status'] = 'failed' if functional else 'passed'
+        report['performance_status'] = 'failed' if 'frame_over_100ms' in result['failures'] else 'passed'
     (out / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf8')
     print(json.dumps({k: v for k, v in report.items() if k != 'game'}, indent=2))
     print('status', report['status'], 'failures', result.get('failures'), 'travelled_m', result.get('travelledM'),

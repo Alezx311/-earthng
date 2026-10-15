@@ -141,10 +141,10 @@ def draw_windows(im, kind, pack):
         d.rectangle([0, 0, 2, PX], fill=line)
 
 
-def facade(name, pack):
+def facade(name, pack, game_assets=True):
     colour, kind = FACADES[name]
     if pack == 'real':
-        tex = game_texture(style.TEXTURES[name]['baseColorMap'])
+        tex = game_texture(style.TEXTURES[name]['baseColorMap']) if game_assets else None
         if tex is None:
             im = Image.new('RGB', (PX, PX), colour)
         else:
@@ -343,16 +343,16 @@ def ensure(user):
     return r
 
 
-def prebuild():
+def prebuild(distributable=False):
     """The shared art build (data/art/<VERSION>), written when missing; returns its path."""
     import paths
-    shared = paths.PROJECT / 'data' / 'art' / VERSION
+    shared = paths.PROJECT / 'data' / ('art-distributable' if distributable else 'art') / VERSION
     if not (shared / 'packs.json').exists():
-        build(shared)
+        build(shared, game_assets=not distributable)
     return shared
 
 
-def build(r):
+def build(r, game_assets=True):
     """Write the facade textures, ground sheets and packs.json into r."""
     base = '/e2r_stream/fast-art/' + VERSION
     done = r / 'packs.json'
@@ -360,7 +360,7 @@ def build(r):
         (r / pack).mkdir(parents=True, exist_ok=True)
         for name in FACADES:
             path = r / pack / f'{name}.color.png'
-            facade(name, pack).save(path)
+            facade(name, pack, game_assets=game_assets).save(path)
             if pack == 'synth':
                 synth_glow(name).save(r / pack / f'{name}.glow.png')
         for name in photo.PHOTO_WALLS:
@@ -397,7 +397,17 @@ def build(r):
     fence.paste(slab.resize((1024, 820), Image.LANCZOS), (0, 1024 - 820))
     fence.transpose(Image.FLIP_TOP_BOTTOM).save(r / 'real' / 'fence_po2.color.png')
     # chain link: the game's opacity map again, with mips that keep the wire (fast_dds.keep_coverage)
-    game_texture(style.CHAINLINK_OPACITY).save(r / 'real' / 'chainlink_o.data.png')
+    if game_assets:
+        chainlink = game_texture(style.CHAINLINK_OPACITY)
+    else:
+        # Distributable art contains only our drawing and CC0 photo sources. Game
+        # shapes/materials remain references into the player's own installation.
+        chainlink = Image.new('RGB', (PX, PX), (0, 0, 0))
+        wire = ImageDraw.Draw(chainlink)
+        for k in range(-PX, 2 * PX, 64):
+            wire.line((k, 0, k + PX, PX), fill=(255, 255, 255), width=5)
+            wire.line((k, 0, k - PX, PX), fill=(255, 255, 255), width=5)
+    chainlink.save(r / 'real' / 'chainlink_o.data.png')
     for kind in ('ground', 'forest', 'paved'):
         synth_grid(SYNTH[kind]).save(r / 'synth' / f'grid_{kind}.color.png')
     synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')

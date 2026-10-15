@@ -10,7 +10,7 @@
                                 English start.ps1 and README.txt)
     python/                     Python 3.14 with numpy, shapely, pyproj, osmium, Pillow
     earthng/                    the companion (fast generator); needs nothing from Earth2Road
-    mod/earth2road_world.zip    the BeamNG mod
+    mod/earthng_planet.zip    the BeamNG mod
     data/osm_tiles/<package>/   OSM source tiles;  data/dem/terrain/12/  Terrarium DEM
 and <out>/EarthNG-<Area>-<date>.zip of that folder. The package is checked with its own
 Python (imports, one tile built from its own data) before it is zipped.
@@ -103,7 +103,7 @@ def main():
     print('companion and mod ...', flush=True)
     shutil.copytree(HERE, pkg / 'earthng', ignore=shutil.ignore_patterns('__pycache__', 'test_*.py', 'package.py', 'package'))
     (pkg / 'mod').mkdir()
-    shutil.copy2(build_mod.build(a.out / 'mod-build' / NAME, LANG), pkg / 'mod' / build_mod.ZIP)
+    shutil.copy2(build_mod.build(a.out / 'mod-build' / NAME, LANG, legacy=True), pkg / 'mod' / build_mod.ZIP)
     print('data ...', flush=True)
     index = json.loads((a.tiles / 'index.json').read_text(encoding='utf8'))
     shutil.copytree(a.tiles, pkg / 'data' / 'osm_tiles' / a.tiles.name)

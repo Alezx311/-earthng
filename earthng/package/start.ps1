@@ -18,8 +18,8 @@ if ($Workers -le 0) { $Workers = [Math]::Max(2, [Math]::Min(8, [int]([Environmen
 
 Write-Host "Тека BeamNG: $UserFolder"
 New-Item -ItemType Directory -Force (Join-Path $UserFolder 'mods') | Out-Null
-Copy-Item (Join-Path $root 'mod\earth2road_world.zip') (Join-Path $UserFolder 'mods\earth2road_world.zip') -Force
-Write-Host 'Мод встановлено: mods\earth2road_world.zip'
+Copy-Item (Join-Path $root 'mod\earthng_planet.zip') (Join-Path $UserFolder 'mods\earthng_planet.zip') -Force
+Write-Host 'Мод встановлено: mods\earthng_planet.zip'
 
 # the OSM tiles shipped in data\osm_tiles (one package: Ukraine or Kyiv oblast)
 $tiles = (Get-ChildItem (Join-Path $root 'data\osm_tiles') -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'index.json') } | Select-Object -First 1).FullName

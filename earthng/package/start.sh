@@ -61,8 +61,8 @@ fi
 echo "BeamNG user folder: $userfolder"
 
 mkdir -p "$userfolder/mods"
-cp -f "$root/mod/earth2road_world.zip" "$userfolder/mods/earth2road_world.zip"
-echo 'Mod installed: mods/earth2road_world.zip'
+cp -f "$root/mod/earthng_planet.zip" "$userfolder/mods/earthng_planet.zip"
+echo 'Mod installed: mods/earthng_planet.zip'
 
 tiles=""
 for d in "$root"/data/osm_tiles/*/; do
