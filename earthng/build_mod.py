@@ -46,8 +46,11 @@ SKY = [
      'hitVehicles': True, 'useTurbulence': True},
     {'class': 'ForestWindEmitter', 'name': 'e2r_wind', 'position': [0, 0, 0], 'strength': 0.4},
     {'class': 'LevelInfo', 'name': 'theLevelInfo', 'canvasClearColor': [0.58, 0.66, 0.76, 255], 'fogAtmosphereHeight': 700,
-     'fogColor': [0.66, 0.71, 0.77, 1], 'fogDensity': 0.00019, 'globalEnviromentMap': 'BNG_Sky_02_cubemap', 'gravity': -9.81,
-     'visibleDistance': 7000},
+     # The scheduled horizon is 5 km (native.lua HORIZON_RADIUS). visibleDistance clears the
+     # outer edge of that ring; the fog keeps a ridge at 5 km present and hazy. 15 km and
+     # 30 km are not covered, so these values do not pretend that they are.
+     'fogColor': [0.66, 0.71, 0.77, 1], 'fogDensity': 0.00015, 'globalEnviromentMap': 'BNG_Sky_02_cubemap', 'gravity': -9.81,
+     'visibleDistance': 8000},
 ]
 
 

@@ -11,6 +11,10 @@ local cellformat = require('ge/extensions/e2r/cellformat')
 -- At 32 the far ring evicted itself and was rebuilt after every 250 m.
 local CELL_LIMIT, TILE_LIMIT, TRIANGLE_LIMIT, VERTEX_LIMIT, LAND_RADIUS = 32, 160, 80000, 240000, 500
 local BLOCK_LIMIT = 6
+-- Prepared horizon meshes, separate from the near/far triangle budget above. The 5 km ring
+-- is the one that is scheduled; 15 km and 30 km stay off until an in-game check.
+local HORIZON_RADIUS, HORIZON_TILE_LIMIT, HORIZON_TRIANGLE_LIMIT = 5000, 96, 250000
+local HORIZON_STEP, HORIZON_BLOCK = 100, 1000
 local FORMATS = {['earthng-features-v1'] = 1, ['earthng-features-v2'] = 2}
 local state, regions, active
 
@@ -385,6 +389,18 @@ local function tileCovered(r, i, j)
   return covered(r, i * t, j * t, (i + 1) * t, (j + 1) * t)
 end
 
+-- A horizon tile may end past the package. Any overlapping source cell is enough: the mesh
+-- omits samples the DEM does not cover and skirts that edge.
+local function touchesCell(r, x0, y0, x1, y1)
+  local s = r.data.cellSize
+  for i = math.floor(x0 / s), math.ceil(x1 / s) - 1 do
+    for j = math.floor(y0 / s), math.ceil(y1 / s) - 1 do
+      if hasCell(r, i, j) then return true end
+    end
+  end
+  return false
+end
+
 local function needSquare(r, x, y)
   local out, t = {}, r.data.tileSize
   for i = math.floor((x - LAND_RADIUS) / t), math.ceil((x + LAND_RADIUS) / t) - 1 do
@@ -436,7 +452,10 @@ local function completeLanding()
   local job, p = state.job, entry.road.spawn.pos
   job.state, job.stage, job.progress, job.manifest = 'ready', 'ready', 1, entry.road
   job.tile = entry.road.tile
-  job.horizonZ = finite(active.region.data.horizonZ) and active.region.data.horizonZ or p[3] - 40
+  -- The DEM horizon replaces the spawn-minus-40 plane. A companion job that still
+  -- passes a numeric horizonZ keeps that plane (world.lua skips it only when this is nil).
+  job.horizonDem = true
+  job.horizonZ = nil
   job.timings = {native = true}
   active.pose = {x = p[1], y = p[2], vx = 0, vy = 0}
   active.prioritiesDirty = true
@@ -448,7 +467,7 @@ local function land(req)
   state.job = {seq = req.seq, lat = req.lat, lon = req.lon, state = 'working', stage = 'source', progress = 0}
   local country, descriptor, x, y, r = at(req.lat, req.lon)
   if not r then fail('no_data: this point has no complete mounted source neighbourhood'); return state.job end
-  active = {region = r, cells = {}, blocks = {}, tiles = {}, failed = {}, clock = 0, everBuilt = {}, desired = {}, evicted = {}, epoch = 1,
+  active = {region = r, cells = {}, blocks = {}, tiles = {}, horizon = {}, failed = {}, clock = 0, everBuilt = {}, desired = {}, evicted = {}, epoch = 1,
     epochPoint = {x, y}, prioritiesDirty = true, startupPinned = true,
     manifests = setmetatable({}, {__mode = 'v'}),
     landing = {x = x, y = y, required = needSquare(r, x, y)}, pose = {x = x, y = y, vx = 0, vy = 0}}
@@ -461,8 +480,10 @@ local function land(req)
     if calls % 8 == 0 and a.timer and a.timer:stop() >= a.budget then coroutine.yield() end
   end
   state.stream = {region = descriptor.id, country = country.id, tile = r.data.tileSize, generator = 'earthng-lua-v1',
-    geo = affineAt(r, x, y), bounds = r.data.bounds, ready = {}, scenes = {}, far = {}, wanted = {}, readyCount = 0,
-    building = 0, queued = 0, failed = active.failed, built = 0, rebuilds = 0, meanBuildSeconds = 0, loadRadius = 1000, farRadius = 3000, farFast = 25}
+    geo = affineAt(r, x, y), bounds = r.data.bounds, ready = {}, scenes = {}, far = {}, horizon = {}, wanted = {}, readyCount = 0,
+    building = 0, queued = 0, failed = active.failed, built = 0, rebuilds = 0, horizonBuilt = 0, horizonRebuilds = 0,
+    meanBuildSeconds = 0, loadRadius = 1000, farRadius = 3000, farFast = 25,
+    horizonRadius = HORIZON_RADIUS, horizonDem = true}
   state.job.region, state.job.country, state.job.tileSize = descriptor.id, country.id, r.data.tileSize
   state.job.generator = state.stream.generator
   return state.job
@@ -486,11 +507,52 @@ local function priorities()
       -- the renderer drops tiles well behind the car at speed (world.lua updateTiles, behind());
       -- wanting them back here rebuilt each one after it was dropped
       local behind = speed >= 15 and ((cx - p.x) * p.vx + (cy - p.y) * p.vy) < 0 and farD > radius * 0.6 + 250
-      if not behind and tileCovered(a.region, i, j) then
-        if d <= radius then
-          out[keyOf(i, j)] = {i = i, j = j, priority = d / math.max(speed, 5)}
-        elseif farD <= farRadius and speed <= st.farFast then
-          out[keyOf(i, j)] = {i = i, j = j, far = true, priority = 1e8 + farD}
+      if tileCovered(a.region, i, j) then
+        if d <= radius and not behind then
+          out[keyOf(i, j)] = {i = i, j = j, priority = d / math.max(speed, 5), size = t}
+        elseif farD <= farRadius then
+          -- Ground stays wanted at any speed. Buildings and trees are the part that used to
+          -- churn the far ring above 90 km/h; they wait until the car slows down.
+          out[keyOf(i, j)] = {i = i, j = j, far = true, decor = speed <= st.farFast,
+            priority = 1e6 + farD, size = t}
+        end
+      end
+    end
+  end
+  -- DEM-only horizon past the far ring. A 1000 m block is one mesh when all four of its
+  -- 500 m quadrants sit in the annulus, so it shares edges with the far tiles and does not
+  -- cover them. A ragged quadrant is its own 500 m mesh. 15 km and 30 km are not scheduled.
+  st.horizonRadius = HORIZON_RADIUS
+  local function centreDistance(cx, cy)
+    return math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
+  end
+  local minX, maxX = p.x - HORIZON_RADIUS, p.x + HORIZON_RADIUS
+  local minY, maxY = p.y - HORIZON_RADIUS, p.y + HORIZON_RADIUS
+  for bi = math.floor(minX / HORIZON_BLOCK), math.floor(maxX / HORIZON_BLOCK) do
+    for bj = math.floor(minY / HORIZON_BLOCK), math.floor(maxY / HORIZON_BLOCK) do
+      local quads = {{2 * bi, 2 * bj}, {2 * bi + 1, 2 * bj}, {2 * bi, 2 * bj + 1}, {2 * bi + 1, 2 * bj + 1}}
+      local outside = {}
+      for _, q in ipairs(quads) do
+        local cx, cy = (q[1] + 0.5) * t, (q[2] + 0.5) * t
+        local dist = centreDistance(cx, cy)
+        if dist > farRadius and dist <= HORIZON_RADIUS then
+          outside[#outside + 1] = {i = q[1], j = q[2], d = dist, x = cx, y = cy}
+        end
+      end
+      if #outside == 4 then
+        local cx, cy = (bi + 0.5) * HORIZON_BLOCK, (bj + 0.5) * HORIZON_BLOCK
+        local x0, y0 = bi * HORIZON_BLOCK, bj * HORIZON_BLOCK
+        if touchesCell(a.region, x0, y0, x0 + HORIZON_BLOCK, y0 + HORIZON_BLOCK) then
+          out[string.format('h1000:%d_%d', bi, bj)] = {i = bi, j = bj, horizon = true, far = true, decor = false,
+            size = HORIZON_BLOCK, step = HORIZON_STEP, priority = 2e6 + centreDistance(cx, cy), x = cx, y = cy}
+        end
+      else
+        for _, q in ipairs(outside) do
+          local x0, y0 = q.i * t, q.j * t
+          if touchesCell(a.region, x0, y0, x0 + t, y0 + t) then
+            out[string.format('h500:%d_%d', q.i, q.j)] = {i = q.i, j = q.j, horizon = true, far = true, decor = false,
+              size = t, step = HORIZON_STEP, priority = 2e6 + q.d, x = q.x, y = q.y}
+          end
         end
       end
     end
@@ -524,7 +586,7 @@ end
 -- spawning there: evicting it frees nothing and made the next update build the tile again.
 local function entrySize(entry)
   local triangles, vertices = 0, 0
-  for _, layer in ipairs({'road', 'scene', 'far'}) do
+  for _, layer in ipairs({'road', 'scene', 'far', 'horizon'}) do
     if not entry[layer .. 'Taken'] then
       local t, v = geometrySize(entry[layer])
       triangles, vertices = triangles + t, vertices + v
@@ -571,21 +633,62 @@ local function trimTiles()
   st.cacheOverBudget = count > TILE_LIMIT or triangles > TRIANGLE_LIMIT or vertices > VERTEX_LIMIT
 end
 
-local function buildTile(key, wanted)
-  local r, t, cells = active.region, active.region.data.tileSize, {}
-  local x0, y0 = wanted.i * t, wanted.j * t
-  local s = r.data.cellSize
-  for i = math.floor(x0 / s), math.ceil((x0 + t) / s) - 1 do
-    for j = math.floor(y0 / s), math.ceil((y0 + t) / s) - 1 do
-      local cellKey = keyOf(i, j)
-      cells[#cells + 1] = loadCell(cellKey, i, j, {x0, y0, x0 + t, y0 + t})
-      active.pause()
+local function trimHorizon()
+  local a, st = active, state.stream
+  if not a then return end
+  local count, triangles = 0, 0
+  for _, entry in pairs(a.horizon) do
+    count, triangles = count + 1, triangles + (entry.triangles or 0)
+  end
+  while count > HORIZON_TILE_LIMIT or triangles > HORIZON_TRIANGLE_LIMIT do
+    local worst, worstPriority, oldest
+    for key, entry in pairs(a.horizon) do
+      local priority = a.desired[key] and a.desired[key].priority or 1e20
+      local held = entry.horizonTaken and not entry.horizonDelivered
+      if not held and (not worst or priority > worstPriority or (priority == worstPriority and entry.used < oldest)) then
+        worst, worstPriority, oldest = key, priority, entry.used
+      end
     end
+    if not worst then break end
+    local removed = a.horizon[worst]
+    count, triangles = count - 1, triangles - (removed.triangles or 0)
+    a.horizon[worst], st.horizon[worst] = nil, nil
+    a.evicted[worst .. ':horizon'] = a.epoch
+  end
+  st.horizonTiles, st.horizonTriangles = count, triangles
+  st.horizonResident = st.horizonResident or 0
+end
+
+local function buildTile(key, wanted)
+  local r = active.region
+  local size = wanted.size or r.data.tileSize
+  local x0, y0 = wanted.i * size, wanted.j * size
+  local tileRect = {x0, y0, x0 + size, y0 + size}
+  local s, cells, seen = r.data.cellSize, {}, {}
+  local function addCell(i, j, yield)
+    if not hasCell(r, i, j) then return end
+    local cellKey = keyOf(i, j)
+    if seen[cellKey] then return end
+    seen[cellKey] = true
+    cells[#cells + 1] = loadCell(cellKey, i, j, tileRect)
+    if yield then active.pause() end
+  end
+  for i = math.floor(x0 / s), math.ceil((x0 + size) / s) - 1 do
+    for j = math.floor(y0 / s), math.ceil((y0 + size) / s) - 1 do addCell(i, j, true) end
+  end
+  -- One terrain step past the tile, so an edge normal can sample the neighbour grid
+  -- instead of becoming one-sided. These few cells do not take their own pause: the
+  -- tile's own cells already yield, and an extra yield rebuilt a neighbour after landing.
+  local pad = 40
+  for i = math.floor((x0 - pad) / s), math.ceil((x0 + size + pad) / s) - 1 do
+    for j = math.floor((y0 - pad) / s), math.ceil((y0 + size + pad) / s) - 1 do addCell(i, j, false) end
   end
   local center = active.landing and {active.landing.x, active.landing.y} or nil
   local road, scene, far, nav = generator.build(cells, wanted.i, wanted.j,
-    {tileSize = t, regionId = r.descriptor.id, center = center, pause = active.pause,
-      materials = '/earthng/planet/materials.json', packs = '/e2r_stream/fast-art/v10/packs.json', far = wanted.far,
+    {tileSize = size, regionId = r.descriptor.id, center = center, pause = active.pause,
+      materials = '/earthng/planet/materials.json', packs = '/e2r_stream/fast-art/v10/packs.json',
+      far = wanted.far, horizon = wanted.horizon, farDecor = wanted.decor and true or false,
+      farStep = 100, horizonStep = wanted.step or 100,
       seaLevel = finite(r.data.seaLevel) and r.data.seaLevel or nil})
   if type(road) ~= 'table' or type(road.items) ~= 'table' or type(road.mats) ~= 'table'
     or type(scene) ~= 'table' or type(scene.items) ~= 'table' then error('generator returned an invalid tile manifest') end
@@ -597,22 +700,45 @@ local function buildTile(key, wanted)
   road.materials, scene.materials = '/earthng/planet/materials.json', '/earthng/planet/materials.json'
   road.packs = '/e2r_stream/fast-art/v10/packs.json'
   road.navSegments = type(nav) == 'table' and nav.segments or {}
+  local st = state.stream
+  if wanted.horizon then
+    far.source, far.materials = r.descriptor.id, '/earthng/planet/materials.json'
+    far.tileSize = size
+    local entry = active.horizon[key] or {}
+    entry.horizon, entry.decor = far, false
+    entry.horizonTaken, entry.horizonDelivered = nil, nil
+    entry.serial = (entry.serial or 0) + 1
+    entry.used = touch()
+    entry.triangles, entry.vertices = geometrySize(far)
+    active.horizon[key] = entry
+    active.manifests[key .. ':horizon'] = far
+    st.horizon[key] = {serial = entry.serial, i = wanted.i, j = wanted.j, size = size,
+      x = (wanted.i + 0.5) * size, y = (wanted.j + 0.5) * size}
+    st.horizonBuilt = (st.horizonBuilt or 0) + 1
+    local layerKey = key .. ':horizon'
+    if active.everBuilt[layerKey] then st.horizonRebuilds = (st.horizonRebuilds or 0) + 1 end
+    active.everBuilt[layerKey] = true
+    trimHorizon()
+    return
+  end
   local entry = active.tiles[key] or {}
   if wanted.far then
     far.source, far.materials = r.descriptor.id, '/earthng/planet/materials.json'
-    entry.far = far
+    entry.far, entry.decor = far, wanted.decor and true or false
+    entry.farTaken, entry.farDelivered = nil, nil
+    entry.serial = (entry.serial or 0) + 1
     active.manifests[key .. ':far'] = far
+    st.far[key] = entry.serial
   else
     entry.road, entry.scene, entry.nav = road, scene, nav
     active.manifests[key .. ':road'], active.manifests[key .. ':scene'] = road, scene
   end
-  if wanted.far then entry.farTaken, entry.farDelivered = nil, nil
-  else entry.roadTaken, entry.sceneTaken, entry.roadDelivered, entry.sceneDelivered = nil, nil, nil, nil end
+  if not wanted.far then entry.roadTaken, entry.sceneTaken, entry.roadDelivered, entry.sceneDelivered = nil, nil, nil, nil end
   entry.used = touch()
   entry.triangles, entry.vertices = entrySize(entry)
   active.tiles[key] = entry
-  local st = state.stream
-  st.ready[key], st.scenes[key], st.far[key] = entry.road and true or nil, entry.scene and true or nil, entry.far and true or nil
+  st.ready[key], st.scenes[key] = entry.road and true or nil, entry.scene and true or nil
+  if not wanted.far then st.far[key] = nil end
   st.built = st.built + 1
   local layerKey = key .. (wanted.far and ':far' or ':road')
   if active.everBuilt[layerKey] then st.rebuilds = st.rebuilds + 1 end
@@ -633,9 +759,12 @@ local function update(dt, budgetMs)
       best, bestKey = nil, nil
       local queued = 0
       for key, entry in pairs(wanted) do
-        local cached = active.tiles[key]
-        local ready = cached and (entry.far and cached.far or not entry.far and cached.road)
-        local layerKey = key .. (entry.far and ':far' or ':road')
+        local cached = entry.horizon and active.horizon[key] or active.tiles[key]
+        local ready
+        if entry.horizon then ready = cached and cached.horizon
+        elseif entry.far then ready = cached and cached.far and (not entry.decor or cached.decor)
+        else ready = cached and cached.road end
+        local layerKey = key .. (entry.horizon and ':horizon' or (entry.far and ':far' or ':road'))
         if not ready and not active.failed[key] and active.evicted[layerKey] ~= active.epoch then
           queued = queued + 1
           if not best or entry.priority < best.priority or (entry.priority == best.priority and key < bestKey) then best, bestKey = entry, key end
@@ -645,7 +774,8 @@ local function update(dt, budgetMs)
       if not best then break end
       local key, entry = bestKey, best
       active.workKey = key
-      active.workFar = entry.far
+      active.workFar = entry.far and not entry.horizon or false
+      active.workHorizon = entry.horizon and true or false
       active.work = coroutine.create(function() buildTile(key, entry) end)
       state.stream.building = 1
       if state.job and state.job.state == 'working' then state.job.stage = 'Generating roads and scenery in Lua' end
@@ -657,7 +787,7 @@ local function update(dt, budgetMs)
     if resumeMs > 30 then
       local slow = state.stream.slowResumes or {}
       state.stream.slowResumes = slow
-      if #slow < 40 then slow[#slow + 1] = {active.workKey, active.workFar and 'far' or 'near', math.floor(resumeMs)} end
+      if #slow < 40 then slow[#slow + 1] = {active.workKey, active.workHorizon and 'horizon' or (active.workFar and 'far' or 'near'), math.floor(resumeMs)} end
     end
     steps = steps + 1
     if not ok then
@@ -715,8 +845,13 @@ local function recount(entry)
   entry.triangles, entry.vertices = entrySize(entry)
 end
 
+local function layerEntry(key)
+  if not active then return nil end
+  return active.tiles[key] or active.horizon[key]
+end
+
 local function manifest(key, layer)
-  local entry = active and active.tiles[key]
+  local entry = layerEntry(key)
   if entry then
     layer = layer or 'road'
     entry.used = touch()
@@ -730,30 +865,40 @@ end
 -- after the entire layer has spawned, so its queue can no longer need the tables.
 local function release(key, layer)
   layer = layer or 'road'
-  if layer ~= 'road' and layer ~= 'scene' and layer ~= 'far' then return false end
-  local entry = active and active.tiles[key]
+  if layer ~= 'road' and layer ~= 'scene' and layer ~= 'far' and layer ~= 'horizon' then return false end
+  local entry = layerEntry(key)
   local data = entry and entry[layer] or active and active.manifests[key .. ':' .. layer]
   if not data then return false end
   for _, item in ipairs(data.items or {}) do item.meshes = nil end
   if entry then
     entry[layer .. 'Delivered'] = true
     entry.used = touch()
-    recount(entry)
+    if layer == 'horizon' then entry.triangles, entry.vertices = 0, 0 else recount(entry) end
   end
-  trimTiles()
+  if layer == 'horizon' then trimHorizon() else trimTiles() end
   return true
 end
 
 -- Resident GPU meshes have gone. Removing the corresponding ready bit makes the
 -- next visit rebuild from the compact source cells instead of reusing empty data.
 local function unload(key, layer)
-  if not active or (layer ~= nil and layer ~= 'road' and layer ~= 'scene' and layer ~= 'far') then return false end
-  local entry, st = active.tiles[key], state.stream
+  if not active or (layer ~= nil and layer ~= 'road' and layer ~= 'scene' and layer ~= 'far' and layer ~= 'horizon') then return false end
+  local entry, st = layerEntry(key), state.stream
   local farOnly = layer == 'far'
-  if active.workKey == key and (farOnly == (active.workFar == true)) then
+  local horizonOnly = layer == 'horizon'
+  if active.workKey == key and ((horizonOnly and active.workHorizon) or (farOnly and active.workFar) or (not farOnly and not horizonOnly and not active.workFar and not active.workHorizon)) then
     active.work, active.workKey, st.building = nil, nil, 0
   end
-  if farOnly then
+  if horizonOnly then
+    if entry then entry.horizon, entry.horizonDelivered, entry.horizonTaken = nil, nil, nil end
+    st.horizon[key], active.evicted[key .. ':horizon'] = nil, nil
+    active.manifests[key .. ':horizon'] = nil
+    active.horizon[key] = nil
+    active.failed[key] = nil
+    active.prioritiesDirty = true
+    trimHorizon()
+    return entry ~= nil
+  elseif farOnly then
     if entry then entry.far, entry.farDelivered, entry.farTaken = nil, nil, nil end
     st.far[key], active.evicted[key .. ':far'] = nil, nil
     active.manifests[key .. ':far'] = nil
@@ -879,6 +1024,38 @@ local function mapRoads(view, budgetMs)
     end
   end
   return out
+end
+
+-- Which horizon meshes to show. A coarser tile stays until every finer tile that overlaps
+-- it is ready, then the swap is the whole set: no hole and no second surface on the same
+-- ground. rank 0 is the finest. Aligned rings give each fine tile one parent.
+function M.horizonShow(candidates, ready)
+  candidates, ready = candidates or {}, ready or {}
+  local hidden = {}
+  local function overlaps(a, b)
+    return a[1] < b[3] and b[1] < a[3] and a[2] < b[4] and b[2] < a[4]
+  end
+  for _, coarse in ipairs(candidates) do
+    local children = {}
+    for _, fine in ipairs(candidates) do
+      if fine.rank < coarse.rank and fine.rect and coarse.rect and overlaps(fine.rect, coarse.rect) then
+        children[#children + 1] = fine
+      end
+    end
+    if #children > 0 then
+      local allReady = true
+      for _, fine in ipairs(children) do
+        if not ready[fine.key] then allReady = false; break end
+      end
+      if allReady then hidden[coarse.key] = true
+      else for _, fine in ipairs(children) do hidden[fine.key] = true end end
+    end
+  end
+  local show = {}
+  for _, candidate in ipairs(candidates) do
+    if ready[candidate.key] and not hidden[candidate.key] then show[#show + 1] = candidate.key end
+  end
+  return show
 end
 
 M.refresh = refresh

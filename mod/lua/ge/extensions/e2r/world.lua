@@ -117,7 +117,7 @@ local S = {
   state = 'off', center = {lat = 50.4501, lon = 30.5234}, zoom = 11, marker = nil,
   seq = 0, viewDirty = true, lastViewAt = -1, tex = nil, texView = nil, status = nil,
   statusReadAt = -1, landSeq = nil, landAt = nil, now = 0, frames = {},
-  tiles = {}, far = {}, queue = {}, nav = {}, navPending = {}, poseAt = -1, collisionDirty = false, collisionAt = -1, knownMats = {},
+  tiles = {}, far = {}, horizon = {}, queue = {}, nav = {}, navPending = {}, poseAt = -1, collisionDirty = false, collisionAt = -1, knownMats = {},
 }
 local coordBuf = im.ArrayChar(64)
 local test, result = nil, {status = 'waiting', shots = {}}
@@ -771,9 +771,10 @@ local function updateTiles()
     -- the far city (earthng/fast_far.py): a tile without its own scene, within farRadius, gets
     -- its far layer; the far layer goes when the scene is in or the car is far away
     local farR = st.farRadius or 3000
-    -- at speed no new far tile starts (their churn at 300 km/h doubled be:reloadCollision,
-    -- vis-replay-01); the ones there stay until they are far behind
-    local farLoadR = speed > (st.farFast or 25) and 0 or farR
+    -- Companion far tiles are decoration and stay gated above 90 km/h (their churn at
+    -- 300 km/h doubled be:reloadCollision). Native far ground is the mountain ring, so it
+    -- keeps loading; only its buildings and trees wait for a slower speed.
+    local farLoadR = (not NATIVE and speed > (st.farFast or 25)) and 0 or farR
     for key, far in pairs(S.far) do
       local cx, cy = tileCentre(far.i, far.j)
       local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
@@ -783,6 +784,14 @@ local function updateTiles()
         far.dropped = true
         S.far[key] = nil
         if NATIVE then native.unload(key, 'far') end
+      end
+    end
+    for key, token in pairs(st.far or {}) do
+      local spawned = S.far[key]
+      if spawned and type(token) == 'number' and spawned.serial ~= token then
+        buryGroup('E2RF_' .. key)
+        spawned.dropped = true
+        S.far[key] = nil
       end
     end
     if #S.queue < 60 then
@@ -804,18 +813,65 @@ local function updateTiles()
         else ok, manifest = pcall(jsonReadFile, tilePath(key, 'far')) end
         if ok and type(manifest) == 'table' and manifest.source == S.stream.region then
           loadNewMaterials(manifest.materials)
-          local far = {i = i, j = j, left = #manifest.items, group = tileGroup('E2RF_' .. key, true), far = true}
+          local far = {i = i, j = j, left = #manifest.items, group = tileGroup('E2RF_' .. key, true), far = true,
+            serial = type(st.far[key]) == 'number' and st.far[key] or 1}
           S.far[key] = far
           for _, it in ipairs(manifest.items) do table.insert(S.queue, {tile = far, key = key, item = it, far = true}) end
         end
       end
     end
+    -- DEM horizon past the far ring. Its own group stays out of MissionGroup, so it never
+    -- joins the static collision. A coarser ring is not scheduled until the 5 km one is checked.
+    local horizonR = (NATIVE and st.horizonDem) and (st.horizonRadius or 0) or 0
+    S.horizon = S.horizon or {}
+    if horizonR > 0 then
+      for key, spawned in pairs(S.horizon) do
+        local info = st.horizon and st.horizon[key]
+        local cx = info and info.x or spawned.x or p.x
+        local cy = info and info.y or spawned.y or p.y
+        if not info or math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2) > horizonR + 800 then
+          buryGroup(spawned.groupName or ('E2RH_' .. key:gsub('[^%w_]', '_')))
+          spawned.dropped = true
+          S.horizon[key] = nil
+          if NATIVE then native.unload(key, 'horizon') end
+        end
+      end
+      if #S.queue < 40 then
+        local bestH, bestHD
+        for key, info in pairs(st.horizon or {}) do
+          if not S.horizon[key] and type(info) == 'table' and info.x and info.y then
+            local d = math.sqrt((info.x - p.x) ^ 2 + (info.y - p.y) ^ 2)
+            if d <= horizonR + 250 and (not bestHD or d < bestHD) then bestH, bestHD = key, d end
+          end
+        end
+        if bestH then
+          local info = st.horizon[bestH]
+          local manifest = native.manifest(bestH, 'horizon')
+          if type(manifest) == 'table' and manifest.source == S.stream.region then
+            loadNewMaterials(manifest.materials)
+            local groupName = 'E2RH_' .. bestH:gsub('[^%w_]', '_')
+            local horizon = {left = #manifest.items, group = tileGroup(groupName, true), horizon = true,
+              serial = info.serial, x = info.x, y = info.y, groupName = groupName}
+            S.horizon[bestH] = horizon
+            if horizon.left == 0 then native.release(bestH, 'horizon')
+            else
+              for _, it in ipairs(manifest.items) do
+                table.insert(S.queue, {tile = horizon, key = bestH, item = it, horizon = true})
+              end
+            end
+          end
+        end
+      end
+    end
+    local horizonCount = 0
+    for _ in pairs(S.horizon) do horizonCount = horizonCount + 1 end
+    result.horizonResident = horizonCount
     -- Reprioritize pending work when direction changes; no scene object can block roads, no far
     -- object a scene.
     -- Roads and scenes go by the car's arrival (wanted, s), a scene SCENE_LAG s after its road:
     -- the buildings by the car come before the roads of a tile a kilometre ahead.
     local wanted = st.wanted or {}
-    local function rank(job) return job.far and 1 or 0 end
+    local function rank(job) return job.horizon and 2 or (job.far and 1 or 0) end
     local function due(job) return (wanted[job.key] or 1e6) + (job.scene and SCENE_LAG or 0) end
     table.sort(S.queue, function(a, b)
       local ra, rb = rank(a), rank(b)
@@ -838,7 +894,7 @@ local function stepQueue()
       while job and job.tile.dropped do job = table.remove(S.queue, 1) end
       if not job then break end
       S.job = job
-      local group = (job.far and job.tile.group) or (job.item.decor and job.tile.decor) or job.tile.group
+      local group = ((job.far or job.horizon) and job.tile.group) or (job.item.decor and job.tile.decor) or job.tile.group
       S.co = coroutine.create(function(p) spawnItem(job.item, group, p) end)
     end
     -- a resume far over the budget: is it the collector (Lua heap shrinks inside it)?
@@ -855,15 +911,15 @@ local function stepQueue()
     if not ok then
       log('E', logTag, tostring(err))
       result.errors = (result.errors or 0) + 1
-      if not S.job.far then S.job.tile.failed = true end
+      if not S.job.far and not S.job.horizon then S.job.tile.failed = true end
     end
     -- createMesh has copied the source arrays into the engine. Retaining every
     -- vertex table in Lua made later garbage collections pause driving frames.
     if NATIVE and ok and coroutine.status(S.co) == 'dead' then S.job.item.meshes = nil end
-    if coroutine.status(S.co) == 'dead' and S.job.far then
+    if coroutine.status(S.co) == 'dead' and (S.job.far or S.job.horizon) then
       S.co = nil
       S.job.tile.left = S.job.tile.left - 1
-      if NATIVE and S.job.tile.left == 0 then native.release(S.job.key, 'far') end
+      if NATIVE and S.job.tile.left == 0 then native.release(S.job.key, S.job.horizon and 'horizon' or 'far') end
     elseif coroutine.status(S.co) == 'dead' then
       S.co = nil
       local tile = S.job.tile
@@ -1292,7 +1348,11 @@ local function beginArrival(job)
   -- leave the previous region
   for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true end
   for key, far in pairs(S.far) do dropGroup('E2RF_' .. key); far.dropped = true end
-  S.tiles, S.far, S.queue, S.co = {}, {}, {}, nil
+  for key, horizon in pairs(S.horizon or {}) do
+    dropGroup(horizon.groupName or ('E2RH_' .. key:gsub('[^%w_]', '_')))
+    horizon.dropped = true
+  end
+  S.tiles, S.far, S.horizon, S.queue, S.co = {}, {}, {}, {}, nil
   -- traffic of the old place has no roads here
   if trafficRunning() then gameplay_traffic.deleteVehicles() end
   S.nav, S.navPending, S.navDirty, S.trafficWanted = {}, {}, false, nil
@@ -1303,7 +1363,7 @@ local function beginArrival(job)
   S.knownMats = {}
   S.lamps = {}
   loadNewMaterials(manifest.materials)
-  if manifest.spawn then pcall(makeHorizon, job.horizonZ, manifest.spawn.pos[1], manifest.spawn.pos[2]) end
+  if manifest.spawn and job.horizonZ then pcall(makeHorizon, job.horizonZ, manifest.spawn.pos[1], manifest.spawn.pos[2]) end
   if manifest.packs and FS:fileExists(manifest.packs) then
     local okP, packs = pcall(jsonReadFile, manifest.packs)
     S.packs = okP and packs and packs.fields or nil
@@ -2070,8 +2130,11 @@ local function drawStats(st, p, v)
     else loading = loading + 1 end
   end
   for _ in pairs(S.far) do far = far + 1 end
-  im.Text(string.format(L('У грі: доріг %d (з колізією %d), сцен %d, далеких %d',
-    'In game: roads %d (with collision %d), scenes %d, far %d'), roads, collided, scenes, far))
+  local bands = 0
+  for _ in pairs(S.horizon or {}) do bands = bands + 1 end
+  result.horizonResident = bands
+  im.Text(string.format(L('У грі: доріг %d (з колізією %d), сцен %d, далеких %d, горизонт %d',
+    'In game: roads %d (with collision %d), scenes %d, far %d, horizon %d'), roads, collided, scenes, far, bands))
   im.Text(string.format(L('Вантажаться %d, збої %d, доставка p99 %.1f с', 'Loading %d, failed %d, delivery p99 %.1f s'), loading, failed, S.deliveryP99 or 0))
   if trafficRunning() and gameplay_traffic.getTrafficAmount then
     local nav = S.navStats or {}
@@ -2452,13 +2515,17 @@ local function refreshCountries()
       dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true
     end
     for key, far in pairs(S.far) do dropGroup('E2RF_' .. key); far.dropped = true end
+    for key, band in pairs(S.horizon or {}) do
+      dropGroup(band.groupName or ('E2RH_' .. key:gsub('[^%w_]', '_')))
+      band.dropped = true
+    end
     dropGroup('E2RWorldWarmup'); dropGroup('E2RWorldPacks'); dropGroup('E2RWorldShapes')
     local horizon = scenetree.findObject('e2r_horizon')
     if horizon then horizon:delete() end
     dropLights()
     if trafficRunning() then gameplay_traffic.deleteVehicles() end
     S.stream, S.co, S.job, S.landing = nil, nil, nil, nil
-    S.tiles, S.far, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}
+    S.tiles, S.far, S.horizon, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}, {}
     S.collisionDirty, S.state = true, 'off'
   end
   if S.state == 'generating' or S.state == 'warmup' then
@@ -2501,7 +2568,7 @@ function M.onClientEndMission()
   restorePackState()
   if NATIVE then native.refresh() end
   S.stream, S.co, S.job, S.landing, S.state = nil, nil, nil, nil, 'off'
-  S.tiles, S.far, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}
+  S.tiles, S.far, S.horizon, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}, {}
   S.knownMats, S.coverage, S.centredOnPackage = {}, nil, nil
   dropLights()
 end

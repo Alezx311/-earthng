@@ -32,8 +32,14 @@ local function hash(value)
 end
 
 local function lerp(a, b, t)
+  local n = math.max(#a, #b)
+  -- A per-corner normal sits at [6..8]. A nil UV in [4] or [5] would stop `#` before it,
+  -- and the clipped border would fall back to a face normal that the neighbour does not share.
+  if type(a[6]) == 'number' or type(b[6]) == 'number' or type(a[9]) == 'number' or type(b[9]) == 'number' then
+    n = math.max(n, 9)
+  end
   local out = {}
-  for k = 1, math.max(#a, #b) do out[k] = (a[k] or 0) + ((b[k] or 0) - (a[k] or 0)) * t end
+  for k = 1, n do out[k] = (a[k] or 0) + ((b[k] or 0) - (a[k] or 0)) * t end
   return out
 end
 
@@ -374,10 +380,18 @@ local function collector(rect, key, layer, pause)
       scales[kind] = scale
     end
     local n = normalIndex(mesh, nx, ny, nz)
+    -- Ground passes a per-corner normal in p[6..8] (nx can be 0, so the type is the test).
+    -- Walls, curbs and roads leave it unset and keep this face normal.
+    local function cornerNormal(p)
+      if type(p[6]) == 'number' and type(p[7]) == 'number' and type(p[8]) == 'number' then
+        return normalIndex(mesh, p[6], p[7], p[8])
+      end
+      return n
+    end
     -- BeamNG ProceduralMesh expects clockwise face indices and zero-based indices.
-    corner(mesh, a, n, scale)
-    corner(mesh, c, n, scale)
-    corner(mesh, b, n, scale)
+    corner(mesh, a, cornerNormal(a), scale)
+    corner(mesh, c, cornerNormal(c), scale)
+    corner(mesh, b, cornerNormal(b), scale)
     triangles, operations = triangles + 1, operations + 1
     if operations % 64 == 0 then pause() end
   end
@@ -386,7 +400,7 @@ local function collector(rect, key, layer, pause)
     local first = clipped[1]
     for k = 2, #clipped - 1 do triangle(kind, first, clipped[k], clipped[k + 1], up) end
   end
-  return {items = items, used = used, polygon = polygon, finish = flush}
+  return {items = items, used = used, polygon = polygon, triangle = triangle, finish = flush}
 end
 
 local SPEED = {motorway = 110, trunk = 90, primary = 60, secondary = 60, tertiary = 50,
@@ -602,6 +616,13 @@ local function build(cells, i, j, options)
   options = options or {}
   local pause = options.pause or options.yield or function() end
   local size = options.tileSize or 500
+  -- far: the 3 km ring. horizon: DEM-only past it. Both shape the ground like near (so the
+  -- shared edge matches) but emit no road mesh, nav or collision. Decor is the optional
+  -- far buildings and trees; a horizon tile never has it.
+  local distant = options.far or options.horizon
+  local visualRoads = not distant
+  local decor = not options.horizon and (not options.far or options.farDecor ~= false)
+  local layerName = options.horizon and 'horizon' or (options.far and 'far' or 'scene')
   local rect, key = {i * size, j * size, (i + 1) * size, (j + 1) * size}, tostring(i) .. '_' .. tostring(j)
   local target = options.center or {(i + .5) * size, (j + .5) * size}
   local lists, terrain
@@ -612,7 +633,7 @@ local function build(cells, i, j, options)
     lists, terrain = collect(cells, pause)
     if single then prepared[single] = {lists, terrain} end
   end
-  local roads, scene = collector(rect, key, 'road', pause), collector(rect, key, options.far and 'far' or 'scene', pause)
+  local roads, scene = collector(rect, key, 'road', pause), collector(rect, key, layerName, pause)
   local roadDecor, sceneDecor = collector(rect, key .. '_marks', 'road', pause), collector(rect, key .. '_cars', 'scene', pause)
   -- mark(name): the stage that just ended (the road quality bench times them)
   local mark = options.mark or function() end
@@ -627,7 +648,7 @@ local function build(cells, i, j, options)
   local segments, segmentBins, nav, bestSpawn, bestDistance = {}, {}, {segments = {}}, nil, math.huge
   for _, road in ipairs(lists.roads) do
     local tags, points, width = road.tags or {}, road.points or {}, math.max(.5, math.min(80, road.width or 7))
-    for index = 1, options.far and 0 or #points - 1 do
+    for index = 1, #points - 1 do
       local a, b = points[index], points[index + 1]
       local dx, dy = b[1] - a[1], b[2] - a[2]
       local length = math.sqrt(dx * dx + dy * dy)
@@ -649,26 +670,44 @@ local function build(cells, i, j, options)
       end
       if index % 32 == 0 then pause() end
     end
-    local navigation = not options.far and navSegment(road)
+    local navigation = visualRoads and navSegment(road)
     if navigation then nav.segments[#nav.segments + 1] = navigation end
     pause()
   end
 
-  local function rawHeight(x, y)
+  -- One world-space sample. No grids: 0, so a near tile without a DEM stays the flat
+  -- lattice the roads already sit on. Grids that miss the point: nil, so a distant mesh
+  -- omits the quad instead of dropping a cliff to z = 0. A point on a shared cell edge
+  -- belongs to every grid that contains it; the lower rect origin wins, so the order the
+  -- cells were loaded in cannot move the surface.
+  local function demAt(x, y)
+    if #terrain == 0 then return 0 end
+    local best, bestX, bestY
     for _, grid in ipairs(terrain) do
       local box = grid.rect
-      if box and x >= box[1] - EPS and x <= box[3] + EPS and y >= box[2] - EPS and y <= box[4] + EPS and grid.nx >= 2 and grid.ny >= 2 then
-        local gx = math.max(0, math.min(grid.nx - 1, (x - box[1]) / (box[3] - box[1]) * (grid.nx - 1)))
-        local gy = math.max(0, math.min(grid.ny - 1, (y - box[2]) / (box[4] - box[2]) * (grid.ny - 1)))
-        local ix, iy = math.min(grid.nx - 2, math.floor(gx)), math.min(grid.ny - 2, math.floor(gy))
-        local tx, ty = gx - ix, gy - iy
-        local heights, row = grid.heights, iy * grid.nx + ix + 1
-        local z00, z10 = heights[row] or 0, heights[row + 1] or 0
-        local z01, z11 = heights[row + grid.nx] or 0, heights[row + grid.nx + 1] or 0
-        return (z00 * (1 - tx) + z10 * tx) * (1 - ty) + (z01 * (1 - tx) + z11 * tx) * ty
+      if box and x >= box[1] - EPS and x <= box[3] + EPS and y >= box[2] - EPS and y <= box[4] + EPS
+          and grid.nx >= 2 and grid.ny >= 2 and grid.heights then
+        local ox, oy = box[1], box[2]
+        if not best or ox < bestX - EPS or (math.abs(ox - bestX) <= EPS and oy < bestY) then
+          best, bestX, bestY = grid, ox, oy
+        end
       end
     end
-    return 0
+    if not best then return nil end
+    local grid, box = best, best.rect
+    local gx = math.max(0, math.min(grid.nx - 1, (x - box[1]) / (box[3] - box[1]) * (grid.nx - 1)))
+    local gy = math.max(0, math.min(grid.ny - 1, (y - box[2]) / (box[4] - box[2]) * (grid.ny - 1)))
+    local ix, iy = math.min(grid.nx - 2, math.floor(gx)), math.min(grid.ny - 2, math.floor(gy))
+    local tx, ty = gx - ix, gy - iy
+    local heights, row = grid.heights, iy * grid.nx + ix + 1
+    local z00, z10 = heights[row] or 0, heights[row + 1] or 0
+    local z01, z11 = heights[row + grid.nx] or 0, heights[row + grid.nx + 1] or 0
+    return (z00 * (1 - tx) + z10 * tx) * (1 - ty) + (z01 * (1 - tx) + z11 * tx) * ty
+  end
+  local function rawHeight(x, y)
+    local z = demAt(x, y)
+    if z == nil then return 0 end
+    return z
   end
   -- The DEM pulled to the roads round a point (fast.ground_corners): fully at a road's profile
   -- within pullFull of its edge, the DEM alone from pullZero. Nearer roads weigh more in the
@@ -676,7 +715,8 @@ local function build(cells, i, j, options)
   local heightOperations = 0
   local span = math.max(1, tune.pullZero - tune.pullFull)
   local function pulled(x, y)
-    local base = rawHeight(x, y)
+    local base = demAt(x, y)
+    if base == nil then return nil end
     local nearby = segmentBins[(floor(x / 50) + 32768) * 65536 + floor(y / 50) + 32768] or NONE
     local sa, sz, pull = 0, 0, 0
     for _, segment in ipairs(nearby) do
@@ -706,20 +746,24 @@ local function build(cells, i, j, options)
   -- road, sidewalk or junction from below (the Python generator cut holes into the ground there;
   -- lowering the four corners of a cell by the worst excess in it is cheap, and since a node's
   -- drop depends only on the cells round it, neighbouring tiles agree on their shared nodes).
+  -- One step past the tile is not enough for a border normal: the sample a step
+  -- outside has to be pressed from both of its cells, or the neighbour tile's slope
+  -- disagrees. The extra ring is only for those samples; drawn quads stay in the tile.
   local n0x, n0y = floor(rect[1] / step + .5) - 1, floor(rect[2] / step + .5) - 1
   local count = math.max(1, floor(size / step + .5))
   local nodes, lower = {}, {}
   local function nodeKey(gx, gy) return (gx - n0x) * 4096 + (gy - n0y) end
-  if not options.far then
-    for gy = n0y, n0y + count + 2 do
-      for gx = n0x, n0x + count + 2 do nodes[nodeKey(gx, gy)] = pulled(gx * step, gy * step) - tune.groundDrop end
-      pause()
+  for gy = n0y - 1, n0y + count + 3 do
+    for gx = n0x - 1, n0x + count + 3 do
+      local z = pulled(gx * step, gy * step)
+      if z == nil then nodes[nodeKey(gx, gy)] = nil else nodes[nodeKey(gx, gy)] = z - tune.groundDrop end
     end
+    pause()
   end
   local function lattice(x, y)
     local fx, fy = x / step, y / step
     local gx, gy = floor(fx), floor(fy)
-    if gx < n0x or gy < n0y or gx >= n0x + count + 2 or gy >= n0y + count + 2 then return nil end
+    if gx < n0x - 1 or gy < n0y - 1 or gx >= n0x + count + 3 or gy >= n0y + count + 3 then return nil end
     local u, v = fx - gx, fy - gy
     local k = nodeKey(gx, gy)
     return k, u, v
@@ -735,6 +779,7 @@ local function build(cells, i, j, options)
     if u >= v then ka, kb, kc, wa, wb, wc = k, k + 4096, k + 4097, 1 - u, u - v, v
     else ka, kb, kc, wa, wb, wc = k, k + 4097, k + 1, 1 - v, u, v - u end
     local za, zb, zc = nodes[ka], nodes[kb], nodes[kc]
+    if za == nil or zb == nil or zc == nil then return end
     local excess = wa * za + wb * zb + wc * zc - target
     if excess <= 0 then return end
     local ha, hb, hc = math.max(0, za - target), math.max(0, zb - target), math.max(0, zc - target)
@@ -748,15 +793,41 @@ local function build(cells, i, j, options)
   -- The ground as drawn: each lattice cell is two triangles split along its (x0, y0)-(x1, y1)
   -- diagonal (the collector fans a quad from its first corner).
   local function ground(x, y)
-    if options.far then return rawHeight(x, y) end
+    local function fallen(z) return z and z - tune.groundDrop or 0 end
     local k, u, v = lattice(x, y)
-    if not k then return pulled(x, y) - tune.groundDrop end
-    local z00, z10 = nodes[k] - (lower[k] or 0), nodes[k + 4096] - (lower[k + 4096] or 0)
-    local z01, z11 = nodes[k + 1] - (lower[k + 1] or 0), nodes[k + 4097] - (lower[k + 4097] or 0)
+    if not k then return fallen(pulled(x, y)) end
+    local function nz(key)
+      local z = nodes[key]
+      if z == nil then return nil end
+      return z - (lower[key] or 0)
+    end
+    local z00, z10, z01, z11 = nz(k), nz(k + 4096), nz(k + 1), nz(k + 4097)
+    -- A corner outside the DEM used to fall back to the raw grid and drop the road pull,
+    -- so the same verge sampled from the other tile landed tens of metres higher.
+    if z00 == nil or z10 == nil or z01 == nil or z11 == nil then return fallen(pulled(x, y)) end
     if u >= v then return z00 + (z10 - z00) * u + (z11 - z10) * v end
     return z00 + (z11 - z01) * u + (z01 - z00) * v
   end
-
+  -- Height of the drawn surface, or nil outside every DEM grid. No grids at all stays the
+  -- numeric ground (flat near tiles). A sample just outside a grid is nil so the normal
+  -- there is one-sided instead of a slope down to the old z = 0 fallback.
+  local function heightAt(x, y)
+    if #terrain == 0 then return ground(x, y) end
+    if demAt(x, y) == nil then return nil end
+    return ground(x, y)
+  end
+  local function groundNormal(x, y)
+    local function slope(dx, dy)
+      local zp, zm, z0 = heightAt(x + dx, y + dy), heightAt(x - dx, y - dy), heightAt(x, y)
+      if zp and zm then return (zp - zm) / (2 * step) end
+      if zp and z0 then return (zp - z0) / step end
+      if zm and z0 then return (z0 - zm) / step end
+      return 0
+    end
+    local nx, ny, nz = -slope(step, 0), -slope(0, step), 1
+    local len = math.sqrt(nx * nx + ny * ny + nz * nz)
+    return nx / len, ny / len, nz / len
+  end
   mark('lattice')
   -- Roads as continuous strips: a knot's normal is the mean of its two segments' directions, so
   -- consecutive quads share their edge vertices (no bevels, no gaps on bends), on every tile.
@@ -796,7 +867,7 @@ local function build(cells, i, j, options)
     end
     return points[1]
   end
-  if not options.far then
+  do
     local mouths, order = {}, {}
     for _, road in ipairs(lists.roads) do
       local points, nodes = road.points or NONE, road.nodes or NONE
@@ -850,7 +921,7 @@ local function build(cells, i, j, options)
     end
   end
   local trimmed = {}
-  for _, road in ipairs(options.far and NONE or lists.roads) do
+  for _, road in ipairs(lists.roads) do
     local tags, raw, width = road.tags or {}, road.points or {}, math.max(.5, math.min(80, road.width or 7))
     local points = {}
     for _, p in ipairs(raw) do
@@ -915,7 +986,7 @@ local function build(cells, i, j, options)
         local box = ringBounds({quad})
         if boundsTouch(rect, box, stripReach) then
           if surfaceRoad then addAsphalt(quad, strip, k) end
-          if boundsTouch(rect, box, 0) then roads.polygon(strip.material, quad, 'flat') end
+          if visualRoads and boundsTouch(rect, box, 0) then roads.polygon(strip.material, quad, 'flat') end
           local dx, dy = b[1] - a[1], b[2] - a[2]
           local length = math.sqrt(dx * dx + dy * dy)
           local t = math.max(0, math.min(1, ((target[1] - a[1]) * dx + (target[2] - a[2]) * dy) / (length * length)))
@@ -1051,7 +1122,7 @@ local function build(cells, i, j, options)
       for k = 1, #corners do
         local tri = {{cx, cy, centre}, corners[k], corners[k % #corners + 1]}
         addAsphalt(tri, nil, nil)
-        if touches then roads.polygon('road', tri, 'flat') end
+        if visualRoads and touches then roads.polygon('road', tri, 'flat') end
       end
       -- round a ground-level star (fast.junction_verge): a sidewalk ring when a street with
       -- sidewalks meets here, then the verge down to the ground, both away from the node
@@ -1086,7 +1157,7 @@ local function build(cells, i, j, options)
       local box = ringBounds({c.quad})
       if boundsTouch(rect, box, stripReach) then
         addAsphalt(c.quad, nil, nil)
-        if boundsTouch(rect, box, 0) then roads.polygon(c.material, c.quad, 'flat') end
+        if visualRoads and boundsTouch(rect, box, 0) then roads.polygon(c.material, c.quad, 'flat') end
       end
     end
   end
@@ -1164,7 +1235,27 @@ local function build(cells, i, j, options)
     return pieces
   end
   local function emit(collectorOf, material, poly, skip, up)
-    for _, piece in ipairs(subtract(poly, skip)) do collectorOf.polygon(material, piece, up) end
+    -- Distant tiles skip the carriageway. The verge is the transition band: the same
+    -- ground wedge the near tile cuts at this edge, so the shared border keeps its vertices.
+    if not visualRoads and not (distant and material == 'ground') then return end
+    for _, piece in ipairs(subtract(poly, skip)) do
+      if material == 'ground' then
+        -- Outer edge points are marked at [9]. Resample them after the clip: a linear
+        -- blend of the two tiles' endpoint heights does not land on the shared ground().
+        local clipped = clip(piece, rect)
+        local shaded = {}
+        for i, p in ipairs(clipped) do
+          local z = p[3] or 0
+          if (p[9] or 0) > 0.9 then z = ground(p[1], p[2]) end
+          local q = {p[1], p[2], z}
+          q[6], q[7], q[8] = groundNormal(p[1], p[2])
+          shaded[i] = q
+        end
+        if #shaded >= 3 then collectorOf.polygon(material, shaded, up) end
+      else
+        collectorOf.polygon(material, piece, up)
+      end
+    end
   end
   mark('plates')
   -- Sidewalks flush with the road (a curb band, then paving) on the sides the tags allow, cut by
@@ -1341,9 +1432,10 @@ local function build(cells, i, j, options)
   for _, plate in ipairs(plates) do
     for _, quad in ipairs(plate.verges or NONE) do
       if boundsTouch(rect, ringBounds({quad}), 0) then
-        local verge = {quad[1], quad[2], {quad[3][1], quad[3][2], ground(quad[3][1], quad[3][2])},
-          {quad[4][1], quad[4][2], ground(quad[4][1], quad[4][2])}}
-        emit(roads, 'ground', verge, nil, true)
+        local outerA = {quad[3][1], quad[3][2], ground(quad[3][1], quad[3][2])}
+        local outerB = {quad[4][1], quad[4][2], ground(quad[4][1], quad[4][2])}
+        outerA[9], outerB[9] = 1, 1
+        emit(distant and scene or roads, 'ground', {quad[1], quad[2], outerA, outerB}, nil, true)
       end
     end
   end
@@ -1351,12 +1443,17 @@ local function build(cells, i, j, options)
     for _, item in ipairs(strip.verges or NONE) do
       local verge = item[1]
       verge[2][3], verge[3][3] = ground(verge[2][1], verge[2][2]), ground(verge[3][1], verge[3][2])
-      if tune.vergeCut > 0 then emit(roads, 'ground', verge, item[2], true) else roads.polygon('ground', verge, true) end
+      -- [9] marks the outer edge. The clip resamples it from ground() so both tiles agree.
+      verge[2][9], verge[3][9] = 1, 1
+      local groundMesh = distant and scene or roads
+      if tune.vergeCut > 0 then emit(groundMesh, 'ground', verge, item[2], true)
+      elseif visualRoads then roads.polygon('ground', verge, true)
+      elseif distant then scene.polygon('ground', verge, true) end
     end
   end
 
   mark('verges')
-  if not options.far then
+  if visualRoads then
     for _, road in ipairs(lists.roads) do
       local points, tags, width = road.points or {}, road.tags or {}, road.width or 7
       local one = tostring(tags.oneway or '')
@@ -1407,7 +1504,7 @@ local function build(cells, i, j, options)
   -- (0 m plus the world lift). Open water is a plane just above it over every ground quad that
   -- reaches it; higher ground covers the plane on the shore. Lakes and rivers are OSM areas.
   local sea = type(options.seaLevel) == 'number' and options.seaLevel + SEA_ABOVE or nil
-  local seaStep = options.far and size / 5 or size / count
+  local seaStep = distant and size / 5 or size / count
   local seaCount = math.max(1, math.floor(size / seaStep + .5))
   local seaQuads, seaAll = {}, true
   for gy = 0, sea and seaCount - 1 or -1 do
@@ -1427,29 +1524,185 @@ local function build(cells, i, j, options)
     scene.polygon('water', {{q[1], q[2], sea}, {q[3], q[2], sea}, {q[3], q[4], sea}, {q[1], q[4], sea}}, 'flat')
   end
   mark('groundsea')
-  for _, area in ipairs(options.far and {} or lists.areas) do
+  for _, area in ipairs(distant and NONE or lists.areas) do
     local kind = area.kind
     if (kind == 'water' or kind == 'paved' or kind == 'forest' or kind == 'park') and ringsTouch(area.rings, rect) then
       drapeRings(kind, area.rings, .025)
     end
     pause()
   end
+  -- Height of the drawn surface, or nil outside every DEM grid. No grids at all stays the
+  -- numeric ground (flat near tiles). A sample just outside a grid is nil so the normal
+  -- there is one-sided instead of a slope down to the old z = 0 fallback.
+  local function vertex(x, y, z)
+    local p = {x, y, z}
+    p[6], p[7], p[8] = groundNormal(x, y)
+    return p
+  end
   -- The ground lattice: each cell two triangles along its (x0, y0)-(x1, y1) diagonal, drawn in
   -- the material of the cover that fills it whole (claims), else as grass.
-  for gy = 0, options.far and -1 or count - 1 do
+  for gy = 0, distant and -1 or count - 1 do
     for gx = 0, count - 1 do
       local cx, cy = n0x + 1 + gx, n0y + 1 + gy
       local x0, y0 = cx * step, cy * step
       local x1, y1 = x0 + step, y0 + step
-      local a, b, c, d = {x0, y0, ground(x0, y0)}, {x1, y0, ground(x1, y0)}, {x1, y1, ground(x1, y1)}, {x0, y1, ground(x0, y1)}
-      local key = ((cx + 32768) * 65536 + cy + 32768) * 2
-      roads.polygon(claims[key] or 'ground', {a, b, c}, true)
-      roads.polygon(claims[key + 1] or 'ground', {a, c, d}, true)
+      local a, b = vertex(x0, y0, ground(x0, y0)), vertex(x1, y0, ground(x1, y0))
+      local c, d = vertex(x1, y1, ground(x1, y1)), vertex(x0, y1, ground(x0, y1))
+      local gkey = ((cx + 32768) * 65536 + cy + 32768) * 2
+      roads.polygon(claims[gkey] or 'ground', {a, b, c}, true)
+      roads.polygon(claims[gkey + 1] or 'ground', {a, c, d}, true)
     end
     pause()
   end
+  -- Distant ground is render-only and lives in the far/horizon manifest. The tile border is
+  -- sampled at the near step so it shares that edge; the interior is the coarse step. A fan
+  -- joins them. Corners belong to one fan, so two strips never cover the same quad.
+  if distant and #terrain > 0 then
+    local fine = step
+    local coarse = options.horizon and (options.horizonStep or options.farStep or 100) or (options.farStep or 100)
+    coarse = fine * math.max(1, math.floor(coarse / fine + 1e-6))
+    if size < coarse * 2 - EPS then coarse = fine end
+    local x0, y0, x1, y1 = rect[1], rect[2], rect[3], rect[4]
+    local function emitTri(a, b, c)
+      if not a or not b or not c then return end
+      scene.triangle('ground', a, b, c, true)
+    end
+    local function at(x, y)
+      local z = heightAt(x, y)
+      if not z then return nil end
+      return vertex(x, y, z)
+    end
+    local ix0, iy0, ix1, iy1 = x0 + coarse, y0 + coarse, x1 - coarse, y1 - coarse
+    if ix1 > ix0 + EPS and iy1 > iy0 + EPS then
+      local function ticks(a, b, stride)
+        local out, v = {}, a
+        while v < b - EPS do out[#out + 1] = v; v = v + stride end
+        out[#out + 1] = b
+        return out
+      end
+      local xs, ys = ticks(ix0, ix1, coarse), ticks(iy0, iy1, coarse)
+      for gy = 1, #ys - 1 do
+        for gx = 1, #xs - 1 do
+          local ax, ay = xs[gx], ys[gy]
+          local bx, by = xs[gx + 1], ys[gy + 1]
+          emitTri(at(ax, ay), at(bx, ay), at(bx, by))
+          emitTri(at(ax, ay), at(bx, by), at(ax, by))
+        end
+        pause()
+      end
+    end
+    local function pointsAlong(ax, ay, bx, by, n)
+      local out = {}
+      for k = 0, n do
+        local t = k / math.max(n, 1)
+        out[#out + 1] = {ax + (bx - ax) * t, ay + (by - ay) * t}
+      end
+      return out
+    end
+    -- Outer fine polyline P and inner coarse knots. P[0] matches the first knot's
+    -- parameter, P[n] the last. Triangles (L, P[i], P[i+1]) plus (L, P[n], R).
+    local function fan(outer, inner)
+      local ia = 1
+      for k = 1, #inner - 1 do
+        local L, R = inner[k], inner[k + 1]
+        local ib = ia
+        while ib < #outer do
+          ib = ib + 1
+          local p = outer[ib]
+          if math.abs(p[1] - R[1]) <= EPS and math.abs(p[2] - R[2]) <= EPS then break end
+          -- R is inset, so the outer end shares R's along-edge coordinate, not its position.
+          local along = math.abs(R[1] - L[1]) >= math.abs(R[2] - L[2])
+          local target = along and R[1] or R[2]
+          local got = along and p[1] or p[2]
+          if math.abs(got - target) <= EPS then break end
+        end
+        for n = ia, ib - 1 do
+          emitTri(at(L[1], L[2]), at(outer[n][1], outer[n][2]), at(outer[n + 1][1], outer[n + 1][2]))
+        end
+        local p = outer[ib]
+        if math.abs(p[1] - R[1]) > EPS or math.abs(p[2] - R[2]) > EPS then
+          emitTri(at(L[1], L[2]), at(p[1], p[2]), at(R[1], R[2]))
+        end
+        ia = ib
+      end
+    end
+    local function fanPoint(outer, x, y)
+      for n = 1, #outer - 1 do
+        emitTri(at(x, y), at(outer[n][1], outer[n][2]), at(outer[n + 1][1], outer[n + 1][2]))
+      end
+    end
+    local nFine = math.floor(coarse / fine + .5)
+    local span = (x1 - x0) - 2 * coarse
+    local nSpanFine = math.floor(span / fine + .5)
+    local nSpanCoarse = math.floor(span / coarse + .5)
+    if span > EPS then
+      fan(pointsAlong(x0 + coarse, y0, x1 - coarse, y0, nSpanFine),
+        pointsAlong(x0 + coarse, y0 + coarse, x1 - coarse, y0 + coarse, nSpanCoarse))
+      fan(pointsAlong(x0 + coarse, y1, x1 - coarse, y1, nSpanFine),
+        pointsAlong(x0 + coarse, y1 - coarse, x1 - coarse, y1 - coarse, nSpanCoarse))
+      fan(pointsAlong(x0, y0 + coarse, x0, y1 - coarse, nSpanFine),
+        pointsAlong(x0 + coarse, y0 + coarse, x0 + coarse, y1 - coarse, nSpanCoarse))
+      fan(pointsAlong(x1, y0 + coarse, x1, y1 - coarse, nSpanFine),
+        pointsAlong(x1 - coarse, y0 + coarse, x1 - coarse, y1 - coarse, nSpanCoarse))
+    end
+    local function corner(outer, x, y) fanPoint(outer, x, y) end
+    corner(pointsAlong(x0, y0 + coarse, x0, y0, nFine), x0 + coarse, y0 + coarse)
+    -- continue the L from the SW corner of the tile to the south inset
+    fanPoint(pointsAlong(x0, y0, x0 + coarse, y0, nFine), x0 + coarse, y0 + coarse)
+    fanPoint(pointsAlong(x1, y0 + coarse, x1, y0, nFine), x1 - coarse, y0 + coarse)
+    fanPoint(pointsAlong(x1, y0, x1 - coarse, y0, nFine), x1 - coarse, y0 + coarse)
+    fanPoint(pointsAlong(x0, y1 - coarse, x0, y1, nFine), x0 + coarse, y1 - coarse)
+    fanPoint(pointsAlong(x0, y1, x0 + coarse, y1, nFine), x0 + coarse, y1 - coarse)
+    fanPoint(pointsAlong(x1, y1 - coarse, x1, y1, nFine), x1 - coarse, y1 - coarse)
+    fanPoint(pointsAlong(x1, y1, x1 - coarse, y1, nFine), x1 - coarse, y1 - coarse)
+    -- Skirt only where the next sample really has no DEM. A shared tile edge whose
+    -- neighbour grid is loaded is left open; the skirt does not hide a wrong height.
+    local function skirtEdge(p, q, outwardX, outwardY)
+      local ux, uy = q[1] - p[1], q[2] - p[2]
+      if -uy * outwardX + ux * outwardY < 0 then p, q = q, p end
+      local drop = 24
+      local pb, qb = {p[1], p[2], p[3] - drop}, {q[1], q[2], q[3] - drop}
+      scene.triangle('ground', p, q, qb, false)
+      scene.triangle('ground', p, qb, pb, false)
+    end
+    local n = math.floor(size / fine + .5)
+    local function gridZ(ix, iy) return heightAt(x0 + ix * fine, y0 + iy * fine) end
+    for iy = 0, n do
+      for ix = 0, n do
+        if ix < n then
+          local z0, z1 = gridZ(ix, iy), gridZ(ix + 1, iy)
+          if z0 and z1 then
+            local function side(dir)
+              local a, b = gridZ(ix, iy + dir), gridZ(ix + 1, iy + dir)
+              return a ~= nil and b ~= nil
+            end
+            local south, north = side(-1), side(1)
+            if south ~= north then
+              skirtEdge({x0 + ix * fine, y0 + iy * fine, z0}, {x0 + (ix + 1) * fine, y0 + iy * fine, z1},
+                0, south and 1 or -1)
+            end
+          end
+        end
+        if iy < n then
+          local z0, z1 = gridZ(ix, iy), gridZ(ix, iy + 1)
+          if z0 and z1 then
+            local function side(dir)
+              local a, b = gridZ(ix + dir, iy), gridZ(ix + dir, iy + 1)
+              return a ~= nil and b ~= nil
+            end
+            local west, east = side(-1), side(1)
+            if west ~= east then
+              skirtEdge({x0 + ix * fine, y0 + iy * fine, z0}, {x0 + ix * fine, y0 + (iy + 1) * fine, z1},
+                west and 1 or -1, 0)
+            end
+          end
+        end
+      end
+      if iy % 4 == 3 then pause() end
+    end
+  end
   mark('areas')
-  for _, building in ipairs(lists.buildings) do
+  for _, building in ipairs(decor and lists.buildings or NONE) do
     local rings, tags = building.rings or {}, building.tags or {}
     local exterior = cleanRing(rings[1])
     if #exterior >= 3 and ringsTouch(rings, rect) then
@@ -1566,7 +1819,7 @@ local function build(cells, i, j, options)
     end
     pause()
   end
-  for _, line in ipairs(options.far and {} or lists.lines) do
+  for _, line in ipairs(distant and NONE or lists.lines) do
     local points, tags = line.points or {}, line.tags or {}
     if line.kind == 'fence' then fence(line) end
     for index = 1, #points - 1 do
@@ -1592,7 +1845,7 @@ local function build(cells, i, j, options)
       shape = shape, decor = true, layer = 'scene', collision = 'None'}
   end
   mark('lines')
-  if not options.far then
+  if not distant then
     local occupied = {}
     for _, building in ipairs(lists.buildings) do
       if ringsTouch(building.rings, rect) then occupied[#occupied + 1] = {bounds = ringBounds(building.rings), rings = building.rings} end
@@ -1638,7 +1891,7 @@ local function build(cells, i, j, options)
       end
       if cars >= maxCars then break end
     end
-  else
+  elseif decor then
     -- A sparse, stable canopy keeps distant woodland readable without regenerating
     -- the dense near-tile lattice or adding detailed ground geometry.
     local planted = 0
@@ -1709,7 +1962,7 @@ local function build(cells, i, j, options)
     static('point_' .. tostring(point.id):gsub('[^%w_]', '_'), BUS_STOP, x, y, ground(x, y) + .25,
       math.atan2(fx, fy) + math.pi)
   end
-  for _, point in ipairs(options.far and {} or lists.points) do
+  for _, point in ipairs(distant and NONE or lists.points) do
     local p = point.pos
     if p and point.kind == 'stop' then
       shelter(point, p)
@@ -1719,7 +1972,7 @@ local function build(cells, i, j, options)
     end
     pause()
   end
-  if not options.far then
+  if not distant then
     local blockers = {}
     for _, building in ipairs(lists.buildings) do
       if ringsTouch(building.rings, rect) then blockers[#blockers + 1] = {rings = building.rings, bounds = ringBounds(building.rings)} end
@@ -1824,9 +2077,11 @@ local function build(cells, i, j, options)
   local roadManifest, sceneManifest = manifest(roads, 'road'), manifest(scene, 'scene')
   roadManifest.spawn = bestSpawn or {pos = {target[1], target[2], ground(target[1], target[2]) + ROAD_LIFT}, yaw = 0}
   roadManifest.drivable = bestSpawn ~= nil
-  if options.far then
-    sceneManifest.layer = 'far'
-    for _, item in ipairs(sceneManifest.items) do item.decor, item.layer = true, 'far' end
+  if distant then
+    sceneManifest.layer = layerName
+    for _, item in ipairs(sceneManifest.items) do
+      item.decor, item.layer, item.collision = true, layerName, 'None'
+    end
     return roadManifest, manifest({used = {}, items = {}}, 'scene'), sceneManifest, nav
   end
   return roadManifest, sceneManifest, nil, nav

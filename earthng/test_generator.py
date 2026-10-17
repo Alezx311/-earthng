@@ -419,6 +419,107 @@ class GeneratorTests(unittest.TestCase):
         _, scene, *_ = self.build([cell([20, 20, 20, 20])])  # no seaLevel (v1 data): no sea
         self.assertEqual(list(self.triangles(scene, 'e2rf_water')), [])
 
+    def corners(self, manifest, material=None):
+        found = []
+        for item, mesh in self.meshes(manifest, material):
+            for k in range(1, len(mesh.faces) + 1, 3):
+                for index in range(k, k + 3):
+                    face = mesh.faces[index]
+                    p = mesh.verts[face.v + 1]
+                    n = mesh.normals[face.n + 1]
+                    found.append((p.x + item.pos[1], p.y + item.pos[2], p.z + item.pos[3], n.x, n.y, n.z))
+        return found
+
+    def border(self, manifest, x, material='e2rf_ground', surface=False):
+        pts = {}
+        for px, py, pz, nx, ny, nz in self.corners(manifest, material):
+            # A skirt shares the data-edge XY and would hide the surface sample.
+            if abs(px - x) < 1e-5 and not (surface and abs(nz) < 0.05):
+                pts[round(py, 3)] = (round(pz, 4), round(nx, 4), round(ny, 4), round(nz, 4))
+        return pts
+
+    def test_far_ground_keeps_a_hill_and_a_valley(self):
+        def cell(heights):
+            return {'terrain': {'rect': [0, 0, 1000, 1000], 'nx': 5, 'ny': 5, 'heights': heights}}
+        hill = [20.0] * 25
+        hill[6] = 400  # grid point (250 m, 250 m)
+        road, scene, far, nav = self.build([cell(hill)], far=True)
+        self.assertEqual((len(road['items']), len(scene['items']), len(nav.segments)), (0, 0, 0))
+        self.assertEqual(far.layer, 'far')
+        ground = list(self.triangles(far, 'e2rf_ground'))
+        self.assertAlmostEqual(sum(map(area, ground)), 500 * 500, delta=1)
+        # (0, 0) is a border vertex. (200, 200) is a coarse vertex on the slope up to the peak.
+        self.assertAlmostEqual(self.surface_at(ground, 0, 0), 19.75, places=2)
+        self.assertAlmostEqual(self.surface_at(ground, 200, 200), 262.95, places=2)
+        self.assertGreater(self.surface_at(ground, 250, 250), 200)
+        valley = [80.0] * 25
+        valley[6] = 5
+        low = list(self.triangles(self.build([cell(valley)], far=True)[2], 'e2rf_ground'))
+        self.assertLess(self.surface_at(low, 200, 200), self.surface_at(low, 0, 0))
+
+    def test_far_ridge_normals_tilt_away_from_the_crest(self):
+        heights = [300.0 if ix == 1 else 20.0 for iy in range(5) for ix in range(5)]
+        cell = {'terrain': {'rect': [0, 0, 1000, 1000], 'nx': 5, 'ny': 5, 'heights': heights}}
+        far = self.build([cell], far=True)[2]
+        left = [n for x, y, z, *n in self.corners(far, 'e2rf_ground') if abs(x - 200) < 1e-4 and abs(y - 200) < 1e-4]
+        right = [n for x, y, z, *n in self.corners(far, 'e2rf_ground') if abs(x - 300) < 1e-4 and abs(y - 200) < 1e-4]
+        self.assertTrue(left and right)
+        self.assertLess(left[0][0], 0)
+        self.assertGreater(right[0][0], 0)
+
+    def test_near_and_far_share_ground_on_a_sloping_road(self):
+        heights = [20.0 + ix * 20 for iy in range(5) for ix in range(5)]
+        cell = {'roads': [{'id': 'road', 'nodes': [1, 2], 'width': 10,
+                           'tags': {'highway': 'residential', 'sidewalk': 'no'},
+                           'points': [[0, 250, 10], [1000, 250, 30]]}],
+                'terrain': {'rect': [0, 0, 1000, 1000], 'nx': 5, 'ny': 5, 'heights': heights}}
+        near = self.border(self.build([cell], i=0)[0], 500, surface=True)
+        far = self.border(self.build([cell], i=1, far=True)[2], 500, surface=True)
+        self.assertTrue(near and far)
+        self.assertEqual(near, far)
+        # x = 500 is DEM column 60 m. Away from the road the surface is that minus groundDrop.
+        self.assertAlmostEqual(near[0][0], 59.75, places=2)
+        self.assertNotAlmostEqual(near[250][0], near[0][0], places=2)
+
+    def test_negative_tiles_share_the_ground_edge(self):
+        cell = {'terrain': {'rect': [-1000, -1000, 0, 0], 'nx': 2, 'ny': 2, 'heights': [10, 40, 10, 40]}}
+        left = self.border(self.build([cell], i=-2, j=-1, far=True)[2], -500)
+        right = self.border(self.build([cell], i=-1, j=-1, far=True)[2], -500)
+        self.assertTrue(left)
+        self.assertEqual(left, right)
+
+    def test_shared_dem_edge_does_not_depend_on_cell_order(self):
+        low = {'terrain': {'rect': [0, 0, 500, 500], 'nx': 2, 'ny': 2, 'heights': [10, 10, 10, 10]}}
+        high = {'terrain': {'rect': [500, 0, 1000, 500], 'nx': 2, 'ny': 2, 'heights': [80, 80, 80, 80]}}
+        for cells in ([low, high], [high, low]):
+            ground = list(self.triangles(self.build(cells, far=True)[2], 'e2rf_ground'))
+            self.assertAlmostEqual(self.surface_at(ground, 500, 250), 9.75, places=2)
+
+    def test_missing_dem_is_omitted_instead_of_a_zero_cliff(self):
+        cell = {'terrain': {'rect': [0, 0, 400, 500], 'nx': 2, 'ny': 2, 'heights': [50, 50, 50, 50]}}
+        far = self.build([cell], far=True)[2]
+        verts = self.corners(far, 'e2rf_ground')
+        self.assertTrue(all(v[0] <= 400 + 1e-4 for v in verts))
+        self.assertTrue(all(abs(v[2]) > 1 for v in verts))
+        dropped = [v for v in verts if v[2] < 40]
+        self.assertTrue(dropped)
+        for x, y, z, *_ in dropped:
+            self.assertTrue(abs(x) < 1e-3 or abs(x - 400) < 1e-3 or abs(y) < 1e-3 or abs(y - 500) < 1e-3)
+
+    def test_horizon_mesh_is_ground_without_buildings_or_trees(self):
+        source = [{'buildings': [{'id': 'a', 'height': 30,
+                                  'rings': [[[100, 100], [140, 100], [140, 140], [100, 140]]]}],
+                   'areas': [{'id': 'wood', 'kind': 'forest',
+                              'rings': [[[0, 0], [500, 0], [500, 500], [0, 500]]]}],
+                   'terrain': {'rect': [0, 0, 1000, 1000], 'nx': 2, 'ny': 2, 'heights': [40, 40, 40, 40]}}]
+        road, scene, horizon, nav = self.build(source, horizon=True)
+        self.assertEqual(horizon.layer, 'horizon')
+        self.assertEqual((len(road['items']), len(scene['items']), len(nav.segments)), (0, 0, 0))
+        self.assertTrue(list(self.triangles(horizon, 'e2rf_ground')))
+        self.assertFalse(any(item.kind == 'static' for item in horizon['items'].values()))
+        self.assertTrue(all(item.layer == 'horizon' and item.collision == 'None'
+                            for item in horizon['items'].values()))
+
     def test_far_woodland_has_sparse_decorative_canopy(self):
         source = [{'areas': [{'id': 'wood', 'kind': 'forest',
                               'rings': [[[0, 0], [500, 0], [500, 500], [0, 500]]]}]}]

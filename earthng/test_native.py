@@ -106,7 +106,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(job.seq, 7)
         self.assertEqual(job.country, 'demo')
         self.assertEqual(job.manifest.spawn.yaw, 0)
-        self.assertEqual(job.horizonZ, -35)
+        self.assertIsNone(job.horizonZ)
+        self.assertTrue(job.horizonDem)
         self.assertGreaterEqual(mod.status().stream.readyCount, 9)
         key = f'{job.tile[1]}_{job.tile[2]}'
         self.assertEqual(mod.manifest(key, 'road').materials, '/earthng/planet/materials.json')
@@ -479,6 +480,50 @@ class NativeV2Tests(NativeTests.__base__):
                 want = geographic(*expected)
                 self.assertAlmostEqual(landing.lat, want[0])
                 self.assertAlmostEqual(landing.lon, want[1])
+
+    def test_fast_driving_still_wants_far_ground_and_the_horizon(self):
+        _, mod, cv = self.make(fixture(8))
+        lat, lon = geographic(3500, 3500)
+        mod.land(cv(dict(seq=11, lat=lat, lon=lon)))
+        self.assertEqual(self.pump(mod).state, 'ready')
+        # 40 m/s is past the 90 km/h decor gate. Far ground and the horizon stay wanted.
+        mod.pose(cv(dict(x=3500, y=3500, vx=40, vy=0, state='driving')))
+        mod.update(.016, 2)
+        far = horizon = 0
+        wanted = mod.status().stream.wanted
+        for key in wanted.keys():
+            priority = wanted[key]
+            if str(key).startswith('h'):
+                horizon += 1
+                self.assertGreaterEqual(priority, 2_000_000)
+            elif priority >= 1_000_000:
+                far += 1
+        self.assertGreater(far, 0)
+        self.assertGreater(horizon, 0)
+
+    def test_coarse_horizon_stays_until_its_children_are_ready(self):
+        _, mod, cv = self.make()
+
+        def rect(x, y, size):
+            return [x, y, x + size, y + size]
+
+        parent = dict(key='parent', rank=1, rect=rect(0, 0, 1000))
+        children = [dict(key=f'c{n}', rank=0, rect=rect(x, y, 500))
+                    for n, (x, y) in enumerate(((0, 0), (500, 0), (0, 500), (500, 500)))]
+
+        def show(ready_keys):
+            ready = {key: True for key in ready_keys}
+            table = mod.horizonShow(cv([parent, *children]), cv(ready))
+            return {table[i] for i in range(1, len(table) + 1)}
+
+        self.assertEqual(show(['parent', 'c0', 'c1', 'c2']), {'parent'})
+        self.assertEqual(show(['parent', 'c0', 'c1', 'c2', 'c3']), {'c0', 'c1', 'c2', 'c3'})
+        # A shared edge is not an overlap, so this neighbour is not one of the parent's children.
+        neighbour = dict(key='edge', rank=0, rect=rect(1000, 0, 500))
+        table = mod.horizonShow(cv([parent, neighbour]), cv(dict(parent=True, edge=True)))
+        self.assertEqual({table[i] for i in range(1, len(table) + 1)}, {'parent', 'edge'})
+        alone = mod.horizonShow(cv([dict(key='solo', rank=0, rect=rect(2000, 0, 500))]), cv(dict(solo=True)))
+        self.assertEqual([alone[i] for i in range(1, len(alone) + 1)], ['solo'])
 
 
 if __name__ == '__main__':
