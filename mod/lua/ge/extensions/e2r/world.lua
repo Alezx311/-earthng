@@ -100,12 +100,6 @@ local PRESETS = {
   {'Transfagarasan', 45.6030, 24.6170, 'romania'}, {'Bran Castle', 45.5150, 25.3672, 'romania'},
   {'Tulcea', 45.1790, 28.8050, 'romania'},
 }
--- Kyiv, its oblast, the country (two rows), California (two rows), the UK (a row per region), New York
--- (two rows), Zanzibar (Unguja, Pemba), Romania (two rows)
-local PRESET_ROWS = {[7] = true, [12] = true, [19] = true, [26] = true, [32] = true, [38] = true, [46] = true,
-  [53] = true, [61] = true, [67] = true, [73] = true, [78] = true, [84] = true, [90] = true,
-  [96] = true, [103] = true, [110] = true, [116] = true, [119] = true, [126] = true}
-
 local S = {
   widgetHidden = false, pickerOpen = false,
   state = 'off', center = {lat = 50.4501, lon = 30.5234}, zoom = 11, marker = nil,
@@ -194,7 +188,10 @@ local function readStatus()
   end
   -- the map opens over the package's own land (the default centre is Kyiv)
   local box = S.status and S.status.packageBox
-  if box and not S.centredOnPackage then
+  if box and not S.centredOnPackage and NATIVE then
+    -- every installed pack in view; the picker fits the box once it knows its map size
+    S.centredOnPackage, S.fitAll = true, true
+  elseif box and not S.centredOnPackage then
     S.centredOnPackage = true
     if not presetInPackage({'', S.center.lat, S.center.lon}) then
       S.center, S.viewDirty = {lat = (box[2] + box[4]) / 2, lon = (box[1] + box[3]) / 2}, true
@@ -594,8 +591,14 @@ local function navBuild()
       for k = 1, n do
         local o = 8 + 3 * (k - 1)
         local id = k == 1 and ('e2r_n' .. tostring(a)) or k == n and ('e2r_n' .. tostring(b)) or ('e2r_s' .. sid .. '_' .. k)
+        -- never a self-link or a zero-length edge: the game's random route walk (graphpath
+        -- getRandomPathG, traffic respawns) adds edge lengths and froze on a piece of graph without
+        -- any. An inner knot on top of the last one is skipped; an end node always stays.
+        local pp = prev and nodes[prev].pos
+        local same = pp and (prev == id or (pp.x - s[o]) ^ 2 + (pp.y - s[o + 1]) ^ 2 < 1e-4)
+        if same and k < n then goto knot end
         node(id, s[o], s[o + 1], s[o + 2], radius)
-        if prev then
+        if prev and not same then
           local data = {drivability = drive, oneWay = oneWay, lanes = lanes, speedLimit = speed,
                         inNode = prev, outNode = id, inPos = nodes[prev].pos, outPos = nodes[id].pos,
                         inRadius = nodes[prev].radius, outRadius = nodes[id].radius}
@@ -603,6 +606,7 @@ local function navBuild()
           nodes[id].links[prev] = data
         end
         prev = id
+        ::knot::
       end
       segs = segs + 1
     end
@@ -696,6 +700,9 @@ local function updateTiles()
   if not p then return end
   local fast = st.generator ~= nil
   local loadR = fast and (st.loadRadius or 1000) or LOAD_R
+  -- the descent needs every tile within 500 m of the spawn (tick): a corner tile's centre is up to
+  -- ~1060 m away, beyond the 1 km radius, and was never loaded (native-hops-02, landing hung)
+  if S.state ~= 'driving' then loadR = math.max(loadR, 500 * math.sqrt(2) + S.stream.tile * 0.71) end
   local unloadR = fast and loadR + 350 or UNLOAD_R
   -- fast, at speed: tiles well behind the car are neither kept nor loaded (the static collision
   -- costs ~7.5 ms per MB of loaded world at every rebuild); a U-turn loads them back from disk
@@ -885,6 +892,10 @@ local function updateCollision()
   local p, v = focus()
   local fast = S.stream and S.stream.generator
   local radius = fast and math.max(750, (v and v:length() or 0) * ((S.deliveryP99 or 2) + 4) + 354) or COLLISION_R
+  -- the descent waits for collision on every tile within 500 m of the spawn (tick): a corner
+  -- tile's centre is up to ~1060 m away, and when such a tile came in last nothing else asked for
+  -- a rebuild and the landing waited forever (native-perf-10)
+  if S.state ~= 'driving' then radius = math.max(radius, 500 * math.sqrt(2) + S.stream.tile * 0.71) end
   local near = S.removedCollision or false
   for _, tile in pairs(S.tiles) do
     if tile.state == 'loaded' and not tile.collided and not (tile.manifest.empty or #tile.manifest.items == 0) then
@@ -924,12 +935,12 @@ end
 -- Button names come from here first (the labels in packs.json are escaped JSON strings); a pack
 -- the table does not know shows its packs.json label or its id.
 local PACK_LABELS = LANG == 'en' and
-  {real = 'Realistic', toon = 'Cartoon', model = 'Mock-up', synth = 'Synthwave',
+  {real = 'Realistic', toon = 'Cartoon', model = 'Mock-up', synth = 'Synthwave', pixel = 'Retro City',
    night = 'Night', rain = 'Rain', cyber = 'Cyberpunk', winter = 'Winter', autumn = 'Autumn'} or
-  {real = 'Реальний', toon = 'Мультяшний', model = 'Макет', synth = 'Синтвейв',
+  {real = 'Реальний', toon = 'Мультяшний', model = 'Макет', synth = 'Синтвейв', pixel = 'Ретро-місто',
    night = 'Ніч', rain = 'Дощ', cyber = 'Кіберпанк', winter = 'Зима', autumn = 'Осінь'}
 local PACK_NAMES = {}
-for _, name in ipairs({'real', 'toon', 'model', 'synth', 'night', 'rain', 'cyber', 'winter', 'autumn'}) do
+for _, name in ipairs({'real', 'toon', 'model', 'synth', 'pixel', 'night', 'rain', 'cyber', 'winter', 'autumn'}) do
   table.insert(PACK_NAMES, {name, PACK_LABELS[name]})
 end
 
@@ -1036,10 +1047,74 @@ local function showSun(cfg)
   placeSun()
 end
 
+local function restoreSkyDriver()
+  local c = core_celestial
+  if S.skyDriverOwned and c and c.getDriver and c.setDriver then
+    -- Do not remove a driver installed by somebody else after ours.
+    if c.getDriver() == S.skyDriver then c.setDriver(S.skyDriverOrig) end
+  end
+  S.skyDriverOwned, S.skyDriver, S.skyDriverOrig = nil, nil, nil
+end
+
+local function applySkyDriver(env)
+  local c = core_celestial
+  if not (c and c.getDriver and c.setDriver) then return end -- older BeamNG
+  if not env.authoredSun then restoreSkyDriver(); return end
+  if not S.skyDriverOwned then
+    S.skyDriverOrig, S.skyDriverOwned = c.getDriver(), true
+  end
+  local sun = env.objects.sunsky
+  local az, el = tonumber(sun.azimuth), tonumber(sun.elevation)
+  local previous = S.skyDriverOrig
+  S.skyDriver = function(ctx)
+    if previous then previous(ctx) end
+    ctx.sunAz, ctx.sunEl = az, el
+  end
+  c.setDriver(S.skyDriver)
+end
+
+local function applyExposure(env)
+  local lx = scenetree.findObject('PostEffectLocalExposureObject')
+  if not lx then
+    S.exposurePending = env
+    S.exposureRetryAt = S.now + 0.5
+    return
+  end
+  S.exposurePending = nil
+  if S.exposureOrig == nil then S.exposureOrig = {lx.autoExposure, lx.manualEV} end
+  if env.exposure ~= nil and env.exposure ~= false then
+    lx.autoExposure, lx.manualEV = false, env.exposure
+  else
+    lx.autoExposure, lx.manualEV = S.exposureOrig[1], S.exposureOrig[2]
+  end
+  result.exposure = {tostring(S.exposureOrig[1]), S.exposureOrig[2], tostring(lx.autoExposure), lx.manualEV}
+end
+
 local function applyEnvObjects(env)
+  -- Capture the original exposure before sky postApply can change its state.
+  applyExposure(env)
+  S.envOrig = S.envOrig or {}
+  for name, fields in pairs(S.envOrig) do
+    if not (env.objects and env.objects[name]) then
+      local obj = scenetree.findObject(name)
+      if obj then
+        for field, value in pairs(fields) do obj:setField(field, 0, value) end
+        pcall(function() obj:postApply() end)
+      end
+    end
+  end
   for objName, fields in pairs(env.objects or {}) do
     local obj = scenetree.findObject(objName)
     if obj then
+      local orig = S.envOrig[objName] or {}
+      S.envOrig[objName] = orig
+      for field in pairs(fields) do
+        if orig[field] == nil then orig[field] = obj:getField(field, 0) end
+      end
+      -- A partial preset (e.g. synth) must not inherit clouds or night fields.
+      for field, value in pairs(orig) do
+        if fields[field] == nil then obj:setField(field, 0, value) end
+      end
       -- in a fixed order and twice: the night cubemap took (or not) depending on the order
       -- pairs() gave nightCubemap and useNightCubemap (vis-packs-10 dark, -11 dusk, same values)
       local keys = {}
@@ -1055,9 +1130,19 @@ local function applyEnvObjects(env)
       result.envMissing = objName
     end
   end
+  applyExposure(env)
+  if test then
+    result.environmentSamples = result.environmentSamples or {}
+    local road = scenetree.findObject('e2rf_road')
+    local sky = scenetree.findObject('sunsky')
+    table.insert(result.environmentSamples, {at = S.now, pack = S.pack,
+      exposure = result.exposure, elevation = sky and sky:getField('elevation', 0),
+      roadEmission = road and road:getField('emissiveFactor', 0)})
+  end
 end
 
 local function envAgainStep()
+  if S.exposurePending and S.now >= S.exposureRetryAt then applyExposure(S.exposurePending) end
   local e = S.envAgain
   if not e or S.now < e.at[1] then return end
   table.remove(e.at, 1)
@@ -1089,6 +1174,8 @@ end
 local function applyPack(name)
   local pack = S.packs and S.packs[name]
   if not pack then return end
+  S.pack = name
+  S.envAgain, S.exposurePending = nil, nil
   local timer = hptimer()
   -- a field the previous pack set and this one does not goes back to the material's own value
   -- (noted the first time a pack changed it): roughness of wet roads, hidden leaves, tints
@@ -1123,31 +1210,29 @@ local function applyPack(name)
     end
   end
   -- reloaded a few a frame (reloadStep): ~80 in one frame stalled it for 0.5-1 s
+  -- A second click can arrive before the first queue drains. Even a material
+  -- whose final fields already match still needs its pending GPU reload.
+  local pending, queued = S.reloadQueue or {}, {}
   S.reloadQueue = {}
-  for _, mat in pairs(dirty) do table.insert(S.reloadQueue, mat) end
+  for _, mat in ipairs(pending) do
+    if not queued[mat] then table.insert(S.reloadQueue, mat); queued[mat] = true end
+  end
+  for _, mat in pairs(dirty) do
+    if not queued[mat] then table.insert(S.reloadQueue, mat); queued[mat] = true end
+  end
   result.packReloads = #S.reloadQueue
   S.packSet = pack
   local tMats = timer:stop()
   -- sky, fog and the sun of the pack
   local env = S.packEnv and S.packEnv[name]
   if env then
+    applySkyDriver(env)
     applyEnvObjects(env)
     -- again a little later: the sky's lighting is captured some frame after a change, and a
     -- capture during the switch left the same night lit like dusk in some runs (vis-packs-11, -13)
     S.envAgain = {env = env, at = {S.now + 0.7, S.now + 2.0, S.now + 4.0}}
     showSun(env.sun ~= false and env.sun or nil)
     showLights(env.lights ~= false and env.lights or nil)
-    -- a night is a night only with a fixed exposure: the automatic one brightens it back to dusk
-    local lx = scenetree.findObject('PostEffectLocalExposureObject')
-    if lx then
-      if S.exposureOrig == nil then S.exposureOrig = {lx.autoExposure, lx.manualEV} end
-      if env.exposure then
-        lx.autoExposure, lx.manualEV = false, env.exposure
-      else
-        lx.autoExposure, lx.manualEV = S.exposureOrig[1], S.exposureOrig[2]
-      end
-      result.exposure = {tostring(S.exposureOrig[1]), S.exposureOrig[2], tostring(lx.autoExposure), lx.manualEV}
-    end
     showPrecip(env.precip ~= false and env.precip or nil)
   end
   S.pack = name
@@ -1463,6 +1548,27 @@ local function worldToGeo(x, y)
   return g[4] + g[7] * dx + g[8] * dy, g[3] + g[5] * dx + g[6] * dy
 end
 
+-- A tile's navigation lanes in lat/lon with their bounds ({south, west, north, east}), once per
+-- manifest: the minimap culls them by the view instead of projecting every point every frame.
+local navLineCache = setmetatable({}, {__mode = 'k'})
+local function navLines(manifest)
+  local hit = navLineCache[manifest]
+  if hit then return hit end
+  local lines = {}
+  if not (S.status and S.status.stream and S.status.stream.geo) then return lines end
+  for _, segment in ipairs(manifest.navSegments or {}) do
+    local geo, s, w, n, e = {}, math.huge, math.huge, -math.huge, -math.huge
+    for k = 8, #segment, 3 do
+      local lat, lon = worldToGeo(segment[k], segment[k + 1])
+      geo[#geo + 1], geo[#geo + 2] = lat, lon
+      s, w, n, e = math.min(s, lat), math.min(w, lon), math.max(n, lat), math.max(e, lon)
+    end
+    if #geo >= 4 then lines[#lines + 1] = {id = segment[1], geo = geo, box = {s, w, n, e}} end
+  end
+  navLineCache[manifest] = lines
+  return lines
+end
+
 -- the car on the map: lat, lon of it and of a point 30 m ahead
 local function carOnMap()
   if S.state ~= 'driving' or not S.stream then return nil end
@@ -1490,6 +1596,128 @@ local function loadCoverage()
   end
 end
 
+-- The landing zones as non-overlapping rectangles. Pack coverage boxes are the geographic bounds
+-- of projected cells, so neighbours overlap and a translucent fill drew darker stripes where they
+-- did. Edges snap to a 0.005 degree grid, each band between edges gets the union of its boxes,
+-- and equal neighbouring bands join. Done once per status (the boxes table changes on refresh).
+local SNAP = 0.005
+local mergedFrom, merged = nil, {}
+local function mergedCoverage(boxes)
+  if boxes == mergedFrom then return merged end
+  mergedFrom, merged = boxes, {}
+  if not boxes or #boxes == 0 then return merged end
+  -- outwards: neighbouring cells of a tilted grid leave hairline gaps between their boxes
+  local bands, keys = {}, {}
+  for _, c in ipairs(boxes) do
+    local w, s = math.floor(c[1] / SNAP), math.floor(c[2] / SNAP)
+    local e, n = math.ceil(c[3] / SNAP), math.ceil(c[4] / SNAP)
+    if e > w and n > s then
+      for y = s, n - 1 do
+        local band = bands[y]
+        if not band then band = {}; bands[y] = band; keys[#keys + 1] = y end
+        band[#band + 1] = {w, e}
+      end
+    end
+  end
+  table.sort(keys)
+  local open = {}   -- intervals of the band above, 'w:e' -> its rectangle
+  for _, y in ipairs(keys) do
+    local band = bands[y]
+    table.sort(band, function(a, b) return a[1] < b[1] end)
+    local runs, cur = {}, nil
+    for _, iv in ipairs(band) do
+      if cur and iv[1] <= cur[2] then cur[2] = math.max(cur[2], iv[2])
+      else cur = {iv[1], iv[2]}; runs[#runs + 1] = cur end
+    end
+    local now = {}
+    for _, r in ipairs(runs) do
+      local key = r[1] .. ':' .. r[2]
+      local rect = open[key]
+      if rect and rect[4] == y * SNAP then rect[4] = (y + 1) * SNAP
+      else
+        rect = {r[1] * SNAP, y * SNAP, r[2] * SNAP, (y + 1) * SNAP}
+        merged[#merged + 1] = rect
+      end
+      now[key] = rect
+    end
+    open = now
+  end
+  return merged
+end
+
+-- Per country: its zone's bounds and the PRESETS inside it, once per status (native.at per
+-- preset and frame cost ~120 lookups a frame).
+local packsFrom, packs = nil, {}
+local function packInfo()
+  local status = S.status
+  if status == packsFrom and status and status.countries == packs.countries then return packs end
+  packsFrom, packs = status, {countries = status and status.countries, byId = {}}
+  for _, region in ipairs(status and status.regions or {}) do
+    local p = packs.byId[region.country] or {regions = 0, presets = {}}
+    packs.byId[region.country] = p
+    p.regions = p.regions + 1
+    for _, c in ipairs(region.coverage or {}) do
+      p.box = p.box and {math.min(p.box[1], c[1]), math.min(p.box[2], c[2]), math.max(p.box[3], c[3]), math.max(p.box[4], c[4])}
+        or {c[1], c[2], c[3], c[4]}
+    end
+  end
+  if NATIVE then
+    for _, preset in ipairs(PRESETS) do
+      local country = native.at(preset[2], preset[3])
+      local p = country and packs.byId[country.id]
+      if p then p.presets[#p.presets + 1] = preset end
+    end
+  end
+  return packs
+end
+
+-- the zoom that shows a {w, s, e, n} box in a width x height map
+local function fitZoom(box, width, height)
+  local x0, y0 = merc(box[4], box[1], 0)
+  local x1, y1 = merc(box[2], box[3], 0)
+  local zx = math.log(width * 0.85 / math.max(1e-9, x1 - x0)) / math.log(2)
+  local zy = math.log(height * 0.85 / math.max(1e-9, y1 - y0)) / math.log(2)
+  return math.max(3, math.min(13, math.floor(math.min(zx, zy))))
+end
+
+local function flyToPack(country, width, height)
+  local p = packInfo().byId[country.id]
+  S.selectedPack = country.id
+  if p and p.box then
+    S.center = {lat = (p.box[2] + p.box[4]) / 2, lon = (p.box[1] + p.box[3]) / 2}
+    S.zoom = fitZoom(p.box, width or S.mapW or W, height or S.mapH or H)
+  elseif country.landing then
+    S.center, S.zoom = {lat = country.landing.lat, lon = country.landing.lon}, 9
+  end
+  if country.landing then setMarker(country.landing.lat, country.landing.lon) end
+end
+
+-- a round button drawn on the map (imgui items over the map's InvisibleButton never get the
+-- hover); returns hovered, clicked
+local function mapButton(dl, x, y, size, label, mouse, clicked)
+  local hover = mouse.x >= x and mouse.x <= x + size and mouse.y >= y and mouse.y <= y + size
+  im.ImDrawList_AddRectFilled(dl, im.ImVec2(x, y), im.ImVec2(x + size, y + size), hover and col(0.93, 0.95, 0.97) or col(1, 1, 1), 5)
+  im.ImDrawList_AddRect(dl, im.ImVec2(x, y), im.ImVec2(x + size, y + size), col(0, 0, 0, 0.25), 5, 0, 1)
+  local t = im.CalcTextSize(label)
+  im.ImDrawList_AddText1(dl, im.ImVec2(x + (size - t.x) / 2, y + (size - t.y) / 2), col(0.2, 0.2, 0.22), label)
+  return hover, hover and clicked
+end
+
+-- metres per pixel at a latitude -> a 1/2/5 x 10^k bar up to ~110 px
+local function drawScale(dl, x, y, lat, z)
+  local mpp = 156543.03392 * math.cos(math.rad(lat)) / 2 ^ z
+  local metres = mpp * 110
+  local p = 10 ^ math.floor(math.log10(metres))
+  local nice = metres / p >= 5 and 5 * p or metres / p >= 2 and 2 * p or p
+  local px = nice / mpp
+  local label = nice >= 1000 and string.format('%g %s', nice / 1000, L('км', 'km')) or string.format('%g %s', nice, L('м', 'm'))
+  im.ImDrawList_AddRectFilled(dl, im.ImVec2(x - 4, y - 18), im.ImVec2(x + px + 4, y + 4), col(1, 1, 1, 0.75), 3)
+  im.ImDrawList_AddLine(dl, im.ImVec2(x, y), im.ImVec2(x + px, y), col(0.2, 0.2, 0.22), 2)
+  im.ImDrawList_AddLine(dl, im.ImVec2(x, y), im.ImVec2(x, y - 5), col(0.2, 0.2, 0.22), 2)
+  im.ImDrawList_AddLine(dl, im.ImVec2(x + px, y), im.ImVec2(x + px, y - 5), col(0.2, 0.2, 0.22), 2)
+  im.ImDrawList_AddText1(dl, im.ImVec2(x + 2, y - 17), col(0.2, 0.2, 0.22), label)
+end
+
 -- view: {center = {lat, lon}, zoom, follow}; pick: a click sets the landing marker
 local function drawMap(width, height, view, pick)
   width, height = width or W, height or H
@@ -1502,6 +1730,9 @@ local function drawMap(width, height, view, pick)
   local r0 = im.GetItemRectMin()
   local r1 = im.ImVec2(r0.x + width, r0.y + height)
   local dl = im.GetWindowDrawList()
+  local mouse = im.GetMousePos()
+  local clicked = hovered and im.IsMouseClicked(0)
+  local onControl = false   -- the mouse is over something of the map's own (no pan, no marker)
   im.ImDrawList_PushClipRect(dl, r0, r1, true)
   im.ImDrawList_AddRectFilled(dl, r0, r1, col(0.67, 0.75, 0.8))
   local z = view.zoom
@@ -1512,71 +1743,166 @@ local function drawMap(width, height, view, pick)
     local x, y = merc(lat, lon, z)
     return r0.x + x - x0, r0.y + y - y0
   end
-  if NATIVE then planetMap.draw(im, dl, r0, width, height, view, merc, col) end
-  -- the wrapper's default tint (IM_COL32_WHITE) is not defined in the game: nil broke AddImage
-  local white = col(1, 1, 1)
+  local north, west = unmerc(x0, y0, z)
+  local south, east = unmerc(x0 + width, y0 + height, z)
   local missing = 0
-  for tx = math.floor(x0 / 256), math.floor((x0 + width) / 256) do
-    for ty = math.max(0, math.floor(y0 / 256)), math.min(n - 1, math.floor((y0 + height) / 256)) do
-      local sx, sy = r0.x + tx * 256 - x0, r0.y + ty * 256 - y0
-      local x = tx % n
-      local t = mapTile(z, x, ty, true)
-      if t then
-        im.ImDrawList_AddImage(dl, t.texId, im.ImVec2(sx, sy), im.ImVec2(sx + 256, sy + 256), im.ImVec2(0, 0), im.ImVec2(1, 1), white)
-      else
-        missing = missing + 1
-        for k = 1, math.min(6, z) do
-          local f = 2 ^ k
-          local a = mapTile(z - k, math.floor(x / f), math.floor(ty / f), false)
-          if a then
-            local u, v = (x % f) / f, (ty % f) / f
-            im.ImDrawList_AddImage(dl, a.texId, im.ImVec2(sx, sy), im.ImVec2(sx + 256, sy + 256),
-              im.ImVec2(u, v), im.ImVec2(u + 1 / f, v + 1 / f), white)
-            break
+  if NATIVE then
+    planetMap.draw(im, dl, r0, width, height, view, merc, unmerc, col)
+  else
+    -- the wrapper's default tint (IM_COL32_WHITE) is not defined in the game: nil broke AddImage
+    local white = col(1, 1, 1)
+    for tx = math.floor(x0 / 256), math.floor((x0 + width) / 256) do
+      for ty = math.max(0, math.floor(y0 / 256)), math.min(n - 1, math.floor((y0 + height) / 256)) do
+        local sx, sy = r0.x + tx * 256 - x0, r0.y + ty * 256 - y0
+        local x = tx % n
+        local t = mapTile(z, x, ty, true)
+        if t then
+          im.ImDrawList_AddImage(dl, t.texId, im.ImVec2(sx, sy), im.ImVec2(sx + 256, sy + 256), im.ImVec2(0, 0), im.ImVec2(1, 1), white)
+        else
+          missing = missing + 1
+          for k = 1, math.min(6, z) do
+            local f = 2 ^ k
+            local a = mapTile(z - k, math.floor(x / f), math.floor(ty / f), false)
+            if a then
+              local u, v = (x % f) / f, (ty % f) / f
+              im.ImDrawList_AddImage(dl, a.texId, im.ImVec2(sx, sy), im.ImVec2(sx + 256, sy + 256),
+                im.ImVec2(u, v), im.ImVec2(u + 1 / f, v + 1 / f), white)
+              break
+            end
           end
         end
       end
     end
-  end
-  if #mapWant > 0 then
-    request({type = 'maptiles', tiles = mapWant})
-    mapWant = {}
-  end
-  -- where a landing works
-  loadCoverage()
-  local green = col(0.16, 0.67, 0.31, 0.15)
-  for _, c in ipairs(S.coverage or {}) do
-    local ax, ay = screen(c[4], c[1])
-    local bx, by = screen(c[2], c[3])
-    if bx >= r0.x and by >= r0.y and ax <= r1.x and ay <= r1.y then
-      im.ImDrawList_AddRectFilled(dl, im.ImVec2(ax, ay), im.ImVec2(bx, by), green)
+    if #mapWant > 0 then
+      request({type = 'maptiles', tiles = mapWant})
+      mapWant = {}
     end
   end
-  if NATIVE and S.stream then
-    local seen = {}
-    for _, tile in pairs(S.tiles) do
-      for _, segment in ipairs(tile.manifest.navSegments or {}) do
-        if not seen[segment[1]] then
-          seen[segment[1]] = true
-          local previous
-          for k = 8, #segment, 3 do
-            local lat, lon = worldToGeo(segment[k], segment[k + 1])
-            if lat then
-              local x, y = screen(lat, lon)
-              if previous then
-                im.ImDrawList_AddLine(dl, im.ImVec2(previous[1], previous[2]), im.ImVec2(x, y), col(0.4, 0.43, 0.45), 2)
-              end
-              previous = {x, y}
+  -- where a landing works: one even tint (pick only; the minimap stays clean)
+  loadCoverage()
+  if pick or not NATIVE then
+    local green = col(0.12, 0.62, 0.28, 0.2)
+    for _, c in ipairs(mergedCoverage(S.coverage)) do
+      if c[3] >= west and c[1] <= east and c[4] >= south and c[2] <= north then
+        -- whole pixels: neighbours share an edge exactly, no lighter seam between them
+        local ax, ay = screen(c[4], c[1])
+        local bx, by = screen(c[2], c[3])
+        ax, ay, bx, by = math.floor(ax + 0.5), math.floor(ay + 0.5), math.floor(bx + 0.5), math.floor(by + 0.5)
+        if bx > ax and by > ay then
+          im.ImDrawList_AddRectFilled(dl, im.ImVec2(ax, ay), im.ImVec2(bx, by), green)
+        end
+      end
+    end
+  end
+  -- streets of the installed country packs on the landing picker (no map download), OSM-like:
+  -- main roads from z11 (wider views take more than MAP_BLOCKS 8 km blocks), the rest closer;
+  -- while driving the minimap keeps to the loaded tiles' lanes below, every line costs a draw call
+  if NATIVE and pick and z >= 11 then
+    local maxRank = z >= 15 and 3 or z >= 13 and 2 or 1
+    local casing, major, minor = col(0.75, 0.6, 0.35), col(0.99, 0.84, 0.55), col(1, 1, 1)
+    local widthMajor = z >= 13 and 4 or 3
+    for _, lines in ipairs(native.mapRoads({w = west, s = south, e = east, n = north}, 3)) do
+      for pass = 1, 2 do
+        for _, line in ipairs(lines) do
+          local b = line.box
+          if line.rank <= maxRank and (pass == 2 or line.rank == 1) and b[1] <= north and b[3] >= south and b[2] <= east and b[4] >= west then
+            local g, px, py = line.geo, nil, nil
+            local c, w = line.rank == 1 and major or minor, line.rank == 1 and widthMajor or (z >= 14 and 2.5 or 1.5)
+            if pass == 1 then c, w = casing, widthMajor + 1.5 end
+            for k = 1, #g - 1, 2 do
+              local x, y = screen(g[k], g[k + 1])
+              if px then im.ImDrawList_AddLine(dl, im.ImVec2(px, py), im.ImVec2(x, y), c, w) end
+              px, py = x, y
             end
           end
         end
       end
     end
   end
+  if NATIVE and S.stream then
+    -- the loaded tiles' lanes: projected once per manifest, drawn only where the view is (all of
+    -- them every frame, unculled, took 11 ms and 1 MB of garbage a frame in Stone Town)
+    local seen, lane = {}, col(0.4, 0.43, 0.45)
+    for _, tile in pairs(S.tiles) do
+      for _, line in ipairs(navLines(tile.manifest)) do
+        local b = line.box
+        if not seen[line.id] and b[1] <= north and b[3] >= south and b[2] <= east and b[4] >= west then
+          seen[line.id] = true
+          -- Mercator pixels at this zoom, once per line and zoom; points under 4 px from the last
+          -- drawn one are skipped (every ImVec2 is an engine object, i.e. garbage)
+          local m = line.merc
+          if line.zoom ~= z then
+            m = {}
+            local g = line.geo
+            for k = 1, #g - 1, 2 do m[k], m[k + 1] = merc(g[k], g[k + 1], z) end
+            line.merc, line.zoom = m, z
+          end
+          local ox, oy = r0.x - x0, r0.y - y0
+          local px, py = m[1] + ox, m[2] + oy
+          local last = #m - 1
+          for k = 3, last, 2 do
+            local x, y = m[k] + ox, m[k + 1] + oy
+            if k == last or (x - px) ^ 2 + (y - py) ^ 2 >= 16 then
+              im.ImDrawList_AddLine(dl, im.ImVec2(px, py), im.ImVec2(x, y), lane, 2)
+              px, py = x, y
+            end
+          end
+        end
+      end
+    end
+  end
+  -- the controls' corners and the pins keep the labels off
+  if NATIVE then
+    planetMap.beginLabels()
+    planetMap.reserve(r1.x - 44, r0.y, r1.x, r0.y + 120)
+    planetMap.reserve(r0.x, r1.y - 26, r0.x + 140, r1.y)
+  end
+  -- the installed packs as pins until their streets show: a click flies to the pack
+  local pinHit
+  if NATIVE and pick and z < 10 then
+    local blue, rim = col(0.13, 0.4, 0.85), col(1, 1, 1)
+    for _, country in ipairs(S.status and S.status.countries or {}) do
+      local at = country.available and country.landing
+      if at and at.lat <= north + 1 and at.lat >= south - 1 and at.lon >= west - 1 and at.lon <= east + 1 then
+        local x, y = screen(at.lat, at.lon)
+        local selected = S.selectedPack == country.id
+        local c = selected and col(0.1, 0.6, 0.3) or blue
+        im.ImDrawList_AddCircleFilled(dl, im.ImVec2(x, y - 12), 8, rim)
+        im.ImDrawList_AddTriangleFilled(dl, im.ImVec2(x - 6, y - 9), im.ImVec2(x + 6, y - 9), im.ImVec2(x, y), rim)
+        im.ImDrawList_AddCircleFilled(dl, im.ImVec2(x, y - 12), 6.5, c)
+        im.ImDrawList_AddTriangleFilled(dl, im.ImVec2(x - 4.8, y - 9.5), im.ImVec2(x + 4.8, y - 9.5), im.ImVec2(x, y - 1.5), c)
+        im.ImDrawList_AddCircleFilled(dl, im.ImVec2(x, y - 12), 2.5, rim)
+        -- the name where it fits (packs of one country crowd together; a hover names any pin)
+        local t = im.CalcTextSize(country.title)
+        local lx, ly = x + 11, y - 12 - t.y / 2 - 2
+        local named = planetMap.place(x - 9, y - 22, lx + t.x + 8, y + 2)
+        local hover = mouse.x >= x - 9 and mouse.y >= y - 22 and mouse.y <= y + 2 and mouse.x <= (named and lx + t.x + 8 or x + 9)
+        if named then
+          im.ImDrawList_AddRectFilled(dl, im.ImVec2(lx, ly), im.ImVec2(lx + t.x + 8, ly + t.y + 4),
+            hover and col(1, 1, 0.85) or col(1, 1, 1, 0.92), 4)
+          im.ImDrawList_AddText1(dl, im.ImVec2(lx + 4, ly + 2), selected and col(0.05, 0.4, 0.2) or col(0.1, 0.2, 0.45), country.title)
+        else
+          planetMap.reserve(x - 9, y - 22, x + 9, y + 2)
+        end
+        if hover and hovered then pinHit = country end
+      end
+    end
+  end
+  -- cities and countries
+  local placeHit
+  if NATIVE then
+    placeHit = planetMap.drawLabels(im, dl, r0, width, height, view, merc, unmerc, col, LANG,
+      hovered and mouse or nil, pick and 70 or 25)
+    if not pick then placeHit = nil end
+  end
   if S.marker then
     local mx, my = screen(S.marker.lat, S.marker.lon)
-    im.ImDrawList_AddCircleFilled(dl, im.ImVec2(mx, my), 7, col(1, 1, 1))
-    im.ImDrawList_AddCircleFilled(dl, im.ImVec2(mx, my), 5, col(0.86, 0.12, 0.12))
+    -- a red pin on the landing point
+    im.ImDrawList_AddCircleFilled(dl, im.ImVec2(mx, my - 14), 9, col(1, 1, 1))
+    im.ImDrawList_AddTriangleFilled(dl, im.ImVec2(mx - 7, my - 11), im.ImVec2(mx + 7, my - 11), im.ImVec2(mx, my), col(1, 1, 1))
+    im.ImDrawList_AddCircleFilled(dl, im.ImVec2(mx, my - 14), 7.5, col(0.86, 0.15, 0.12))
+    im.ImDrawList_AddTriangleFilled(dl, im.ImVec2(mx - 5.6, my - 11.5), im.ImVec2(mx + 5.6, my - 11.5), im.ImVec2(mx, my - 1.5), col(0.86, 0.15, 0.12))
+    im.ImDrawList_AddCircleFilled(dl, im.ImVec2(mx, my - 14), 3, col(0.5, 0.05, 0.05))
   end
   if car then
     -- an arrow along the heading, with a white rim for any background
@@ -1595,10 +1921,27 @@ local function drawMap(width, height, view, pick)
     arrow(1.35, col(1, 1, 1))
     arrow(1, col(0.1, 0.45, 0.95))
   end
+  -- zoom buttons and the scale
+  local zoomTo
+  if hovered or not view.follow then
+    local bx, size = r1.x - 38, 28
+    local hIn, cIn = mapButton(dl, bx, r0.y + 10, size, '+', mouse, clicked)
+    local hOut, cOut = mapButton(dl, bx, r0.y + 10 + size + 4, size, '-', mouse, clicked)
+    onControl = hIn or hOut
+    if cIn then zoomTo = z + 1 elseif cOut then zoomTo = z - 1 end
+  end
+  drawScale(dl, r0.x + 10, r1.y - 8, view.center.lat, z)
   local credit = NATIVE and 'Natural Earth | (c) OpenStreetMap contributors' or '(c) OpenStreetMap'
   local tw = im.CalcTextSize(credit).x
   im.ImDrawList_AddRectFilled(dl, im.ImVec2(r1.x - tw - 8, r1.y - 18), r1, col(1, 1, 1, 0.75))
   im.ImDrawList_AddText1(dl, im.ImVec2(r1.x - tw - 4, r1.y - 17), col(0.15, 0.15, 0.15), credit)
+  -- what a click here would do
+  if pick and hovered and not onControl and (pinHit or placeHit) then
+    local tip = pinHit and (pinHit.title .. L(' - показати пакет', ' - show the pack')) or (placeHit.name .. L(' - поставити точку', ' - set the point'))
+    local t = im.CalcTextSize(tip)
+    im.ImDrawList_AddRectFilled(dl, im.ImVec2(mouse.x + 14, mouse.y + 16), im.ImVec2(mouse.x + 22 + t.x, mouse.y + 20 + t.y), col(0.12, 0.13, 0.15, 0.92), 4)
+    im.ImDrawList_AddText1(dl, im.ImVec2(mouse.x + 18, mouse.y + 18), col(1, 1, 1), tip)
+  end
   im.ImDrawList_PopClipRect(dl)
   -- a tile asked long ago and still not here: the companion could not download it
   if missing > 0 then
@@ -1611,21 +1954,25 @@ local function drawMap(width, height, view, pick)
     end
   end
   -- wheel: zoom round the cursor (round the car while following); drag: pan, stops following;
-  -- click: the landing point
+  -- click: the landing point (a pin: its pack; a city: the city)
   local io = im.GetIO()
-  local mp = im.GetMousePos()
-  local px, py = mp.x - r0.x, mp.y - r0.y
-  if hovered and io.MouseWheel ~= 0 then
-    local nz = math.max(NATIVE and 1 or 3, math.min(18, z + (io.MouseWheel > 0 and 1 or -1)))
+  local px, py = mouse.x - r0.x, mouse.y - r0.y
+  local minZoom = NATIVE and 2 or 3
+  if hovered and io.MouseWheel ~= 0 and not zoomTo then zoomTo = z + (io.MouseWheel > 0 and 1 or -1) end
+  if zoomTo then
+    local nz = math.max(minZoom, math.min(18, zoomTo))
+    -- the buttons zoom round the centre, the wheel round the cursor
+    local ax, ay = px, py
+    if onControl then ax, ay = width / 2, height / 2 end
     if not (view.follow and car) then
-      local lat, lon = unmerc(x0 + px, y0 + py, z)
+      local lat, lon = unmerc(x0 + ax, y0 + ay, z)
       local wx, wy = merc(lat, lon, nz)
       view.center = {}
-      view.center.lat, view.center.lon = unmerc(wx - px + width / 2, wy - py + height / 2, nz)
+      view.center.lat, view.center.lon = unmerc(wx - ax + width / 2, wy - ay + height / 2, nz)
     end
     view.zoom = nz
   end
-  if hovered and im.IsMouseClicked(0) then view.dragging, view.dragMoved = true, 0 end
+  if clicked and not onControl then view.dragging, view.dragMoved = true, 0 end
   if view.dragging then
     if im.IsMouseDown(0) then
       local d = im.GetMouseDragDelta(0, 0)
@@ -1638,7 +1985,11 @@ local function drawMap(width, height, view, pick)
         im.ResetMouseDragDelta(0)
       end
     else
-      if pick and view.dragMoved < 4 and hovered then setMarker(unmerc(x0 + px, y0 + py, z)) end
+      if pick and view.dragMoved < 4 and hovered then
+        if pinHit then flyToPack(pinHit, width, height)
+        elseif placeHit then setMarker(placeHit.lat, placeHit.lon)
+        else setMarker(unmerc(x0 + px, y0 + py, z)) end
+      end
       view.dragging = false
     end
   end
@@ -1730,11 +2081,260 @@ local function drawStats(st, p, v)
   end
 end
 
+-- --- the look: our windows only (pushed round Begin/End, the game's own UI keeps its style) ------
+local theme
+local function pushTheme()
+  if not theme then
+    local function c(r, g, b, a) return im.ImVec4(r, g, b, a or 1) end
+    theme = {colors = {
+      {im.Col_WindowBg, c(0.10, 0.11, 0.13, 0.97)}, {im.Col_ChildBg, c(0.13, 0.14, 0.17, 1)},
+      {im.Col_TitleBg, c(0.10, 0.18, 0.30, 1)}, {im.Col_TitleBgActive, c(0.12, 0.28, 0.50, 1)},
+      {im.Col_FrameBg, c(0.19, 0.21, 0.25, 1)}, {im.Col_FrameBgHovered, c(0.24, 0.27, 0.32, 1)},
+      {im.Col_Button, c(0.21, 0.24, 0.29, 1)}, {im.Col_ButtonHovered, c(0.27, 0.33, 0.41, 1)},
+      {im.Col_ButtonActive, c(0.18, 0.42, 0.78, 1)}, {im.Col_Header, c(0.16, 0.38, 0.70, 0.65)},
+      {im.Col_HeaderHovered, c(0.22, 0.44, 0.76, 0.55)}, {im.Col_HeaderActive, c(0.18, 0.42, 0.78, 0.9)},
+      {im.Col_Separator, c(0.28, 0.30, 0.35, 1)}, {im.Col_Text, c(0.92, 0.93, 0.95, 1)},
+      {im.Col_TextDisabled, c(0.50, 0.53, 0.58, 1)}},
+      vars = {{im.StyleVar_WindowRounding, 8}, {im.StyleVar_ChildRounding, 6}, {im.StyleVar_FrameRounding, 5}},
+      vars2 = {{im.StyleVar_WindowPadding, im.ImVec2(12, 10)}, {im.StyleVar_FramePadding, im.ImVec2(8, 5)},
+        {im.StyleVar_ItemSpacing, im.ImVec2(8, 6)}},
+      muted = c(0.62, 0.65, 0.70, 1), accent = c(0.45, 0.70, 1, 1), warn = c(1, 0.65, 0.3, 1),
+      green = c(0.13, 0.55, 0.30, 1), greenHover = c(0.16, 0.65, 0.36, 1), greenActive = c(0.10, 0.45, 0.25, 1)}
+  end
+  for _, p in ipairs(theme.colors) do im.PushStyleColor2(p[1], p[2]) end
+  for _, p in ipairs(theme.vars) do im.PushStyleVar1(p[1], p[2]) end
+  for _, p in ipairs(theme.vars2) do im.PushStyleVar2(p[1], p[2]) end
+end
+local function popTheme()
+  im.PopStyleColor(#theme.colors)
+  im.PopStyleVar(#theme.vars + #theme.vars2)
+end
+
+-- the packs in the side list by part of the world (their landing point)
+local GROUP_ORDER = {'europe', 'america', 'south', 'africa', 'asia', 'oceania', 'other'}
+local GROUP_TITLE = {europe = L('Європа', 'Europe'), america = L('Північна Америка', 'North America'),
+  south = L('Південна Америка', 'South America'), africa = L('Африка', 'Africa'), asia = L('Азія', 'Asia'),
+  oceania = L('Океанія', 'Oceania'), other = L('Інші', 'Other')}
+local function packGroup(country)
+  local l = country.landing
+  if not l then return 'other' end
+  if l.lon >= -30 and l.lon <= 60 and l.lat >= 35 then return 'europe' end
+  if l.lon < -30 then return l.lat >= 12 and 'america' or 'south' end
+  if l.lon <= 55 and l.lat < 37 then return 'africa' end
+  if l.lon > 110 and l.lat < -10 then return 'oceania' end
+  return 'asia'
+end
+
+local searchBuf = im.ArrayChar(64)
+local foundPlaces
+
+-- buttons that wrap to the next line when the row is full
+local function flowButtons(items, onClick)
+  local spacing = im.GetStyle().ItemSpacing.x
+  local avail = im.GetContentRegionAvailWidth()
+  local used = 0
+  for k, item in ipairs(items) do
+    local w = im.CalcTextSize(item[1]).x + 16
+    if k > 1 and used + spacing + w <= avail then im.SameLine(); used = used + spacing + w else used = w end
+    if im.Button(item[1] .. '##preset' .. k) then onClick(item) end
+  end
+end
+
+local function drawSidebar(mapW, mapH)
+  im.SetNextItemWidth(-1)
+  im.InputTextWithHint('##search', L('Пошук: пакет, місто...', 'Search: pack, city...'), searchBuf, 64)
+  local query = planetMap and planetMap.lower(ffi.string(searchBuf):gsub('^%s+', ''):gsub('%s+$', '')) or ''
+  local countries = NATIVE and S.status and S.status.countries or {}
+  local info = packInfo()
+  if query ~= '' then
+    local any = false
+    for _, country in ipairs(countries) do
+      if country.available and planetMap.lower(country.title):find(query, 1, true) then
+        if not any then im.TextColored(theme.muted, L('Пакети', 'Packs')); any = true end
+        if im.Selectable1(country.title .. '##found_' .. country.id, S.selectedPack == country.id) then flyToPack(country, mapW, mapH) end
+      end
+    end
+    -- the places of a query, with their pack check, once per query (native.at walks the boxes)
+    if not foundPlaces or foundPlaces.query ~= query or foundPlaces.status ~= S.status then
+      local places = {query = query, status = S.status}
+      for _, p in ipairs(PRESETS) do
+        if planetMap.lower(p[1]):find(query, 1, true) and (not NATIVE or native.at(p[2], p[3])) then
+          places[#places + 1] = {name = p[1], lat = p[2], lon = p[3], zoom = 15, covered = true}
+        end
+      end
+      for _, p in ipairs(planetMap and planetMap.search(query, LANG, 25) or {}) do
+        places[#places + 1] = {name = p.name, lat = p.lat, lon = p.lon, covered = not NATIVE or native.at(p.lat, p.lon) ~= nil}
+      end
+      foundPlaces = places
+    end
+    local places = foundPlaces
+    if #places > 0 then
+      im.Spacing()
+      im.TextColored(theme.muted, L('Місця', 'Places'))
+      for k, p in ipairs(places) do
+        if im.Selectable1(p.name .. (p.covered and '' or L('  (немає пакета)', '  (no pack)')) .. '##place' .. k) then
+          goTo(p.lat, p.lon, p.zoom or 12)
+        end
+      end
+    elseif not any then
+      im.TextColored(theme.muted, L('Нічого не знайдено', 'Nothing found'))
+    end
+    return
+  end
+  if NATIVE then
+    local available = 0
+    for _, country in ipairs(countries) do if country.available then available = available + 1 end end
+    im.TextColored(theme.muted, string.format(L('Встановлені пакети: %d', 'Installed packs: %d'), available))
+    if #countries == 0 then
+      im.TextWrapped(L('Пакетів країн немає. Додайте earthng_<країна>.zip до папки mods і ввімкніть його в менеджері модів.',
+        'No country packs installed. Add earthng_<country>.zip to your mods folder and enable it in the Mod Manager.'))
+    end
+    local groups = {}
+    for _, country in ipairs(countries) do
+      local g = packGroup(country)
+      groups[g] = groups[g] or {}
+      table.insert(groups[g], country)
+    end
+    for _, g in ipairs(GROUP_ORDER) do
+      local list = groups[g]
+      if list then
+        table.sort(list, function(a, b) return a.title < b.title end)
+        im.Spacing()
+        im.TextColored(theme.accent, GROUP_TITLE[g])
+        im.Separator()
+        for _, country in ipairs(list) do
+          if country.available then
+            local selected = S.selectedPack == country.id
+            if im.Selectable1(country.title .. '##pack_' .. country.id, selected) then flyToPack(country, mapW, mapH) end
+            local p = info.byId[country.id]
+            if selected and p and #p.presets > 0 then
+              im.Indent(10)
+              flowButtons(p.presets, function(preset) goTo(preset[2], preset[3], 15) end)
+              im.Unindent(10)
+              im.Spacing()
+            end
+          else
+            im.TextColored(theme.muted, country.title .. ': ' .. tostring(country.reason or L('недоступно', 'unavailable')))
+          end
+        end
+      end
+    end
+  else
+    local shown = {}
+    for _, p in ipairs(PRESETS) do if presetInPackage(p) then shown[#shown + 1] = p end end
+    im.TextColored(theme.muted, L('Місця пакета', 'Places of the package'))
+    flowButtons(shown, function(preset) goTo(preset[2], preset[3], 15) end)
+  end
+end
+
+-- under the map: the point, the landing button, coordinates
+local function drawLandingBar()
+  if S.marker then
+    local country = NATIVE and native.at(S.marker.lat, S.marker.lon)
+    if not NATIVE or country then
+      im.PushStyleColor2(im.Col_Button, theme.green)
+      im.PushStyleColor2(im.Col_ButtonHovered, theme.greenHover)
+      im.PushStyleColor2(im.Col_ButtonActive, theme.greenActive)
+      if im.Button(L('Висадитися тут', 'Land here'), im.ImVec2(200, 30)) then land() end
+      im.PopStyleColor(3)
+      im.SameLine()
+      im.Text(string.format('%s%.5f, %.5f', country and (country.title .. '  ') or '', S.marker.lat, S.marker.lon))
+    else
+      im.TextColored(theme.warn, string.format(L('%.5f, %.5f - тут немає даних. Оберіть зелену зону або встановіть пакет.',
+        '%.5f, %.5f - no data here. Pick a green area or install a pack.'), S.marker.lat, S.marker.lon))
+    end
+  else
+    im.TextColored(theme.muted, L('Клікніть на мапі в зеленій зоні, щоб обрати точку висадки.',
+      'Click inside a green area to pick the landing point.'))
+  end
+  im.SetNextItemWidth(220)
+  im.InputTextWithHint('##coords', L('широта, довгота', 'latitude, longitude'), coordBuf, 64)
+  im.SameLine()
+  if im.Button(L('Перейти', 'Go')) then
+    local lat, lon = ffi.string(coordBuf):match('(-?%d+%.?%d*)%s*[,; ]%s*(-?%d+%.?%d*)')
+    if lat then goTo(tonumber(lat), tonumber(lon), 15) end
+  end
+  im.SameLine()
+  im.TextColored(theme.muted, L('Колесо - масштаб, перетягування - рух, клік - точка', 'Wheel - zoom, drag - pan, click - point'))
+end
+
+local function drawProblems()
+  if S.lastError then
+    im.TextColored(im.ImVec4(1, 0.3, 0.3, 1), L('Помилка мода: ', 'Mod error: ') .. S.lastError:sub(1, 160))
+  end
+  if not serverUp() then
+    im.TextColored(im.ImVec4(1, 0.45, 0.3, 1), L('Компаньйон Earth2Road не відповідає. Запустіть EarthNG.bat і натисніть «Запустити».',
+      'The Earth2Road companion is not responding. Run EarthNG.bat and press Start.'))
+  end
+  if NATIVE and S.status and #(S.status.errors or {}) > 0 then
+    if im.CollapsingHeader1(L('Проблеми з пакетами', 'Pack errors')) then
+      for _, err in ipairs(S.status.errors) do im.TextWrapped(tostring(err.message or err)) end
+    end
+  end
+end
+
+local function drawPicker()
+  im.SetNextWindowSize(im.ImVec2(1180, 720), im.Cond_FirstUseEver)
+  im.SetNextWindowSizeConstraints(im.ImVec2(820, 500), im.ImVec2(8000, 8000))
+  im.Begin(L('EarthNG - планета', 'EarthNG - Planet') .. '##planet', nil,
+    im.WindowFlags_NoCollapse + im.WindowFlags_NoScrollbar + im.WindowFlags_NoScrollWithMouse)
+  if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
+  if S.pickerOpen then
+    im.SameLine()
+    if im.Button(L('Повернутися до їзди', 'Back to driving')) then S.pickerOpen = false end
+  end
+  im.SameLine()
+  im.TextColored(theme.muted, L('Оберіть пакет зліва або місце на мапі', 'Pick a pack on the left or a place on the map'))
+  drawProblems()
+  local avail = im.GetContentRegionAvail()
+  local sideW = 290
+  local barH = 2 * im.GetFrameHeightWithSpacing() + 8
+  local mapW = math.max(200, avail.x - sideW - im.GetStyle().ItemSpacing.x)
+  local mapH = math.max(200, avail.y - barH)
+  S.mapW, S.mapH = mapW, mapH
+  -- the part of the world with the most packs in view on the first opening (all of them
+  -- together can span the planet)
+  if S.fitAll then
+    local count, best, box = {}, nil, nil
+    for _, country in ipairs(S.status and S.status.countries or {}) do
+      if country.available then
+        local g = packGroup(country)
+        count[g] = (count[g] or 0) + 1
+        if not best or count[g] > count[best] then best = g end
+      end
+    end
+    for _, country in ipairs(S.status and S.status.countries or {}) do
+      local p = packInfo().byId[country.id]
+      if country.available and packGroup(country) == best and p and p.box then
+        box = box and {math.min(box[1], p.box[1]), math.min(box[2], p.box[2]), math.max(box[3], p.box[3]), math.max(box[4], p.box[4])}
+          or {p.box[1], p.box[2], p.box[3], p.box[4]}
+      end
+    end
+    box = box or (S.status and S.status.packageBox)
+    if box then
+      S.center = {lat = (box[2] + box[4]) / 2, lon = (box[1] + box[3]) / 2}
+      S.zoom = fitZoom(box, mapW, mapH)
+    end
+    S.fitAll = nil
+  end
+  im.BeginChild1('##side', im.ImVec2(sideW, avail.y), true)
+  drawSidebar(mapW, mapH)
+  im.EndChild()
+  im.SameLine()
+  im.BeginGroup()
+  drawMap(mapW, mapH, S, true)
+  drawLandingBar()
+  im.EndGroup()
+  im.End()
+end
+
 local function drawWindow()
+  pushTheme()
   if S.widgetHidden then
     im.Begin('EarthNG##restore', nil, im.WindowFlags_AlwaysAutoResize)
     if im.Button(L('Показати мапу', 'Show map')) then S.widgetHidden = false; S.viewDirty = true end
     im.End()
+    popTheme()
     return
   end
   if S.state == 'driving' and not S.pickerOpen then
@@ -1750,7 +2350,7 @@ local function drawWindow()
       if im.Button(L('До авто', 'To the car')) then S.mini.follow = true end
       im.SameLine()
     end
-    im.TextColored(im.ImVec4(0.65, 0.65, 0.65, 1), L('Колесо - масштаб, перетягування - огляд', 'Wheel - zoom, drag - look around'))
+    im.TextColored(theme.muted, L('Колесо - масштаб, перетягування - огляд', 'Wheel - zoom, drag - look around'))
     local st = S.status and S.status.stream
     local p, v = focus()
     if st and st.edgeKm and st.edgeKm < 3 then
@@ -1770,92 +2370,37 @@ local function drawWindow()
     drawTraffic()
     if im.CollapsingHeader1(L('Статистика', 'Statistics'), im.TreeNodeFlags_DefaultOpen) then drawStats(st, p, v) end
     im.End()
+    popTheme()
     return
   end
-  im.SetNextWindowSize(im.ImVec2(W + 32, 0), im.Cond_Always)
-  im.Begin(L('EarthNG - планета', 'EarthNG - Planet') .. '##picker', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
-  if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
-  if S.pickerOpen then
-    im.SameLine()
-    if im.Button(L('Повернутися до їзди', 'Back to driving')) then S.pickerOpen = false end
-  end
   if S.state == 'pick' or S.pickerOpen then
-    if NATIVE then
-      local countries = S.status and S.status.countries or {}
-      if #countries == 0 then
-        im.TextWrapped(L('Пакетів країн немає. Додайте earthng_<країна>.zip до папки mods і ввімкніть його в менеджері модів.',
-          'No country packs installed. Add earthng_<country>.zip to your mods folder and enable it in the Mod Manager.'))
-      end
-      for _, country in ipairs(countries) do
-        if country.available and im.Button(country.title .. '##country_' .. country.id) then
-          local point = country.landing
-          if point then goTo(point.lat, point.lon, 13) end
-        elseif not country.available then
-          im.TextWrapped(country.title .. ': ' .. tostring(country.reason or L('недоступно', 'unavailable')))
-        end
-      end
-    end
-    im.Text(L('Колесо - масштаб, перетягування - рух, клік - точка висадки.',
-      'Wheel - zoom, drag - pan, click - landing point.'))
-    drawMap(W, H, S, true)
-    local shown = 0
-    for k, p in ipairs(PRESETS) do
-      if presetInPackage(p) then
-        if shown > 0 and not PRESET_ROWS[k] then im.SameLine() end
-        if im.Button(p[1]) then goTo(p[2], p[3], 15) end
-        shown = shown + 1
-      end
-    end
-    im.InputText('##coords', coordBuf, 64)
-    im.SameLine()
-    if im.Button(L('Перейти до координат', 'Go to coordinates')) then
-      local lat, lon = ffi.string(coordBuf):match('(-?%d+%.?%d*)%s*[,; ]%s*(-?%d+%.?%d*)')
-      if lat then goTo(tonumber(lat), tonumber(lon), 15) end
-    end
-    im.Separator()
-    if S.marker then
-      im.Text(string.format(L('Точка: %.5f, %.5f', 'Point: %.5f, %.5f'), S.marker.lat, S.marker.lon))
-      if not NATIVE or native.at(S.marker.lat, S.marker.lon) then
-        if im.Button(L('Висадитися тут', 'Land here'), im.ImVec2(220, 32)) then land() end
-      else
-        im.TextWrapped(L('Для цієї точки немає активного пакета даних. Оберіть зелену зону або встановіть відповідний пакет.',
-          'No active data pack covers this point. Pick a green area or install the corresponding pack.'))
-      end
-    else
-      im.Text(L('Оберіть точку на мапі. Дані підготовлені там, де зелена зона.',
-        'Pick a point on the map. Data is ready inside the green zone.'))
-    end
-  else
-    local job = S.status and S.status.job
-    if job and job.seq == S.landSeq then
-      im.Text(string.format(L('Генерація %.5f, %.5f', 'Generating %.5f, %.5f'), job.lat or 0, job.lon or 0))
-      im.ProgressBar(job.progress or 0, im.ImVec2(W, 0), tostring(job.stage or ''))
-      if job.state == 'error' then
-        im.TextWrapped(L('Помилка: ', 'Error: ') .. tostring(job.message))
-        if im.Button(L('Назад до мапи', 'Back to the map')) then S.state = 'pick' end
-      end
-    elseif S.state == 'generating' then
-      im.Text(NATIVE and L('Завантажую дані пакета...', 'Loading pack data...') or
-        L('Запит надіслано, чекаю на компаньйон...', 'Request sent, waiting for the companion...'))
-    end
-    if S.state == 'warmup' or S.state == 'spawning' then
-      local loaded = countTiles()
-      im.ProgressBar(math.min(1, loaded / 4), im.ImVec2(W, 0), L('Спуск: будую світ', 'Descent: building the world'))
-    end
+    drawPicker()
+    popTheme()
+    return
   end
-  if S.lastError then
-    im.TextColored(im.ImVec4(1, 0.3, 0.3, 1), L('Помилка мода: ', 'Mod error: ') .. S.lastError:sub(1, 160))
-  end
-  if not serverUp() then
-    im.TextColored(im.ImVec4(1, 0.45, 0.3, 1), L('Компаньйон Earth2Road не відповідає. Запустіть EarthNG.bat і натисніть «Запустити».',
-      'The Earth2Road companion is not responding. Run EarthNG.bat and press Start.'))
-  end
-  if NATIVE and S.status and #(S.status.errors or {}) > 0 then
-    if im.CollapsingHeader1(L('Проблеми з пакетами', 'Pack errors')) then
-      for _, err in ipairs(S.status.errors) do im.TextWrapped(tostring(err.message or err)) end
+  -- the landing under way: a small window of its own
+  im.SetNextWindowSize(im.ImVec2(W, 0), im.Cond_Always)
+  im.Begin(L('EarthNG - висадка', 'EarthNG - Landing') .. '##progress', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
+  if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
+  local job = S.status and S.status.job
+  if job and job.seq == S.landSeq then
+    im.Text(string.format(L('Генерація %.5f, %.5f', 'Generating %.5f, %.5f'), job.lat or 0, job.lon or 0))
+    im.ProgressBar(job.progress or 0, im.ImVec2(W - 24, 0), tostring(job.stage or ''))
+    if job.state == 'error' then
+      im.TextWrapped(L('Помилка: ', 'Error: ') .. tostring(job.message))
+      if im.Button(L('Назад до мапи', 'Back to the map')) then S.state = 'pick' end
     end
+  elseif S.state == 'generating' then
+    im.Text(NATIVE and L('Завантажую дані пакета...', 'Loading pack data...') or
+      L('Запит надіслано, чекаю на компаньйон...', 'Request sent, waiting for the companion...'))
   end
+  if S.state == 'warmup' or S.state == 'spawning' then
+    local loaded = countTiles()
+    im.ProgressBar(math.min(1, loaded / 4), im.ImVec2(W - 24, 0), L('Спуск: будую світ', 'Descent: building the world'))
+  end
+  drawProblems()
   im.End()
+  popTheme()
 end
 
 -- --- lifecycle -----------------------------------------------------------------------------------
@@ -1891,7 +2436,36 @@ end
 function M.onModManagerModsMounted() refreshCountries() end
 function M.onModActivated() refreshCountries() end
 function M.onModDeactivated() refreshCountries() end
+local function restorePackState()
+  restoreSkyDriver()
+  S.envAgain, S.exposurePending, S.exposureRetryAt = nil, nil, nil
+  local lx = scenetree.findObject('PostEffectLocalExposureObject')
+  for name, fields in pairs(S.envOrig or {}) do
+    local obj = scenetree.findObject(name)
+    if obj then
+      for field, value in pairs(fields) do obj:setField(field, 0, value) end
+      pcall(function() obj:postApply() end)
+    end
+  end
+  for name, fields in pairs(S.packOrig or {}) do
+    local mat = scenetree.findObject(name)
+    if mat then
+      for field, value in pairs(fields) do mat:setField(field, 0, value) end
+      mat:reload()
+    end
+  end
+  if lx and S.exposureOrig then lx.autoExposure, lx.manualEV = S.exposureOrig[1], S.exposureOrig[2] end
+  S.exposureOrig, S.envOrig, S.packOrig, S.packSet, S.reloadQueue = nil, nil, nil, nil, nil
+  S.packsWarm, S.packsExtra, S.packs, S.packEnv = nil, nil, nil, nil
+  showPrecip(nil)
+  showSun(nil)
+  dropLights()
+end
+
+function M.onExtensionUnloaded() restorePackState() end
+
 function M.onClientEndMission()
+  restorePackState()
   if NATIVE then native.refresh() end
   S.stream, S.co, S.job, S.landing, S.state = nil, nil, nil, nil, 'off'
   S.tiles, S.far, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}
@@ -1908,10 +2482,27 @@ local function runTest()
     local job, stream = status.job or {}, status.stream or {}
     result.native = {countryCount = status.countryCount, provider = status.provider,
       job = {state = job.state, progress = job.progress, message = job.message, stage = job.stage},
-      built = stream.built, ready = stream.readyCount, error = S.lastError}
+      built = stream.built, ready = stream.readyCount, error = S.lastError,
+      cachedTiles = stream.cachedTiles, cachedCells = stream.cachedCells, rebuilds = stream.rebuilds,
+      slowResumes = stream.slowResumes}
+    local P = S.prof
+    if P and P.frames > 0 then
+      local mean = {}
+      for part, sum in pairs(P.sum) do mean[part] = sum / P.frames end
+      local kbMean = {}
+      for part, sum in pairs(P.kb) do kbMean[part] = sum / P.frames end
+      result.luaProfile = {frames = P.frames, meanMs = mean, maxMs = P.max, heapKb = collectgarbage('count'), kbPerFrame = kbMean,
+        garbageKbPerFrame = P.kbUp / P.frames, collections = P.collections}
+    end
     saveResult()
   end
-  if test.pickerOnly and S.state == 'pick' and t > 4 then
+  -- picker check: optionally centre the map on a point and hold it there (a desktop capture
+  -- sees the imgui map; the game's own screenshots do not contain it)
+  if test.pickerOnly and S.state == 'pick' and test.pickerZoom and not S.testPicked and t > 2 then
+    goTo(test.lat, test.lon, test.pickerZoom)
+    S.testPicked = S.now
+  end
+  if test.pickerOnly and S.state == 'pick' and t > (test.pickerHold or 4) then
     shot('1-picker')
     local actual = NATIVE and native.status().countryCount or 0
     result.status = actual == (test.expectedCountries or 0) and not S.lastError and 'passed' or 'failed'
@@ -1939,6 +2530,31 @@ local function runTest()
       saveResult()
     end
     return
+  end
+  -- teleports (test.hops: {lat, lon, stage}): land again from 'driving', or mid-descent from
+  -- 'spawning'/'warmup', as a player does from the picker; each hop's descent time is reported
+  if test.hops and S.testLanded then
+    local done = S.hop or 0
+    local last = result.hops and result.hops[done]
+    if last and not last.landedAfter and S.state == 'driving' then
+      last.landedAfter = S.now - last.at
+      saveResult()
+    end
+    if done < #test.hops then
+      local h = test.hops[done + 1]
+      local stage = h[3] or 'driving'
+      if S.state == stage and S.now - S.phaseAt > (stage == 'driving' and 3 or 1) then
+        S.hop = done + 1
+        result.hops = result.hops or {}
+        table.insert(result.hops, {n = S.hop, lat = h[1], lon = h[2], from = S.state, at = S.now})
+        S.pickerOpen = true
+        goTo(h[1], h[2], 15)
+        land()
+        saveResult()
+      end
+      return
+    end
+    if last and not last.landedAfter then return end
   end
   if S.state == 'pick' and not S.testPicked and (mapTexN > 0 or test.skipMap) and t > 3 then
     shot('1-picker')
@@ -1978,6 +2594,20 @@ local function runTest()
     S.testDriving, S.frames = S.now, {}
     if test.route then
       local ok, route = pcall(jsonReadFile, test.route)
+      -- a native route is lat/lon (geo); the region's own projection puts it in the game's frame
+      if ok and route and NATIVE and route.geo then
+        route.points = {}
+        for _, g in ipairs(route.geo) do
+          local x, y = native.localPoint(g[1], g[2])
+          if x then route.points[#route.points + 1] = {x, y, 0} end
+        end
+        local length = 0
+        for k = 2, #route.points do
+          local a, b = route.points[k - 1], route.points[k]
+          length = length + math.sqrt((b[1] - a[1]) ^ 2 + (b[2] - a[2]) ^ 2)
+        end
+        route.length = length
+      end
       if ok and route then
         if test.replay then
           S.replay = {points = route.points, idx = 1, along = 0, distance = 0, speed = test.speed or 83.333}
@@ -2188,11 +2818,27 @@ local function replayStep(dt)
   core_camera.setPosRot(0,p.x-d.x*30,p.y-d.y*30,240,q.x,q.y,q.z,q.w)
   local i,j = tileOf(p.x,p.y)
   local key = i .. '_' .. j
-  if not tileLoadedAt(p.x,p.y) and S.lastMiss ~= key then
-    table.insert(result.deadlineMisses,{seconds=S.now-S.testDriving,tile=key,distance=r.distance})
+  -- delivered = loaded with collision; a replay crosses tiles without roads (not drivable)
+  local here = S.tiles[key]
+  if not (here and not here.failed and here.roadComplete and here.collided) and S.lastMiss ~= key then
+    local t, st = here, S.status and S.status.stream or {}
+    table.insert(result.deadlineMisses,{seconds=S.now-S.testDriving,tile=key,distance=r.distance,
+      inGame=t~=nil, road=t and t.roadComplete, collided=t and t.collided, loadSeconds=t and t.startedAt and S.now-t.startedAt,
+      left=t and t.left, ready=st.ready and st.ready[key]~=nil, wanted=st.wanted and st.wanted[key],
+      failed=st.failed and st.failed[key], queue=#S.queue, collisionAgo=S.now-S.collisionAt, dirty=S.collisionDirty})
     S.lastMiss = key
   end
   result.replayDistanceM = r.distance
+end
+
+-- Where a frame's Lua time goes (automation report): sums and maxima per part, and the Lua heap
+-- growth between frames (garbage the collector must walk later).
+local function profAdd(part, ms, kb)
+  local P = S.prof
+  if not P then P = {sum = {}, max = {}, kb = {}, frames = 0, kbUp = 0, collections = 0}; S.prof = P end
+  P.sum[part] = (P.sum[part] or 0) + ms
+  if ms > (P.max[part] or 0) then P.max[part] = ms end
+  if kb and kb > 0 then P.kb[part] = (P.kb[part] or 0) + kb end
 end
 
 function M.onUpdate(dtReal)
@@ -2233,13 +2879,37 @@ function M.onUpdate(dtReal)
       saveResult()
     end
   end
+  -- A frame stuck in Lua (ours or another mod's) for seconds writes its Lua stack to
+  -- e2r-hang.txt in the user folder from inside the loop (the LuaJIT profiler samples compiled
+  -- code too). Freezes in play were otherwise invisible: the log just stopped.
+  S.frameStamp = os.clock()
+  if not S.watchdog then
+    S.watchdog = true
+    local okProfile, profile = pcall(require, 'jit.profile')
+    if okProfile and profile then
+      local dumps, lastDump = 0, -1
+      profile.start('i200', function(thread)
+        local now = os.clock()
+        if S.frameStamp and now - S.frameStamp > 3 and now - lastDump > 2 and dumps < 30 then
+          lastDump, dumps = now, dumps + 1
+          local f = io.open('e2r-hang.txt', 'a')
+          if f then
+            f:write(string.format('stuck %.1f s: %s\n', now - S.frameStamp, profile.dumpstack(thread, 'Fpl < ', 40)))
+            f:close()
+          end
+        end
+      end)
+    end
+  end
   -- an error in the logic must not stop the window from being drawn (it flickered when it did)
   local ok, err = xpcall(M.tick, debug.traceback, dtReal)
   if not ok then
     if S.lastError ~= err then log('E', logTag, err) end
     S.lastError = err
   end
+  local wkb, wt = collectgarbage('count'), hptimer()
   drawWindow()
+  if S.prof then profAdd('window', wt:stop(), collectgarbage('count') - wkb) end
   if test then
     local ok2, err2 = xpcall(runTest, debug.traceback)
     if not ok2 and S.lastError ~= err2 then log('E', logTag, err2); S.lastError = err2 end
@@ -2247,7 +2917,20 @@ function M.onUpdate(dtReal)
 end
 
 function M.tick(dt)
-  if NATIVE then native.update(dt, BUDGET_MS) end
+  if NATIVE then
+    local kb, t = collectgarbage('count'), hptimer()
+    if S.profKb then
+      local P = S.prof
+      if P then
+        P.frames = P.frames + 1
+        if kb >= S.profKb then P.kbUp = P.kbUp + kb - S.profKb else P.collections = P.collections + 1 end
+      end
+    end
+    native.update(dt, BUDGET_MS)
+    S.nativeMs = t:stop()
+    profAdd('native', S.nativeMs, collectgarbage('count') - kb)
+    S.profKb = collectgarbage('count')
+  end
   placeSun()
   lightsStep()
   reloadStep()
@@ -2270,22 +2953,28 @@ function M.tick(dt)
     local timer = hptimer()
     writePose()
     local tPose = timer:stopAndReset()
+    local kb0 = collectgarbage('count')
     updateTiles()
     local tTiles = timer:stopAndReset()
+    local kb1 = collectgarbage('count')
     -- a frame that rebuilds the collision (up to ~65 ms) spawns no mesh: together with a
     -- createMesh and the render they reached 98 ms (fast-oblast-replay-01)
     local reloaded = updateCollision()
     local tColl = timer:stopAndReset()
+    local kb2 = collectgarbage('count')
     if not reloaded then stepQueue(); digGraves() end
     local tQueue = timer:stopAndReset()
+    local kb3 = collectgarbage('count')
     if S.state == 'driving' then navStep() end
     local tNav = timer:stopAndReset()
     if tNav > (result.navStepMs or 0) then result.navStepMs = tNav end
-    if tPose + tTiles + tQueue + tColl > 50 then
+    profAdd('pose', tPose); profAdd('tiles', tTiles, kb1 - kb0); profAdd('collision', tColl); profAdd('queue', tQueue, kb3 - kb2)
+    profAdd('nav', tNav)
+    if tPose + tTiles + tQueue + tColl + (S.nativeMs or 0) > 50 then
       result.slow = result.slow or {}
       if #result.slow < 60 then
         table.insert(result.slow, {math.floor(S.now), math.floor(tPose), math.floor(tTiles), math.floor(tQueue), math.floor(tColl),
-                                   S.job and S.job.item and S.job.item.name or ''})
+                                   S.job and S.job.item and S.job.item.name or '', math.floor(S.nativeMs or 0)})
       end
     end
   end
@@ -2308,6 +2997,25 @@ function M.tick(dt)
       end
       -- the descent only (the index of a big city's window, before it, takes minutes and is
       -- not the stream's fault); a warning in play, a failed run in automation
+      -- why the descent waits (automation report): the tiles round the spawn that hold it back
+      if S.now - S.phaseAt > 60 and not result.descentBlocked then
+        local blocked, st = {}, S.status and S.status.stream or {}
+        for x = sp[1]-500, sp[1]+500, 250 do
+          for y = sp[2]-500, sp[2]+500, 250 do
+            local i,j = tileOf(x,y)
+            local key = i .. '_' .. j
+            local t = S.tiles[key]
+            if not t or t.failed or not t.roadComplete or (#t.manifest.items > 0 and not t.collided) or not blocked[key] then
+              blocked[key] = {inGame = t ~= nil, failed = t and t.failed, road = t and t.roadComplete, scene = t and t.sceneComplete,
+                collided = t and t.collided, left = t and t.left, ready = st.ready and st.ready[key] ~= nil,
+                wanted = st.wanted and st.wanted[key], nativeFailed = st.failed and st.failed[key]}
+            end
+          end
+        end
+        result.descentBlocked = {seconds = S.now - S.phaseAt, landing = li .. '_' .. lj, tiles = blocked, queue = #S.queue,
+          collisionDirty = S.collisionDirty, collisionAt = S.collisionAt, now = S.now}
+        saveResult()
+      end
       if not result.startupFailed and S.now - S.phaseAt > 300 then
         result.startupFailed = true
         S.lastError = 'Descent exceeded 300 seconds'

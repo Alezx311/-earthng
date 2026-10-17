@@ -5,7 +5,13 @@ local M = {}
 local catalog = require('ge/extensions/e2r/countries')
 local generator = require('ge/extensions/e2r/generator')
 local coordinates = require('ge/extensions/e2r/coordinates')
-local CELL_LIMIT, TILE_LIMIT, TRIANGLE_LIMIT, VERTEX_LIMIT, LAND_RADIUS = 32, 32, 80000, 240000, 500
+local cellformat = require('ge/extensions/e2r/cellformat')
+-- TILE_LIMIT holds the whole wanted set (1 km near plus the 3 km far ring, ~130 tiles): a
+-- delivered tile keeps only flags, while undelivered geometry is bounded by triangles/vertices.
+-- At 32 the far ring evicted itself and was rebuilt after every 250 m.
+local CELL_LIMIT, TILE_LIMIT, TRIANGLE_LIMIT, VERTEX_LIMIT, LAND_RADIUS = 32, 160, 80000, 240000, 500
+local BLOCK_LIMIT = 6
+local FORMATS = {['earthng-features-v1'] = 1, ['earthng-features-v2'] = 2}
 local state, regions, active
 
 local function finite(v)
@@ -45,11 +51,12 @@ local function insideAny(boxes, x, y)
   return false
 end
 
-local function pathIn(path, prefix)
+local function pathIn(path, prefix, extension)
+  extension = extension or '.json'
   if type(path) ~= 'string' or path:sub(1, #prefix) ~= prefix
     or path:find('[%z\1-\31\\:%?%#%%]') or path:find('//', 1, true) then return false end
   for p in path:gmatch('[^/]+') do if p == '.' or p == '..' then return false end end
-  return path:sub(-5) == '.json'
+  return path:sub(-#extension) == extension
 end
 
 local function exists(path)
@@ -65,6 +72,27 @@ local function read(path)
 end
 
 local function keyOf(i, j) return string.format('%d_%d', i, j) end
+
+-- Raw bytes through the game's VFS (country ZIPs are mounted, never unpacked).
+local function readBytes(path)
+  if not exists(path) then error('missing mounted source: ' .. path) end
+  local f = io.open(path, 'rb')
+  if not f then error('cannot open mounted source: ' .. path) end
+  local data = f:read('*a')
+  f:close()
+  if type(data) ~= 'string' then error('cannot read mounted source: ' .. path) end
+  return data
+end
+
+-- v1 lists every cell in its manifest; v2 keeps a 64-bit presence mask per 8 x 8 km block,
+-- so a whole country's manifest stays small and nothing is enumerated at startup.
+local function hasCell(r, i, j)
+  local d = r.data
+  if d.schemaVersion ~= 2 then return d.cells[keyOf(i, j)] ~= nil end
+  local b = cellformat.BLOCK
+  local block = d.blocks[keyOf(math.floor(i / b), math.floor(j / b))]
+  return block ~= nil and cellformat.present(block.mask, i % b + (j % b) * b)
+end
 
 local function geographic(r, x, y)
   if r.projection then return r.projection.geographic(x, y) end
@@ -93,7 +121,7 @@ local function covered(r, x0, y0, x1, y1)
   local i0, j0 = math.floor((x0 + 0.000001) / s), math.floor((y0 + 0.000001) / s)
   local i1, j1 = math.ceil((x1 - 0.000001) / s) - 1, math.ceil((y1 - 0.000001) / s) - 1
   for i = i0, i1 do
-    for j = j0, j1 do if not r.data.cells[keyOf(i, j)] then return false end end
+    for j = j0, j1 do if not hasCell(r, i, j) then return false end end
   end
   return true
 end
@@ -112,15 +140,55 @@ local function addIssue(country, region, message)
     path = region and region.manifest or country.manifest, code = 'native-source', message = tostring(message)}
 end
 
+-- A landing point is safe when its 500 m tile and LAND_RADIUS round it have source cells.
+local function safeAt(r, x, y)
+  local t = r.data.tileSize
+  local i, j = math.floor(x / t), math.floor(y / t)
+  return covered(r, i * t - LAND_RADIUS, j * t - LAND_RADIUS, (i + 1) * t + LAND_RADIUS, (j + 1) * t + LAND_RADIUS)
+end
+
+local function validateBlocks(country, d)
+  if d.blockCells ~= cellformat.BLOCK or type(d.blocks) ~= 'table' then error('invalid source block grid') end
+  if not array(d.coverage) or #d.coverage == 0 then error('region coverage must be a nonempty array') end
+  for _, box in ipairs(d.coverage) do if not geoBox(box) then error('invalid region coverage box') end end
+  local count = 0
+  for key, block in pairs(d.blocks) do
+    local i, j
+    if type(key) == 'string' then i, j = key:match('^(-?%d+)_(-?%d+)$') end
+    i, j = tonumber(i), tonumber(j)
+    if not i or not j or math.abs(i) > 1000000 or math.abs(j) > 1000000 or key ~= keyOf(i, j) or type(block) ~= 'table'
+      or type(block.mask) ~= 'string' or #block.mask ~= 16 or block.mask:find('[^0-9a-f]')
+      or not pathIn(block.path, country.namespace, '.bin') then error('invalid source block: ' .. tostring(key)) end
+    count = count + 1
+  end
+  if count == 0 then error('region has no source blocks') end
+end
+
 local function validateRegion(country, descriptor)
   local d = read(descriptor.manifest)
-  if d.schemaVersion ~= 1 or d.id ~= descriptor.id or d.runtime ~= 'lua' then
-    error('region must use schemaVersion 1, its declared id and runtime lua')
+  if (d.schemaVersion ~= 1 and d.schemaVersion ~= 2) or d.id ~= descriptor.id or d.runtime ~= 'lua' then
+    error('region must use schemaVersion 1 or 2, its declared id and runtime lua')
   end
+  if d.schemaVersion == 2 and d.sourceFormat ~= 'earthng-features-v2' then error('schemaVersion 2 needs earthng-features-v2') end
   if d.tileSize ~= 500 or not finite(d.cellSize) or d.cellSize < d.tileSize
     or d.cellSize > 10000 or d.cellSize % d.tileSize ~= 0 then error('invalid tileSize/cellSize grid') end
   if not geoBox(d.bounds) or not vector(d.geo, 8) then error('invalid region bounds/geo affine') end
   if math.abs(d.geo[5] * d.geo[8] - d.geo[6] * d.geo[7]) < 1e-18 then error('singular geo affine') end
+  local r = {country = country, descriptor = descriptor, data = d, coverage = {},
+    projection = type(coordinates.frame) == 'function' and coordinates.frame(d.frame) or nil}
+  if d.schemaVersion == 2 then
+    validateBlocks(country, d)
+    -- The author picked a road cell with a full neighbourhood; checked here against the masks.
+    if not vector(d.landing, 2) or not safeAt(r, d.landing[1], d.landing[2]) then
+      error('no complete landing neighbourhood in exported source cells')
+    end
+    local b = cellformat.BLOCK
+    local first = d.blocks[keyOf(math.floor(math.floor(d.landing[1] / d.cellSize) / b),
+      math.floor(math.floor(d.landing[2] / d.cellSize) / b))]
+    if not exists(first.path) then error('missing mounted source block: ' .. first.path) end
+    r.landing, r.coverage = {d.landing[1], d.landing[2]}, d.coverage
+    return r
+  end
   if type(d.cells) ~= 'table' then error('region cells must be an object') end
   local prefix, count = country.namespace, 0
   for key, cell in pairs(d.cells) do
@@ -134,8 +202,7 @@ local function validateRegion(country, descriptor)
     count = count + 1
   end
   if count == 0 then error('region has no mounted source cells') end
-  local r = {country = country, descriptor = descriptor, data = d, safe = {}, coverage = {},
-    projection = type(coordinates.frame) == 'function' and coordinates.frame(d.frame) or nil}
+  r.safe = {}
   -- Erode the exported cell union by the startup radius. Each advertised rectangle
   -- can land with the full 1 km neighbourhood, including at holes and outer edges.
   for _, cell in pairs(d.cells) do
@@ -151,6 +218,8 @@ local function validateRegion(country, descriptor)
     end
   end
   table.sort(r.safe, function(a, b) return a[1] == b[1] and a[2] < b[2] or a[1] < b[1] end)
+  if #r.safe == 0 then error('no complete landing neighbourhood in exported source cells') end
+  r.landing = {(r.safe[1][1] + r.safe[1][3]) / 2, (r.safe[1][2] + r.safe[1][4]) / 2}
   return r
 end
 
@@ -162,15 +231,16 @@ local function refresh()
   for _, issue in ipairs(errors or {}) do state.errors[#state.errors + 1] = issue end
   for _, country in ipairs(countries) do
     local accepted = 0
-    if country.runtime == 'native' and country.sourceFormat == 'earthng-features-v1' then
+    if country.runtime == 'native' and FORMATS[country.sourceFormat] then
+      local requested = country.landing
+      country.landing = nil
       for _, descriptor in ipairs(country.regions) do
         local ok, r = pcall(validateRegion, country, descriptor)
-        if ok and #r.safe > 0 then
+        if ok then
           regions[#regions + 1] = r
           accepted = accepted + 1
           if not country.landing then
-            local first = r.safe[1]
-            local lon, lat = geographic(r, (first[1] + first[3]) / 2, (first[2] + first[4]) / 2)
+            local lon, lat = geographic(r, r.landing[1], r.landing[2])
             country.landing = {lat = lat, lon = lon}
           end
           state.regions[#state.regions + 1] = {id = descriptor.id, country = country.id, title = descriptor.title or country.title,
@@ -182,11 +252,20 @@ local function refresh()
               or {box[1], box[2], box[3], box[4]}
           end
         else
-          addIssue(country, descriptor, ok and 'no complete landing neighbourhood in exported source cells' or r)
+          addIssue(country, descriptor, r)
+        end
+      end
+      -- The author's button point (e.g. the capital) wins when it is landable here.
+      if type(requested) == 'table' and finite(requested.lat) and finite(requested.lon) then
+        for _, r in ipairs(regions) do
+          if r.country == country and insideAny(r.descriptor.coverage, requested.lon, requested.lat) then
+            local x, y = localPoint(r, requested.lat, requested.lon)
+            if safeAt(r, x, y) then country.landing = {lat = requested.lat, lon = requested.lon}; break end
+          end
         end
       end
     elseif country.runtime ~= 'source' then
-      addIssue(country, nil, 'country requires runtime native and sourceFormat earthng-features-v1')
+      addIssue(country, nil, 'country requires runtime native and sourceFormat earthng-features-v1 or v2')
     end
     country.available = accepted > 0
     country.reason = country.available and nil or (country.runtime == 'source' and 'source-only' or 'no-playable-source')
@@ -204,7 +283,7 @@ local function at(lat, lon)
   for _, r in ipairs(regions) do
     if insideAny(r.country.coverage, lon, lat) and insideAny(r.descriptor.coverage, lon, lat) then
       local x, y = localPoint(r, lat, lon)
-      if insideAny(r.safe, x, y) and covered(r, x - LAND_RADIUS, y - LAND_RADIUS, x + LAND_RADIUS, y + LAND_RADIUS) then
+      if safeAt(r, x, y) and covered(r, x - LAND_RADIUS, y - LAND_RADIUS, x + LAND_RADIUS, y + LAND_RADIUS) then
         return r.country, r.descriptor, x, y, r
       end
     end
@@ -228,9 +307,38 @@ local function evict(cache, limit, protected, onRemove)
   end
 end
 
-local function loadCell(key, descriptor)
+local function loadBlock(key, block)
+  local hit = active.blocks[key]
+  if hit then hit.used = touch(); return hit end
+  local data = readBytes(block.path)
+  active.pause()
+  hit = {data = data, slots = cellformat.block(data), used = touch()}
+  active.blocks[key] = hit
+  evict(active.blocks, BLOCK_LIMIT)
+  return hit
+end
+
+-- keep: the tile's rectangle. A v2 cell is decoded for one tile and never cached: only the
+-- features reaching the tile become tables, and decoded points are the bulk of the Lua heap the
+-- game's collector walks every cycle (a dense 1 km cell is 6-10 MB of them). The block bytes
+-- stay cached; a string costs the collector nothing.
+local function loadCell(key, i, j, keep)
   local hit = active.cells[key]
   if hit then hit.used = touch(); return hit.data end
+  local d = active.region.data
+  if d.schemaVersion == 2 then
+    local b, s = cellformat.BLOCK, d.cellSize
+    local blockKey = keyOf(math.floor(i / b), math.floor(j / b))
+    local block = d.blocks[blockKey]
+    if not block or not hasCell(active.region, i, j) then error('missing source cell: ' .. key) end
+    local loaded = loadBlock(blockKey, block)
+    local range = loaded.slots[i % b + (j % b) * b]
+    if not range then error('source block lacks cell: ' .. key) end
+    return cellformat.cell(loaded.data, range[1], range[2], i * s, j * s,
+      {i * s, j * s, (i + 1) * s, (j + 1) * s}, active.pause, keep)
+  end
+  local descriptor = d.cells[key]
+  if not descriptor then error('missing source cell: ' .. key) end
   local cell = read(descriptor.path)
   for _, field in ipairs({'roads', 'junctions', 'buildings', 'areas', 'lines', 'points'}) do
     if cell[field] ~= nil and not array(cell[field]) then error('source cell ' .. field .. ' must be an array') end
@@ -340,13 +448,21 @@ local function land(req)
   state.job = {seq = req.seq, lat = req.lat, lon = req.lon, state = 'working', stage = 'source', progress = 0}
   local country, descriptor, x, y, r = at(req.lat, req.lon)
   if not r then fail('no_data: this point has no complete mounted source neighbourhood'); return state.job end
-  active = {region = r, cells = {}, tiles = {}, failed = {}, clock = 0, desired = {}, evicted = {}, epoch = 1,
+  active = {region = r, cells = {}, blocks = {}, tiles = {}, failed = {}, clock = 0, everBuilt = {}, desired = {}, evicted = {}, epoch = 1,
     epochPoint = {x, y}, prioritiesDirty = true, startupPinned = true,
     manifests = setmetatable({}, {__mode = 'v'}),
     landing = {x = x, y = y, required = needSquare(r, x, y)}, pose = {x = x, y = y, vx = 0, vy = 0}}
+  -- Generation hands the frame back only when update()'s budget is spent. A yield at every
+  -- pause point (thousands per tile) capped the work per frame by the number of resumes and
+  -- broke LuaJIT's traces in every hot loop; the clock is read at every 8th point.
+  local a, calls = active, 0
+  active.pause = function()
+    calls = calls + 1
+    if calls % 8 == 0 and a.timer and a.timer:stop() >= a.budget then coroutine.yield() end
+  end
   state.stream = {region = descriptor.id, country = country.id, tile = r.data.tileSize, generator = 'earthng-lua-v1',
     geo = affineAt(r, x, y), bounds = r.data.bounds, ready = {}, scenes = {}, far = {}, wanted = {}, readyCount = 0,
-    building = 0, queued = 0, failed = active.failed, built = 0, meanBuildSeconds = 0, loadRadius = 1000, farRadius = 3000, farFast = 25}
+    building = 0, queued = 0, failed = active.failed, built = 0, rebuilds = 0, meanBuildSeconds = 0, loadRadius = 1000, farRadius = 3000, farFast = 25}
   state.job.region, state.job.country, state.job.tileSize = descriptor.id, country.id, r.data.tileSize
   state.job.generator = state.stream.generator
   return state.job
@@ -367,7 +483,10 @@ local function priorities()
       local cx, cy = (i + 0.5) * t, (j + 0.5) * t
       local d = math.min(math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2), math.sqrt((cx - ax) ^ 2 + (cy - ay) ^ 2))
       local farD = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
-      if tileCovered(a.region, i, j) then
+      -- the renderer drops tiles well behind the car at speed (world.lua updateTiles, behind());
+      -- wanting them back here rebuilt each one after it was dropped
+      local behind = speed >= 15 and ((cx - p.x) * p.vx + (cy - p.y) * p.vy) < 0 and farD > radius * 0.6 + 250
+      if not behind and tileCovered(a.region, i, j) then
         if d <= radius then
           out[keyOf(i, j)] = {i = i, j = j, priority = d / math.max(speed, 5)}
         elseif farD <= farRadius and speed <= st.farFast then
@@ -401,6 +520,24 @@ local function geometrySize(manifest)
   return triangles, vertices
 end
 
+-- Geometry still held only here. A layer the renderer has taken (manifest()) is queued for
+-- spawning there: evicting it frees nothing and made the next update build the tile again.
+local function entrySize(entry)
+  local triangles, vertices = 0, 0
+  for _, layer in ipairs({'road', 'scene', 'far'}) do
+    if not entry[layer .. 'Taken'] then
+      local t, v = geometrySize(entry[layer])
+      triangles, vertices = triangles + t, vertices + v
+    end
+  end
+  return triangles, vertices
+end
+
+local function inRenderer(entry)
+  return (entry.roadTaken and not entry.roadDelivered) or (entry.sceneTaken and not entry.sceneDelivered)
+    or (entry.farTaken and not entry.farDelivered)
+end
+
 local function trimTiles()
   local a, st = active, state.stream
   local count, triangles, vertices, cellCount = 0, 0, 0, 0
@@ -414,7 +551,7 @@ local function trimTiles()
       local required = a.landing and a.startupPinned and a.landing.required[key]
       local selected = a.startupPinned and a.landing and a.landing.selected == key
       local priority = a.desired[key] and a.desired[key].priority or 1e20
-      if not required and not selected and (not worst or priority > worstPriority or (priority == worstPriority and entry.used < oldest)) then
+      if not required and not selected and not inRenderer(entry) and (not worst or priority > worstPriority or (priority == worstPriority and entry.used < oldest)) then
         worst, worstPriority, oldest = key, priority, entry.used
       end
     end
@@ -441,14 +578,15 @@ local function buildTile(key, wanted)
   for i = math.floor(x0 / s), math.ceil((x0 + t) / s) - 1 do
     for j = math.floor(y0 / s), math.ceil((y0 + t) / s) - 1 do
       local cellKey = keyOf(i, j)
-      cells[#cells + 1] = loadCell(cellKey, r.data.cells[cellKey])
-      coroutine.yield()
+      cells[#cells + 1] = loadCell(cellKey, i, j, {x0, y0, x0 + t, y0 + t})
+      active.pause()
     end
   end
   local center = active.landing and {active.landing.x, active.landing.y} or nil
   local road, scene, far, nav = generator.build(cells, wanted.i, wanted.j,
-    {tileSize = t, regionId = r.descriptor.id, center = center, pause = function() coroutine.yield() end,
-      materials = '/earthng/planet/materials.json', packs = '/e2r_stream/fast-art/v9/packs.json', far = wanted.far})
+    {tileSize = t, regionId = r.descriptor.id, center = center, pause = active.pause,
+      materials = '/earthng/planet/materials.json', packs = '/e2r_stream/fast-art/v10/packs.json', far = wanted.far,
+      seaLevel = finite(r.data.seaLevel) and r.data.seaLevel or nil})
   if type(road) ~= 'table' or type(road.items) ~= 'table' or type(road.mats) ~= 'table'
     or type(scene) ~= 'table' or type(scene.items) ~= 'table' then error('generator returned an invalid tile manifest') end
   if wanted.far and (type(far) ~= 'table' or type(far.items) ~= 'table') then error('generator returned an invalid far manifest') end
@@ -457,7 +595,7 @@ local function buildTile(key, wanted)
   end
   road.tile, road.source, scene.source = {wanted.i, wanted.j}, r.descriptor.id, r.descriptor.id
   road.materials, scene.materials = '/earthng/planet/materials.json', '/earthng/planet/materials.json'
-  road.packs = '/e2r_stream/fast-art/v9/packs.json'
+  road.packs = '/e2r_stream/fast-art/v10/packs.json'
   road.navSegments = type(nav) == 'table' and nav.segments or {}
   local entry = active.tiles[key] or {}
   if wanted.far then
@@ -468,14 +606,17 @@ local function buildTile(key, wanted)
     entry.road, entry.scene, entry.nav = road, scene, nav
     active.manifests[key .. ':road'], active.manifests[key .. ':scene'] = road, scene
   end
-  local rt, rv = geometrySize(entry.road)
-  local stt, sv = geometrySize(entry.scene)
-  local ft, fv = geometrySize(entry.far)
-  entry.used, entry.triangles, entry.vertices = touch(), rt + stt + ft, rv + sv + fv
+  if wanted.far then entry.farTaken, entry.farDelivered = nil, nil
+  else entry.roadTaken, entry.sceneTaken, entry.roadDelivered, entry.sceneDelivered = nil, nil, nil, nil end
+  entry.used = touch()
+  entry.triangles, entry.vertices = entrySize(entry)
   active.tiles[key] = entry
   local st = state.stream
   st.ready[key], st.scenes[key], st.far[key] = entry.road and true or nil, entry.scene and true or nil, entry.far and true or nil
   st.built = st.built + 1
+  local layerKey = key .. (wanted.far and ':far' or ':road')
+  if active.everBuilt[layerKey] then st.rebuilds = st.rebuilds + 1 end
+  active.everBuilt[layerKey] = true
   trimTiles()
 end
 
@@ -485,6 +626,7 @@ local function update(dt, budgetMs)
   local wanted, best, bestKey = active.prioritiesDirty and priorities() or active.desired, nil, nil
   local timer = hptimer()
   budgetMs = finite(budgetMs) and math.max(0.1, math.min(8, budgetMs)) or 2
+  active.timer, active.budget = timer, budgetMs
   local steps = 0
   repeat
     if not active.work then
@@ -508,7 +650,15 @@ local function update(dt, budgetMs)
       state.stream.building = 1
       if state.job and state.job.state == 'working' then state.job.stage = 'Generating roads and scenery in Lua' end
     end
+    local resumeTimer = hptimer()
     local ok, message = coroutine.resume(active.work)
+    local resumeMs = resumeTimer:stop()
+    -- a resume far over the budget (a block read, a big sort) for the automation report
+    if resumeMs > 30 then
+      local slow = state.stream.slowResumes or {}
+      state.stream.slowResumes = slow
+      if #slow < 40 then slow[#slow + 1] = {active.workKey, active.workFar and 'far' or 'near', math.floor(resumeMs)} end
+    end
     steps = steps + 1
     if not ok then
       active.failed[active.workKey] = tostring(message)
@@ -520,7 +670,7 @@ local function update(dt, budgetMs)
       trimTiles()
     end
     state.stream.building = active.work and 1 or 0
-  until steps >= 256 or timer:stop() >= budgetMs
+  until steps >= 10000 or timer:stop() >= budgetMs
 end
 
 local function pose(p)
@@ -532,7 +682,16 @@ local function pose(p)
   active.pose = {x = p.x, y = p.y,
     vx = finite(p.vx) and math.max(-10000, math.min(10000, p.vx)) or 0,
     vy = finite(p.vy) and math.max(-10000, math.min(10000, p.vy)) or 0}
-  if p.x ~= old.x or p.y ~= old.y or active.pose.vx ~= old.vx or active.pose.vy ~= old.vy then active.prioritiesDirty = true end
+  -- The wanted set depends on the car's tile, the look-ahead point's tile and the far switch;
+  -- recomputing it (~170 tiles) for every pose made garbage in every frame.
+  local t = active.region.data.tileSize
+  local speed = math.sqrt(active.pose.vx ^ 2 + active.pose.vy ^ 2)
+  local ahead = math.min(speed * 3, 2000)
+  local ax = speed > 0 and p.x + active.pose.vx / speed * ahead or p.x
+  local ay = speed > 0 and p.y + active.pose.vy / speed * ahead or p.y
+  local signature = string.format('%d_%d_%d_%d_%s', math.floor(p.x / t), math.floor(p.y / t),
+    math.floor(ax / t), math.floor(ay / t), tostring(speed <= state.stream.farFast))
+  if signature ~= active.poseSignature then active.poseSignature, active.prioritiesDirty = signature, true end
   local ep = active.epochPoint
   if (p.x - ep[1]) ^ 2 + (p.y - ep[2]) ^ 2 >= 250 * 250 then
     active.epoch, active.epochPoint = active.epoch + 1, {p.x, p.y}
@@ -552,17 +711,20 @@ local function pose(p)
     (b[3] - lon) * 111.2 * math.cos(math.rad(lat)), (lat - b[2]) * 111.2, (b[4] - lat) * 111.2))
 end
 
-local function manifest(key, layer)
-  local entry = active and active.tiles[key]
-  if entry then entry.used = touch(); return entry[layer or 'road'] end
+local function recount(entry)
+  entry.triangles, entry.vertices = entrySize(entry)
 end
 
-local function recount(entry)
-  local rt, rv = geometrySize(entry.road)
-  local stt, sv = geometrySize(entry.scene)
-  local ft, fv = geometrySize(entry.far)
-  entry.triangles, entry.vertices = rt + stt + ft, rv + sv + fv
+local function manifest(key, layer)
+  local entry = active and active.tiles[key]
+  if entry then
+    layer = layer or 'road'
+    entry.used = touch()
+    if entry[layer] then entry[layer .. 'Taken'] = true; recount(entry) end
+    return entry[layer]
+  end
 end
+
 
 -- createMesh has copied these arrays to the engine. The renderer calls this only
 -- after the entire layer has spawned, so its queue can no longer need the tables.
@@ -592,13 +754,13 @@ local function unload(key, layer)
     active.work, active.workKey, st.building = nil, nil, 0
   end
   if farOnly then
-    if entry then entry.far, entry.farDelivered = nil, nil end
+    if entry then entry.far, entry.farDelivered, entry.farTaken = nil, nil, nil end
     st.far[key], active.evicted[key .. ':far'] = nil, nil
     active.manifests[key .. ':far'] = nil
   else
     if entry then
       entry.road, entry.scene, entry.nav = nil, nil, nil
-      entry.roadDelivered, entry.sceneDelivered = nil, nil
+      entry.roadDelivered, entry.sceneDelivered, entry.roadTaken, entry.sceneTaken = nil, nil, nil, nil
     end
     st.ready[key], st.scenes[key], active.evicted[key .. ':road'] = nil, nil, nil
     active.manifests[key .. ':road'], active.manifests[key .. ':scene'] = nil, nil
@@ -612,7 +774,115 @@ local function unload(key, layer)
   return entry ~= nil
 end
 
+-- Streets on the picker map before any landing: road centre lines straight from the
+-- mounted v2 blocks under the view, decoded a little per frame and cached per block.
+-- Rank 1: motorway..secondary, 2: tertiary/residential/unclassified, 3: the rest.
+local MAP_BLOCKS, MAP_CACHE = 48, 96
+local RANK = {motorway = 1, trunk = 1, primary = 1, secondary = 1, tertiary = 2, residential = 2,
+  unclassified = 2, living_street = 2}
+local mapCache, mapClock, mapWork = {}, 0, nil
+
+local function mapBlock(r, key, block)
+  local data = readBytes(block.path)
+  coroutine.yield()
+  local b, s = cellformat.BLOCK, r.data.cellSize
+  local bi, bj = key:match('^(-?%d+)_(-?%d+)$')
+  bi, bj = tonumber(bi), tonumber(bj)
+  local cx, cy = (bi + .5) * b * s, (bj + .5) * b * s
+  local g = affineAt(r, cx, cy)
+  local lines, seen = {}, {}
+  for slot, range in pairs(cellformat.block(data)) do
+    local i, j = bi * b + slot % b, bj * b + math.floor(slot / b)
+    for _, road in ipairs(cellformat.roads(data, range[1], range[2], i * s, j * s)) do
+      if not seen[road.id] then
+        seen[road.id] = true
+        local highway = (road.highway or ''):gsub('_link$', '')
+        local geo, xy, lastX, lastY = {}, road.xy, nil, nil
+        local box = {math.huge, math.huge, -math.huge, -math.huge}  -- lat/lon: south, west, north, east
+        for n = 1, #xy, 2 do
+          local x, y = xy[n], xy[n + 1]
+          -- every bend of 15 m or more; the map never needs the 20 m profile knots
+          if n == 1 or n == #xy - 1 or (x - lastX) ^ 2 + (y - lastY) ^ 2 >= 225 then
+            local dx, dy = x - g[1], y - g[2]
+            local lat, lon = g[4] + g[7] * dx + g[8] * dy, g[3] + g[5] * dx + g[6] * dy
+            geo[#geo + 1], geo[#geo + 2] = lat, lon
+            box[1], box[2] = math.min(box[1], lat), math.min(box[2], lon)
+            box[3], box[4] = math.max(box[3], lat), math.max(box[4], lon)
+            lastX, lastY = x, y
+          end
+        end
+        lines[#lines + 1] = {rank = RANK[highway] or 3, geo = geo, box = box}
+      end
+    end
+    coroutine.yield()
+  end
+  return lines
+end
+
+local function mapRoads(view, budgetMs)
+  ensure()
+  if type(view) ~= 'table' or not finite(view.w) or not finite(view.s) or not finite(view.e) or not finite(view.n) then return {} end
+  local wanted, out = {}, {}
+  for _, r in ipairs(regions) do
+    local b = r.data.bounds
+    if r.data.schemaVersion == 2 and b[1] <= view.e and b[3] >= view.w and b[2] <= view.n and b[4] >= view.s then
+      local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+      for _, p in ipairs({{view.s, view.w}, {view.s, view.e}, {view.n, view.w}, {view.n, view.e}}) do
+        local x, y = localPoint(r, p[1], p[2])
+        x0, y0, x1, y1 = math.min(x0, x), math.min(y0, y), math.max(x1, x), math.max(y1, y)
+      end
+      local size = cellformat.BLOCK * r.data.cellSize
+      local bi0, bj0, bi1, bj1 = math.floor(x0 / size), math.floor(y0 / size), math.floor(x1 / size), math.floor(y1 / size)
+      if (bi1 - bi0 + 1) * (bj1 - bj0 + 1) <= MAP_BLOCKS * 4 then
+        for bj = bj0, bj1 do
+          for bi = bi0, bi1 do
+            local key = keyOf(bi, bj)
+            if r.data.blocks[key] then wanted[#wanted + 1] = {r = r, key = key, id = r.descriptor.id .. ':' .. key} end
+          end
+        end
+      end
+    end
+  end
+  if #wanted > MAP_BLOCKS then return out end -- zoomed too far out for streets
+  mapClock = mapClock + 1
+  local missing
+  for _, w in ipairs(wanted) do
+    local hit = mapCache[w.id]
+    if hit then hit.used = mapClock; out[#out + 1] = hit.lines elseif not missing then missing = w end
+  end
+  if mapWork and mapWork.id ~= (missing and missing.id) and mapCache[mapWork.id] == nil then
+    -- keep finishing a block still in view; drop one the player panned away from
+    local still = false
+    for _, w in ipairs(wanted) do if w.id == mapWork.id then still = true end end
+    if not still then mapWork = nil end
+  end
+  if not mapWork and missing then
+    local w = missing
+    mapWork = {id = w.id, co = coroutine.create(function() return mapBlock(w.r, w.key, w.r.data.blocks[w.key]) end)}
+  end
+  local timer = hptimer()
+  budgetMs = finite(budgetMs) and budgetMs or 3
+  while mapWork and timer:stop() < budgetMs do
+    local ok, lines = coroutine.resume(mapWork.co)
+    if not ok then
+      mapCache[mapWork.id], mapWork = {lines = {}, used = mapClock, error = tostring(lines)}, nil
+    elseif coroutine.status(mapWork.co) == 'dead' then
+      mapCache[mapWork.id] = {lines = lines, used = mapClock}
+      out[#out + 1] = lines
+      mapWork = nil
+      local count, oldest, oldestAt = 0, nil, nil
+      for id, entry in pairs(mapCache) do
+        count = count + 1
+        if not oldestAt or entry.used < oldestAt then oldest, oldestAt = id, entry.used end
+      end
+      if count > MAP_CACHE then mapCache[oldest] = nil end
+    end
+  end
+  return out
+end
+
 M.refresh = refresh
+M.mapRoads = mapRoads
 M.at = at
 M.land = land
 M.update = update
@@ -620,6 +890,7 @@ M.pose = pose
 M.manifest = manifest
 M.release = release
 M.unload = unload
+M.localPoint = function(lat, lon) if active then return localPoint(active.region, lat, lon) end end
 M.nav = function(key) local entry = active and active.tiles[key]; return entry and entry.nav end
 M.status = function() ensure(); state.heartbeat = os.time(); return state end
 return M

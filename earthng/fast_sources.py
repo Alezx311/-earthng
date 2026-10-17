@@ -140,6 +140,19 @@ def window_of(index, point):
     return dict(index, tiles=tiles, package_box=window, window=window, centre=centre), window
 
 
+def window_box(index, box):
+    """The tiles of a package under a lon/lat box (an authoring grid region), centred on it."""
+    tiles = {k: v for k, v in index['tiles'].items()
+             if v['cell'][0] < box[2] and v['cell'][2] > box[0] and v['cell'][1] < box[3] and v['cell'][3] > box[1]}
+    if not tiles:
+        raise ValueError(f'no_osm: {box} is outside the source package')
+    xs = [c for v in tiles.values() for c in (v['cell'][0], v['cell'][2])]
+    ys = [c for v in tiles.values() for c in (v['cell'][1], v['cell'][3])]
+    window = [round(min(xs), 6), round(min(ys), 6), round(max(xs), 6), round(max(ys), 6)]
+    centre = [round((box[0] + box[2]) / 2, 6), round((box[1] + box[3]) / 2, 6)]
+    return dict(index, tiles=tiles, package_box=window, window=window, centre=centre), window
+
+
 def dem_tiles(box):
     """z12 Terrarium tiles under a lon/lat box, one tile of margin (fast_dem.audit's rule)."""
     w, s, e, n = box
@@ -148,12 +161,13 @@ def dem_tiles(box):
     return [(x, y) for x in range(math.floor(x0) - 1, math.floor(x1) + 2) for y in range(math.floor(y0) - 1, math.floor(y1) + 2)]
 
 
-def source_identity(source, dem, point=None):
+def source_identity(source, dem, point=None, box=None):
     """Index checksum (of the window's tiles) plus the DEM files under it (name, size, mtime):
     old geometry cannot survive source replacement. Contents were hashed before: 200 MB of
     PNG per landing for the oblast."""
     source, dem = Path(source), Path(dem)
-    index, window = window_of(json.loads((source / 'index.json').read_bytes()), point)
+    index = json.loads((source / 'index.json').read_bytes())
+    index, window = window_box(index, box) if box is not None else window_of(index, point)
     # the frame's origin: the window's centre (the landing snapped to WINDOW_SNAP, so nearby
     # landings share the index and its tiles; at most ~11 km from the car), else the package's
     if 'centre' not in index:
@@ -179,23 +193,31 @@ class Terrain:
         self.cache, self.frame = Path(cache), frame or Frame()
         self.images = OrderedDict()
 
+    def image(self, a, b):
+        key = (a, b)
+        if key not in self.images:
+            path = self.cache / 'terrain' / '12' / str(a) / f'{b}.png'
+            if not path.exists():
+                raise FileNotFoundError(f'no_dem: {path}')
+            with Image.open(path) as im:
+                rgb = np.asarray(im.convert('RGB'), dtype=float)
+            self.images[key] = rgb[:,:,0]*256 + rgb[:,:,1] + rgb[:,:,2]/256 - 32768
+            if len(self.images) > 24:
+                self.images.popitem(last=False)
+        self.images.move_to_end(key)
+        return self.images[key]
+
     def pixels(self, x, y):
-        out = np.empty(len(x), dtype=float)
         tx, ty = x // 256, y // 256
-        for a, b in set(zip(tx.tolist(), ty.tolist())):
-            key = (a, b)
-            if key not in self.images:
-                path = self.cache / 'terrain' / '12' / str(a) / f'{b}.png'
-                if not path.exists():
-                    raise FileNotFoundError(f'no_dem: {path}')
-                with Image.open(path) as im:
-                    rgb = np.asarray(im.convert('RGB'), dtype=float)
-                self.images[key] = rgb[:,:,0]*256 + rgb[:,:,1] + rgb[:,:,2]/256 - 32768
-                if len(self.images) > 24:
-                    self.images.popitem(last=False)
-            self.images.move_to_end(key)
-            mask = (tx == a) & (ty == b)
-            out[mask] = self.images[key][y[mask] % 256, x[mask] % 256]
+        a0, b0 = int(tx[0]), int(ty[0])
+        if (tx == a0).all() and (ty == b0).all():     # the usual case: one PNG
+            return self.image(a0, b0)[y % 256, x % 256]
+        out = np.empty(len(x), dtype=float)
+        keys = tx * 65536 + ty                          # z12 tile indices are 0..4095
+        for key in np.unique(keys).tolist():
+            mask = keys == key
+            a, b = divmod(key, 65536)
+            out[mask] = self.image(a, b)[y[mask] % 256, x[mask] % 256]
         return out
 
     def sample(self, xy, smooth=False):
@@ -210,9 +232,12 @@ class Terrain:
         u, v = x-ix, y-iy
         offsets = [(0,0,1.)] if not smooth else [(0,0,.5),(-1,0,.125),(1,0,.125),(0,-1,.125),(0,1,.125)]
         z = np.zeros(len(x))
+        n = len(x)
         for dx, dy, weight in offsets:
-            z += weight * ((self.pixels(ix+dx,iy+dy)*(1-u) + self.pixels(ix+dx+1,iy+dy)*u)*(1-v)
-                           + (self.pixels(ix+dx,iy+dy+1)*(1-u) + self.pixels(ix+dx+1,iy+dy+1)*u)*v)
+            # the four corners in one lookup (one pass over the PNG keys)
+            p = self.pixels(np.concatenate([ix+dx, ix+dx+1, ix+dx, ix+dx+1]),
+                            np.concatenate([iy+dy, iy+dy, iy+dy+1, iy+dy+1]))
+            z += weight * ((p[:n]*(1-u) + p[n:2*n]*u)*(1-v) + (p[2*n:3*n]*(1-u) + p[3*n:]*u)*v)
         if not np.isfinite(z).all():
             raise ValueError('non-finite DEM')
         return z + LIFT
@@ -406,7 +431,7 @@ def prepare(*args, **kw):
             gc.enable()
 
 
-def _prepare(source, output, dem, emit=print, point=None, cancelled=None):
+def _prepare(source, output, dem, emit=print, point=None, cancelled=None, box=None):
     """Parse source tiles once, split roads at shared nodes, publish a read-only index.
     A large package is indexed as a window round point (the landing). cancelled() is asked
     between the stages: a window of a big city takes minutes, and the single preparer must not
@@ -416,7 +441,7 @@ def _prepare(source, output, dem, emit=print, point=None, cancelled=None):
     def check():
         if cancelled and cancelled():
             raise Cancelled(point)
-    identity, index = source_identity(source, dem, point)
+    identity, index = source_identity(source, dem, point, box)
     target = Path(output) / identity
     final = target / 'sources.sqlite'
     if final.exists():
@@ -558,7 +583,11 @@ class Store:
                     if kind is None:
                         kind=fast_style.ground_kind(a.tags)
                     if kind and a.id not in found:
-                        found[a.id]=(kind,dict(a.tags),shape(json.loads(factory.create_multipolygon(a))))
+                        try:
+                            geometry=factory.create_multipolygon(a)
+                        except RuntimeError:
+                            return      # broken OSM ring (e.g. area 29961653): skip that area alone
+                        found[a.id]=(kind,dict(a.tags),shape(json.loads(geometry)))
                 def node(self,n):
                     # bus stops and traffic signals where OSM has them (way nodes keep their tags
                     # in the source tiles); keyed apart from areas and ways

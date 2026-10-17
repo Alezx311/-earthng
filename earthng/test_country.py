@@ -11,6 +11,7 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 
 import build_country as country
+import country_format as binary
 import fast_sources as sources
 
 
@@ -79,8 +80,9 @@ class CountryTests(unittest.TestCase):
         result = self.build()
         with zipfile.ZipFile(result) as archive:
             names = archive.namelist()
-            self.assertTrue(all(name.startswith('earthng/countries/ua/') and name.endswith('.json') for name in names))
-            self.assertEqual(len(names), 4)  # country, region and two source cells
+            self.assertTrue(all(name.startswith('earthng/countries/ua/') and name.endswith(('.json', '.bin'))
+                                for name in names))
+            self.assertEqual(len(names), 3)  # country, region and one block of two source cells
             index = json.loads(archive.read('earthng/countries/ua/manifest.json'))
             self.assertEqual(index['runtime'], 'native')
             self.assertEqual(index['sourceFormat'], country.FORMAT)
@@ -92,17 +94,94 @@ class CountryTests(unittest.TestCase):
             descriptor = index['regions'][0]
             self.assertEqual(descriptor['id'], 'test-region')
             region = json.loads(archive.read(descriptor['manifest'].lstrip('/')))
-            self.assertEqual(region['runtime'], 'lua')
+            self.assertEqual((region['schemaVersion'], region['runtime'], region['blockCells']), (2, 'lua', 8))
             self.assertEqual(region['sourceId'], index['sourceId'])
             self.assertEqual(region['sourceDate'], index['sourceDate'])
-            self.assertEqual(set(region['cells']), {'0_0', '1_0'})
-            self.assertEqual(region['cells']['1_0']['bounds'], [1000, 0, 2000, 1000])
-            self.assertEqual(region['coverage'], [self.store.frame.geo_bbox([0, 0, 1000, 1000]),
-                                                 self.store.frame.geo_bbox([1000, 0, 2000, 1000])])
+            self.assertEqual(region['cellCount'], 2)
+            self.assertEqual(region['seaLevel'], sources.LIFT)  # the DEM sea surface in region metres
+            self.assertEqual(set(region['blocks']), {'0_0'})
+            block = region['blocks']['0_0']
+            self.assertEqual(block['mask'], '3000000000000000')  # slots 0 and 1: cells 0_0 and 1_0
+            self.assertEqual(region['coverage'], [self.store.frame.geo_bbox([0, 0, 2000, 1000])])
             self.assertEqual(index['coverage'], region['coverage'])
+            self.assertNotIn('landing', region)  # 2 x 1 km has no full 3 x 3 km landing neighbourhood
             self.assertNotIn('/private', archive.read(descriptor['manifest'].lstrip('/')).decode())
             self.assertEqual(len(region['geo']), 8)
+            data = archive.read(block['path'].lstrip('/'))
+            ranges = binary.decode_block(data)
+            self.assertEqual(sorted(ranges), [0, 1])
+            cell = binary.decode_cell(data, (1000, 0), [1000, 0, 2000, 1000], *ranges[1])
+            self.assertEqual(cell['terrain']['rect'], [1000, 0, 2000, 1000])
+            self.assertEqual(cell['roads'][0]['nodes'][0], '9007199254740993')
         self.store.db.close.assert_called_once()
+
+    def test_binary_cell_round_trip_keeps_centimetres_and_shared_seams(self):
+        a = country.compile_cell(self.store, [0, 0, 1000, 1000])
+        b = country.compile_cell(self.store, [1000, 0, 2000, 1000])
+        da = binary.decode_cell(binary.encode_cell(a, (0, 0)), (0, 0), [0, 0, 1000, 1000])
+        db = binary.decode_cell(binary.encode_cell(b, (1000, 0)), (1000, 0), [1000, 0, 2000, 1000])
+        self.assertEqual(da['roads'], db['roads'])  # same integers whatever the cell origin
+        for kind in binary.KINDS:
+            self.assertEqual([f['id'] for f in da[kind]], [f['id'] for f in a[kind]])
+        for p, q in zip(a['roads'][0]['points'], da['roads'][0]['points']):
+            self.assertTrue(all(abs(x - y) <= .005 for x, y in zip(p, q)))
+        self.assertEqual(da['roads'][0]['tags'], ROAD['tags'])
+        self.assertEqual(da['buildings'][0]['height'], 12.)
+        self.assertEqual(len(da['buildings'][0]['rings']), 2)
+        self.assertEqual(da['points'][0]['pos'], [1000., 20., 50.4])
+        heights = da['terrain']['heights']
+        self.assertTrue(all(abs(x - y) <= .05 for x, y in zip(heights, a['terrain']['heights'])))
+        self.assertEqual(heights[40::41], db['terrain']['heights'][0::41])
+        with self.assertRaisesRegex(ValueError, 'trailing'):
+            binary.decode_cell(binary.encode_cell(a, (0, 0)) + b'\x00', (0, 0), [0, 0, 1000, 1000])
+        with self.assertRaisesRegex(ValueError, 'truncated'):
+            binary.decode_cell(binary.encode_cell(a, (0, 0))[:-3], (0, 0), [0, 0, 1000, 1000])
+
+    def test_large_areas_are_cut_to_the_padded_cell(self):
+        forest = (5, 'forest', {'tags': {'landuse': 'forest'}},
+                  Polygon([(-5000, -5000), (6000, -5000), (6000, 6000), (-5000, 6000)]))
+        self.store.scenery = lambda rect: [forest]
+        cell = country.compile_cell(self.store, [0, 0, 1000, 1000])
+        ring = cell['areas'][0]['rings'][0]
+        xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+        self.assertEqual((min(xs), min(ys), max(xs), max(ys)), (-100, -100, 1100, 1100))
+
+    def test_ragged_package_edge_reads_quarters_from_several_tiles(self):
+        calls = []
+
+        def scenery(rect):
+            calls.append(rect)
+            if rect[2] - rect[0] > 600:
+                raise ValueError('no_osm scenery coverage: ragged edge')
+            if rect[0] < 0 and rect[1] < 0:
+                raise ValueError('no_osm scenery coverage: open sea')
+            return [(7, 'water', {'tags': {}}, Polygon([(0, 0), (50, 0), (50, 50)]))]
+        self.store.scenery = scenery
+        cell = country.compile_cell(self.store, [0, 0, 1000, 1000])
+        self.assertEqual(len(cell['areas']), 1)  # one area, though three quarters returned it
+        self.assertGreater(len(calls), 5)
+        self.store.scenery = Mock(side_effect=ValueError('broken tile'))
+        with self.assertRaisesRegex(ValueError, 'broken tile'):
+            country.compile_cell(self.store, [0, 0, 1000, 1000])
+
+    def test_grid_region_lands_on_roads_and_clips_coverage_to_its_core(self):
+        self.store.covered = lambda rect: -3000 <= rect[0] and rect[2] <= 3000 and -3000 <= rect[1] and rect[3] <= 3000
+        lon, lat = self.store.frame.geographic([-1500, 1500], [-1500, 1500])
+        core = [float(lon[0]), float(lat[0]), float(lon[1]), float(lat[1])]
+        with patch.object(sources, 'Store', return_value=self.store):
+            result = country.build_country('ua', 'Україна', '1', [{'dir': self.region, 'core': core, 'id': 'e0300-n500'}],
+                                           self.root / 'mods', emit=lambda _: None, landing=(50.45, 30.52))
+        with zipfile.ZipFile(result) as archive:
+            index = json.loads(archive.read('earthng/countries/ua/manifest.json'))
+            self.assertEqual(index['landing'], {'lat': 50.45, 'lon': 30.52})
+            region = json.loads(archive.read(index['regions'][0]['manifest'].lstrip('/')))
+        self.assertEqual(region['id'], 'e0300-n500')
+        self.assertEqual(region['cellCount'], 36)  # core +- 4 km margin, cut to source coverage
+        self.assertEqual(set(region['blocks']), {'-1_-1', '0_-1', '-1_0', '0_0'})
+        x, y = region['landing']
+        self.assertTrue(-1000 <= x <= 1000 and -1000 <= y <= 1000)
+        for box in region['coverage']:
+            self.assertTrue(core[0] <= box[0] < box[2] <= core[2] and core[1] <= box[1] < box[3] <= core[3])
 
     def test_full_feature_halo_holes_profile_and_terrain_seams(self):
         a = country.compile_cell(self.store, [0, 0, 1000, 1000])
@@ -139,7 +218,7 @@ class CountryTests(unittest.TestCase):
         target = self.build()
         expected = target.read_bytes()
         self.store.terrain.sample = Mock(side_effect=FileNotFoundError('no_dem'))
-        with self.assertRaisesRegex(FileNotFoundError, 'no_dem'):
+        with self.assertRaisesRegex(ValueError, 'no_dem'):  # every cell lacked elevation
             self.build()
         self.assertEqual(target.read_bytes(), expected)
         self.assertEqual(list(target.parent.glob('*.tmp')), [])
@@ -183,7 +262,23 @@ class CountryTests(unittest.TestCase):
         with zipfile.ZipFile(result) as archive:
             index = json.loads(archive.read('earthng/countries/ua/manifest.json'))
             self.assertEqual(len(index['regions']), 2)
-            self.assertTrue(any('/second-region/cells/' in name for name in archive.namelist()))
+            self.assertTrue(any('/second-region/blocks/' in name for name in archive.namelist()))
+
+    def test_dem_spikes_and_pits_take_the_neighbourhood_median_with_equal_seams(self):
+        class Noisy:
+            def sample(self, xy):
+                xy = np.asarray(xy)
+                h = 40 + xy[:, 0] * .2  # a steep, real 20 % slope stays
+                h[(np.abs(xy[:, 0] - 1000) < 1) & (np.abs(xy[:, 1] - 500) < 1)] += 230  # a spike
+                h[(np.abs(xy[:, 0] - 500) < 1) & (np.abs(xy[:, 1] - 500) < 1)] -= 90   # a pit
+                return h
+        terrain = country.Despiked(Noisy())
+        self.assertEqual(list(terrain.sample([[1000, 500], [500, 500], [300, 300]])), [240., 140., 100.])
+        self.store.terrain = terrain
+        a = country.compile_cell(self.store, [0, 0, 1000, 1000])['terrain']['heights']
+        b = country.compile_cell(self.store, [1000, 0, 2000, 1000])['terrain']['heights']
+        self.assertEqual(a[40::41], b[0::41])
+        self.assertEqual((a[20 * 41 + 40], a[20 * 41 + 20]), (240., 140.))  # spike and pit gone
 
     def test_nonfinite_geometry_and_terrain_are_rejected(self):
         data = copy.deepcopy(ROAD)

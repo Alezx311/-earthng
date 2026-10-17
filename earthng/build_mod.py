@@ -154,7 +154,7 @@ def build(out, lang='uk', legacy=False):
         for name, data in level_files(lang, legacy=legacy).items():
             z.writestr(name, data)
         z.writestr('earthng/planet/manifest.json', json.dumps({
-            'schemaVersion': 1, 'kind': 'earthng-planet', 'version': '0.2.0',
+            'schemaVersion': 1, 'kind': 'earthng-planet', 'version': '0.2.1',
             'countrySchemaVersion': 1, 'runtime': 'companion' if legacy else 'lua',
         }))
         if not legacy:
@@ -165,6 +165,13 @@ def build(out, lang='uk', legacy=False):
             for src in sorted(art.rglob('*')):
                 if src.is_file() and src.suffix in ('.dds', '.json'):
                     z.write(src, f'e2r_stream/fast-art/{fast_art.VERSION}/' + src.relative_to(art).as_posix())
+            # the picker's offline base map (Natural Earth tiles and labels; PNGs are stored as is)
+            import build_basemap
+            base = build_basemap.build()
+            for src in sorted(base.rglob('*')):
+                if src.is_file() and src.suffix in ('.png', '.json'):
+                    z.write(src, 'earthng/planet/basemap/' + src.relative_to(base).as_posix(),
+                            compress_type=zipfile.ZIP_STORED if src.suffix == '.png' else zipfile.ZIP_DEFLATED)
     temporary.replace(path)
     return path
 

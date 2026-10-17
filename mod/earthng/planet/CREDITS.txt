@@ -1,5 +1,6 @@
-EarthNG offline base map: Natural Earth 1:110m land, public domain.
-Source: https://github.com/nvkelso/natural-earth-vector/blob/master/geojson/ne_110m_land.geojson
+EarthNG offline base map: Natural Earth 1:10m land, lakes, rivers, urban areas,
+borders, populated places and country names; 1:110m land as a fallback. Public domain.
+Source: https://github.com/nvkelso/natural-earth-vector/tree/master/geojson
 Terms: https://www.naturalearthdata.com/about/terms-of-use/
 
 Country source data: OpenStreetMap contributors, ODbL 1.0.
@@ -7,5 +8,6 @@ https://www.openstreetmap.org/copyright
 Country packs must retain their source/date and attribution in the manifest.
 
 Shared art: EarthNG procedural drawings and CC0 photos (Panelka, ambientCG).
+Retro City: original EarthNG procedural pixel drawings, palette and material preset.
 No BeamNG game assets are included: game shapes and materials are referenced
 from the player's installation. See the EarthNG source project for the art tools.

@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'out/test-tools'))
 from lupa.luajit21 import LuaRuntime
 
+sys.path.insert(0, str(ROOT / 'earthng'))
+import country_format as binary
+
 
 def fixture(size=4):
     base = '/earthng/countries/demo/'
@@ -54,6 +57,11 @@ class NativeTests(unittest.TestCase):
           FS={fileExists=function(_,p) return files[p]~=nil end,
               findFiles=function() return manifestPaths end}
           jsonReadFile=function(p) return files[p] end
+          io.open=function(p, mode)
+            local data = files[p]
+            if type(data) ~= 'string' then return nil end
+            return {read=function() return data end, close=function() end}
+          end
           jsonWriteFile=function() error('native provider must not write files') end
           hptimer=function() local elapsed=0; return {stop=function() elapsed=elapsed+0.7; return elapsed end} end
           buildCalls=0; fakeTriangles=0
@@ -71,7 +79,8 @@ class NativeTests(unittest.TestCase):
         lua.globals().countries = lua.execute((ROOT / 'mod/lua/ge/extensions/e2r/countries.lua').read_text(encoding='utf8'))
         coordinate_path = ROOT / 'mod/lua/ge/extensions/e2r/coordinates.lua'
         lua.globals().coordinates = lua.execute(coordinate_path.read_text(encoding='utf8')) if coordinate_path.exists() else lua.table()
-        lua.execute("require=function(name) if name=='ge/extensions/e2r/countries' then return countries elseif name=='ge/extensions/e2r/coordinates' then return coordinates else return stubGenerator end end")
+        lua.globals().cellformat = lua.execute((ROOT / 'mod/lua/ge/extensions/e2r/cellformat.lua').read_text(encoding='utf8'))
+        lua.execute("require=function(name) if name=='ge/extensions/e2r/countries' then return countries elseif name=='ge/extensions/e2r/coordinates' then return coordinates elseif name=='ge/extensions/e2r/cellformat' then return cellformat else return stubGenerator end end")
         mod = lua.execute((ROOT / 'mod/lua/ge/extensions/e2r/native.lua').read_text(encoding='utf8'))
         return lua, mod, convert
 
@@ -249,8 +258,8 @@ class NativeTests(unittest.TestCase):
         for _ in range(1000):
             mod.update(.016, 2)
         stream = mod.status().stream
-        self.assertLessEqual(stream.cachedTiles, 32)
-        self.assertLessEqual(stream.cachedCells, 32)
+        self.assertLessEqual(stream.cachedTiles, stream.cacheLimits.tiles)
+        self.assertLessEqual(stream.cachedCells, stream.cacheLimits.cells)
         self.assertLessEqual(stream.cachedTriangles, 80000)
         self.assertFalse(stream.cacheOverBudget)
         self.assertGreater(len(list(stream.far.keys())), 0)
@@ -290,7 +299,9 @@ class NativeTests(unittest.TestCase):
                 break
         self.assertIsNotNone(mod.manifest(key, 'road')['items'][1].meshes)
 
-    def test_renderer_can_release_a_manifest_after_cache_eviction(self):
+    def test_taken_manifests_are_neither_evicted_nor_rebuilt_until_released(self):
+        # A layer the renderer has taken is queued for spawning there. Evicting it freed nothing
+        # and the tile was built again (92 rebuilds in a 10 km replay, native-replay-03).
         lua, mod, cv = self.make()
         lua.globals().fakeTriangles = 20000
         lat, lon = geographic(1750, 1750)
@@ -298,10 +309,176 @@ class NativeTests(unittest.TestCase):
         self.pump(mod)
         held = {key: mod.manifest(key, 'road') for key in mod.status().stream.ready.keys()}
         mod.pose(cv(dict(x=1750, y=1750, state='driving')))
-        evicted = next(key for key in held if mod.manifest(key, 'road') is None)
-        self.assertIsNotNone(held[evicted]['items'][1].meshes)
-        self.assertTrue(mod.release(evicted, 'road'))
-        self.assertIsNone(held[evicted]['items'][1].meshes)
+        for _ in range(200):
+            mod.update(.016, 2)
+        stream = mod.status().stream
+        self.assertEqual(stream.rebuilds, 0)
+        same = lua.eval('rawequal')
+        for key, manifest in held.items():
+            self.assertTrue(same(mod.manifest(key, 'road'), manifest))
+        key = next(iter(held))
+        self.assertIsNotNone(held[key]['items'][1].meshes)
+        self.assertTrue(mod.release(key, 'road'))
+        self.assertIsNone(held[key]['items'][1].meshes)
+
+
+
+def fixture_v2(size=4, roads=False, landing=(1750, 1750)):
+    """The same demo region in earthng-features-v2: binary 8 x 8 cell blocks."""
+    base = '/earthng/countries/demo/'
+    region_path = base + 'regions/sample.json'
+    files = fixture(1)
+    country = files[base + 'manifest.json']
+    country['sourceFormat'] = 'earthng-features-v2'
+    blocks, payloads = {}, {}
+    for i in range(size):
+        for j in range(size):
+            bounds = [i * 1000, j * 1000, (i + 1) * 1000, (j + 1) * 1000]
+            cell = dict(roads=[], junctions=[], buildings=[], areas=[], lines=[], points=[],
+                        terrain=dict(rect=bounds, nx=2, ny=2, heights=[0, 1.5, -2.25, 3]))
+            if roads:
+                cell['roads'] = [dict(id='main', nodes=['1', '2'], width=8,
+                                      points=[[0, 1750, 0], [4000, 1750, 20]],
+                                      tags={'highway': 'residential', 'sidewalk': 'no'})]
+            payloads.setdefault((i // 8, j // 8), {})[binary.slot(i, j)] = binary.encode_cell(cell, bounds[:2])
+    for (bi, bj), cells in payloads.items():
+        data, mask = binary.encode_block(cells)
+        path = base + f'regions/sample/blocks/{bi}_{bj}.bin'
+        files[path] = data
+        blocks[f'{bi}_{bj}'] = dict(path=path, mask=mask)
+    files[region_path] = dict(schemaVersion=2, id='sample', runtime='lua', sourceFormat='earthng-features-v2',
+                              tileSize=500, cellSize=1000, blockCells=8, geo=files[region_path]['geo'],
+                              bounds=[19, 39, 21, 41], coverage=[[19, 39, 21, 41]], landing=list(landing),
+                              blocks=blocks)
+    for path in [p for p in files if '/cells/' in p]:
+        del files[path]
+    return files
+
+
+class NativeV2Tests(NativeTests.__base__):
+    make = NativeTests.make
+    pump = NativeTests.pump
+
+    def test_lua_decoder_matches_reference_decoder(self):
+        lua, _, _ = self.make()
+        cell = dict(roads=[dict(id='w1', nodes=['9007199254740993', 'b'], width=7.25, tags={'highway': 'primary', 'name': 'Вулиця'},
+                                points=[[1000.004, 2000.5, 151.237], [1999.99, -3.5, -12.01]])],
+                    junctions=[dict(id='j:0', height=50.5, rings=[[[1, 2, 3], [4, 5, 6], [7, 8, 9]]])],
+                    buildings=[dict(id='b:0', kind='building', height=12, minHeight=3, tags={'building': 'yes'},
+                                    rings=[[[0, 0, 1], [10, 0, 1], [10, 10, 1]], [[2, 2, 1], [3, 2, 1], [3, 3, 1]]])],
+                    areas=[dict(id='a:0', kind='water', tags={}, rings=[[[0, 0, 0], [5, 0, 0], [5, 5, 0]]])],
+                    lines=[dict(id='l:0', kind='fence', tags={'barrier': 'fence'}, points=[[1, 1, 1], [2, 2, 2]])],
+                    points=[dict(id='p:0', kind='stop', tags={'highway': 'bus_stop'}, pos=[1000, 20, 50.4])],
+                    terrain=dict(rect=[1000, 0, 2000, 1000], nx=2, ny=3, heights=[1, 2.04, 3, -4, 5, 6.66]))
+        data, _ = binary.encode_block({binary.slot(1, 0): binary.encode_cell(cell, (1000, 0))})
+        expected = binary.decode_cell(data, (1000, 0), [1000, 0, 2000, 1000], *binary.decode_block(data)[1])
+        lua.globals().blockData = data
+        got = lua.execute('''local slots = cellformat.block(blockData)
+          local r = slots[1]
+          return cellformat.cell(blockData, r[1], r[2], 1000, 0, {1000, 0, 2000, 1000})''')
+
+        def plain(value):
+            if hasattr(value, 'items') and not isinstance(value, dict):
+                items = dict(value.items())
+                if items and all(isinstance(k, int) for k in items):
+                    return [plain(items[k]) for k in sorted(items)]
+                return {k: plain(v) for k, v in items.items()}
+            if isinstance(value, bytes):
+                return value.decode('utf8')
+            return value
+
+        got = plain(got)
+        for kind in binary.KINDS:
+            for feature in got[kind]:
+                feature.setdefault('tags', {}) if kind != 'junctions' else None
+        self.assertEqual(got, expected)
+        lua.globals().blockData = data[:-1]
+        with self.assertRaises(Exception):
+            lua.execute('cellformat.block(blockData)')
+
+    def test_v2_region_lands_without_enumerating_cells(self):
+        lua, mod, cv = self.make(fixture_v2())
+        st = mod.refresh()
+        self.assertEqual(st.countryCount, 1)
+        lat, lon = geographic(1750, 1750)
+        self.assertAlmostEqual(st.countries[1].landing.lat, lat)
+        self.assertAlmostEqual(st.countries[1].landing.lon, lon)
+        self.assertIsNotNone(mod.at(lat, lon))
+        self.assertIsNone(mod.at(*geographic(250, 2000)))  # the startup square leaves the cells
+        lua.execute('''local build = stubGenerator.build
+          stubGenerator.build = function(cells, ...) lastCells = cells; return build(cells, ...) end''')
+        mod.land(cv(dict(seq=1, lat=lat, lon=lon)))
+        job = self.pump(mod)
+        self.assertEqual(job.state, 'ready')
+        terrain = lua.globals().lastCells[1].terrain
+        self.assertEqual((terrain.nx, terrain.ny, terrain.heights[3]), (2, 2, -2.2))  # decimetres
+
+    def test_v2_cells_generate_meshes_with_the_real_generator(self):
+        _, mod, cv = self.make(fixture_v2(roads=True), real_generator=True)
+        lat, lon = geographic(1750, 1750)
+        mod.land(cv(dict(seq=3, lat=lat, lon=lon)))
+        job = self.pump(mod, count=4000)
+        self.assertEqual(job.state, 'ready')
+        self.assertGreater(job.manifest.triangles, 0)
+        self.assertGreater(len(job.manifest.navSegments), 0)
+        self.assertAlmostEqual(job.manifest.spawn.pos[3], 8.85)
+
+    def test_map_streets_come_from_blocks_before_landing(self):
+        _, mod, cv = self.make(fixture_v2(roads=True))
+        mod.refresh()
+        s, w = geographic(0, 0)
+        n, e = geographic(4000, 4000)
+        view = dict(w=min(w, e) - .01, s=min(s, n) - .01, e=max(w, e) + .01, n=max(s, n) + .01)
+        lines = []
+        for _ in range(50):
+            got = mod.mapRoads(cv(view), 50)
+            lines = [line for block in got.values() for line in block.values()]
+            if lines:
+                break
+        self.assertEqual(len(lines), 1)  # one road, though all 16 cells hold it
+        self.assertEqual(lines[0].rank, 2)
+        geo = list(lines[0].geo.values())
+        self.assertAlmostEqual(geo[0], geographic(0, 1750)[0], places=6)
+        self.assertAlmostEqual(geo[1], geographic(0, 1750)[1], places=6)
+        self.assertAlmostEqual(geo[-2], geographic(4000, 1750)[0], places=6)
+        far = dict(w=view['w'] - 40, s=view['s'] - 20, e=view['e'] + 40, n=view['n'] + 20)
+        self.assertEqual(len(mod.mapRoads(cv(far), 50)), 0)  # zoomed far out: no streets, no loading
+
+    def test_v2_bad_landing_or_block_paths_disable_region(self):
+        for name, change in (('landing outside', lambda f: f['/earthng/countries/demo/regions/sample.json'].update(landing=[250, 2000])),
+                             ('escaping block', lambda f: next(iter(f['/earthng/countries/demo/regions/sample.json']['blocks'].values())).update(path='/earthng/countries/demo/../x.bin')),
+                             ('bad mask', lambda f: next(iter(f['/earthng/countries/demo/regions/sample.json']['blocks'].values())).update(mask='zz')),
+                             ('missing block', lambda f: f.pop('/earthng/countries/demo/regions/sample/blocks/0_0.bin'))):
+            files = fixture_v2()
+            change(files)
+            with self.subTest(name):
+                _, mod, _ = self.make(files)
+                st = mod.refresh()
+                self.assertEqual(st.countryCount, 0)
+                self.assertGreater(len(st.errors), 0)
+
+    def test_v2_corrupt_block_is_a_visible_job_error(self):
+        files = fixture_v2()
+        path = '/earthng/countries/demo/regions/sample/blocks/0_0.bin'
+        files[path] = files[path][:-5]
+        _, mod, cv = self.make(files)
+        lat, lon = geographic(1750, 1750)
+        mod.land(cv(dict(seq=2, lat=lat, lon=lon)))
+        job = self.pump(mod)
+        self.assertEqual(job.state, 'error')
+        self.assertIn('source block', job.message)
+
+    def test_author_landing_is_used_only_when_landable(self):
+        for point, expected in (((1250, 2250), (1250, 2250)), ((100, 100), (1750, 1750))):
+            files = fixture_v2()
+            lat, lon = geographic(*point)
+            files['/earthng/countries/demo/manifest.json']['landing'] = dict(lat=lat, lon=lon)
+            with self.subTest(point=point):
+                _, mod, _ = self.make(files)
+                landing = mod.refresh().countries[1].landing
+                want = geographic(*expected)
+                self.assertAlmostEqual(landing.lat, want[0])
+                self.assertAlmostEqual(landing.lon, want[1])
 
 
 if __name__ == '__main__':

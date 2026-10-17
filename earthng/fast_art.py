@@ -17,10 +17,11 @@ import zipfile
 from PIL import Image, ImageDraw
 
 import fast_packs
+import fast_pixel
 import fast_photo as photo
 import fast_style as style
 
-VERSION = 'v9'
+VERSION = 'v10'
 CELL = 3.0          # m per texture repeat on walls: one window, one floor
 PX = 1024           # texture size: as the game's own (a 256 px swap kept its 1024 mip chain and failed)
 
@@ -83,8 +84,8 @@ FLAT = {   # kind: (toon colour, model colour)
     'roof_metal': ((96, 120, 116), (205, 205, 205)), 'parapet': ((200, 196, 190), (236, 236, 236)),
 }
 BASE_PACKS = ('real', 'toon', 'model', 'synth')
-PACKS = BASE_PACKS + fast_packs.PACKS
-LABELS = {'real': 'Реальний', 'toon': 'Мультяшний', 'model': 'Макет', 'synth': 'Синтвейв', **fast_packs.LABELS}
+PACKS = BASE_PACKS + ('pixel',) + fast_packs.PACKS
+LABELS = {'real': 'Реальний', 'toon': 'Мультяшний', 'model': 'Макет', 'synth': 'Синтвейв', 'pixel': 'Ретро-місто', **fast_packs.LABELS}
 MAP_FIELDS = ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap', 'opacityMap')
 # synthwave: dark violet surfaces, neon lines glowing (emissive), a striped sun at the horizon
 SYNTH = {
@@ -243,6 +244,8 @@ def colour(rgb):
 
 def pack_fields(pack, base):
     """Material name -> stage-0 fields for one pack (all map fields present, '' clears)."""
+    if pack == 'pixel':
+        return fast_pixel.fields(base)
     if pack in fast_packs.PACKS:
         return fast_packs.fields(pack, base, pack_fields('real', base))
     out = {}
@@ -296,8 +299,10 @@ def environment(pack):
         real = {'objects': {'sunsky': {**fields(sky['sunsky'], sun_keys), 'useNightCubemap': '0'}, 'theLevelInfo': fields(sky['theLevelInfo'], info_keys),
                             'clouds': fields(sky['clouds'], ('coverage', 'exposure', 'baseColor'))},
                 'sun': False}
+        if pack == 'pixel':
+            return fast_pixel.environment(real)
         return fast_packs.environment(pack, real) if pack in fast_packs.PACKS else real
-    return {'objects': {
+    return {'authoredSun': True, 'objects': {
         'sunsky': {'azimuth': '250', 'elevation': '3', 'brightness': '0.45', 'skyBrightness': '6',
                    'colorize': '0.75 0.1 0.95 1', 'colorizeAmount': '4', 'fogScale': '0.55 0.08 0.75 1',
                    'sunScale': '1 0.3 0.8 1', 'ambientScale': '0.45 0.25 0.7 1'},
@@ -349,6 +354,8 @@ def prebuild(distributable=False):
     shared = paths.PROJECT / 'data' / ('art-distributable' if distributable else 'art') / VERSION
     if not (shared / 'packs.json').exists():
         build(shared, game_assets=not distributable)
+    else:
+        write_manifest(shared)  # environment/fields are code, not a texture cache
     return shared
 
 
@@ -413,6 +420,7 @@ def build(r, game_assets=True):
     synth_grid(None, glow=True).save(r / 'synth' / 'grid.glow.png')
     synth_sun().save(r / 'synth' / 'sun.color.png')
     fast_packs.build(r, base)
+    fast_pixel.build(r)
     # every map as a BC1 DDS with its mips, the PNG removed: the game reads '<name>.png' from
     # '<name>.dds' as it does its own assets, and does not cook (vis-08-centre showed checker
     # placeholders for ~30 s while ~70 PNGs cooked one by one)
@@ -424,6 +432,13 @@ def build(r, game_assets=True):
         png.unlink()
     with ThreadPoolExecutor(6) as pool:
         list(pool.map(to_dds, sorted(r.rglob('*.png'))))
+    write_manifest(r)
+    return r
+
+
+def write_manifest(r):
+    """Refresh pack settings independently of the expensive texture build."""
+    base = '/e2r_stream/fast-art/' + VERSION
     fields = {p: pack_fields(p, base) for p in PACKS}
     tmp = r / 'packs.json.tmp'
     sun = {'e2rf_synth_sun': {'name': 'e2rf_synth_sun', 'mapTo': 'e2rf_synth_sun', 'class': 'Material', 'version': 1.5,
@@ -434,5 +449,4 @@ def build(r, game_assets=True):
                                           'emissiveFactor': [1, 1, 1]}, {}, {}, {}]}}
     tmp.write_text(json.dumps(style.dds({'order': list(PACKS), 'labels': LABELS, 'fields': fields, 'warm': {p: warm_defs(p, fields[p]) for p in PACKS},
                                'environment': {p: environment(p) for p in PACKS}, 'extra': sun})), encoding='utf8')
-    os.replace(tmp, done)
-    return r
+    os.replace(tmp, r / 'packs.json')

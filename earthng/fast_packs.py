@@ -322,24 +322,8 @@ def autumn_leaves(rel):
 # --- the packs --------------------------------------------------------------------------------------
 GROUND_KINDS = ('ground', 'park', 'forest')
 GLOW = {'night': '1.8 1.8 1.8', 'cyber': '2.2 2.2 2.2', 'rain': '1.4 1.4 1.4'}      # emissive gain of lit windows
-# Moonlight fill: in the dark packs every surface also glows faintly in its own colour (emissive =
-# its colour map x FILL x TINT). The sky lights a night in two ways between sessions — a blue
-# "moonlit" one or, with a stale dark capture, nothing — and with nothing every wall away from a
-# lamp was black (tester, 2026-10-14). A sun above the horizon, however dim, blew the frame out
-# at a night exposure (out/fix-packs-02), and nightColor/ambientScale did not reach the dark case.
-FILL = {'night': .25, 'cyber': .2, 'rain': .3}
-TINT = {'night': (.7, .8, 1.), 'cyber': (.9, .6, 1.), 'rain': (.85, .9, 1.)}
-
-
-def with_fill(glow, colour, mood):
-    """A wall's glow map with the moonlight fill baked in (its emissive map is the windows'):
-    the colour map in linear light x FILL x TINT / the glow gain, added under the windows."""
-    if colour is None:
-        return glow
-    gain = float(GLOW[mood].split()[0])
-    c = _arr(colour.resize(glow.size, Image.BILINEAR)) ** 2.2 * np.array(TINT[mood], np.float32) * (FILL[mood] / gain)
-    g = _arr(glow) ** 2.2
-    return _img(np.clip(g + c, 0, 1) ** (1 / 2.2))
+# Only luminous objects emit. Ambient visibility belongs to the sky/exposure, not
+# to an albedo-as-emission workaround that makes the entire city glow.
 
 
 def build(r, base):
@@ -353,11 +337,11 @@ def build(r, base):
         if photo.PHOTO_WALLS[name][0].startswith('end_'):
             continue
         for mood in ('night', 'cyber'):
-            with_fill(wall_glow(name, mood, colour), colour, mood).save(r / mood / f'{name}.glow.png')
+            wall_glow(name, mood, colour).save(r / mood / f'{name}.glow.png')
     for name, (_, kind) in fast_art.FACADES.items():
         colour = Image.open(r / 'real' / f'{name}.color.png') if (r / 'real' / f'{name}.color.png').exists() else None
         for mood in ('night', 'cyber'):
-            with_fill(facade_glow(kind, mood), colour, mood).save(r / mood / f'{name}.glow.png')
+            facade_glow(kind, mood).save(r / mood / f'{name}.glow.png')
     # wet roads: the game's asphalt roughness, smoother overall and near mirror-smooth in puddles
     for tex, out in (('asphalt', 'road'), ('sidewalk', 'sidewalk')):
         rough = fast_art.game_texture(style.TEXTURES[tex]['roughnessMap'])
@@ -465,16 +449,6 @@ def fields(pack, base, real):
         put('footway', baseColorMap=f'{art}/paving.color.png', normalMap=f'{art}/paving.normal.png')
         for w in walls:
             put('wall_' + w, baseColorFactor='1 0.97 0.92 1')
-    if pack in FILL:
-        # the moonlight fill of everything else: its colour map (or colour) as a faint emissive;
-        # walls have it baked into their glow maps (with_fill), the neon of cyber stays as it is
-        for mat, f in out.items():
-            if not mat.startswith('e2rf_') or f.get('emissiveMap') or f.get('emissiveFactor', '0 0 0') != '0 0 0':
-                continue
-            bc = [float(v) for v in str(f.get('baseColorFactor', '1 1 1 1')).split()[:3]]
-            if f.get('baseColorMap'):
-                f['emissiveMap'] = f['baseColorMap']
-            f['emissiveFactor'] = ' '.join(f'{FILL[pack] * c * t:.4f}' for c, t in zip(bc, TINT[pack]))
     # the trees: their own materials (fast_tree_materials.json)
     for mat, rel in LEAF_MATS.items():
         f = {}
@@ -497,10 +471,13 @@ def environment(pack, real):
     env = copy.deepcopy(real)
     sun, info = env['objects']['sunsky'], env['objects']['theLevelInfo']
     clouds = env['objects'].setdefault('clouds', {})
-    env.update(precip=False, lights=False, sun=False)
+    env.update(precip=False, lights=False, sun=False, authoredSun=True)
     if pack in ('night', 'cyber'):
-        sun.update(elevation='-25', brightness='0.02', skyBrightness='1', ambientScale='0.05 0.055 0.1 1',
-                   nightColor='0.008 0.011 0.026 1', nightFogColor='0.008 0.011 0.026 1', colorizeAmount='0')
+        # A blue-hour sky supplies real ambient light. Deep astronomical night
+        # (-25 degrees) has no sky irradiance and leaves unlit surfaces black.
+        sun.update(elevation='-5', brightness='0.02', skyBrightness='2', ambientScale='0.08 0.12 0.2 1',
+                   colorize='0.12 0.22 0.42 1', colorizeAmount='1',
+                   nightColor='0.008 0.011 0.026 1', nightFogColor='0.008 0.011 0.026 1')
         info.update(fogColor='0.016 0.022 0.048 1', fogDensity='0.00045', canvasClearColor='3 5 12 255')
         clouds.update(coverage='0.25', exposure='0.15')
         env['lights'] = {'colors': [[1, .55, .2]], 'radius': 34, 'brightness': 7, 'height': 7.3, 'count': 36}
@@ -508,7 +485,8 @@ def environment(pack, real):
         # cubemap, BNG_Sky_Space, took in some sessions and not in others: vis-packs-podil-06/07.)
         env['exposure'] = 4.5
     if pack == 'cyber':
-        sun.update(nightColor='0.04 0.012 0.07 1', nightFogColor='0.07 0.015 0.11 1', ambientScale='0.12 0.06 0.18 1')
+        sun.update(nightColor='0.04 0.012 0.07 1', nightFogColor='0.07 0.015 0.11 1', ambientScale='0.12 0.06 0.18 1',
+                   colorize='0.24 0.08 0.36 1')
         info.update(fogColor='0.08 0.015 0.13 1', fogDensity='0.0008', canvasClearColor='12 3 22 255')
         env['lights'] = {'colors': [[1, .1, .75], [0, .85, 1], [.55, .2, 1]], 'radius': 26, 'brightness': 6,
                          'height': 7.3, 'count': 28}

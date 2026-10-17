@@ -29,3 +29,19 @@ Fixes verified during migration: road-only landing selection, source-cell buildi
 datum continuity, safe country-button landing points, reset while generation is
 pending, pinned startup geometry until touchdown, and release/unload of Lua mesh
 arrays after engine upload. Exact UTM is tested against pyproj in both hemispheres.
+
+## 2026-10-17: якість доріг і зависання з трафіком
+
+- Полігон центру Києва 10 x 10 км (`out/polygon/earthng_kyiv10.zip`) і стенд
+  `earthng/road_quality.py` з метриками дефектів. Генератор доведено за ними:
+  земля притиснута під асфальт, суцільні стрічки доріг із мітрою, тротуари врівень
+  і обрізані по чужому асфальту, узбіччя, покриття на землі, перехрестя-зірки.
+  Перехрестя виводяться з кінців доріг у рантаймі: пакети v2 не перезбираються.
+  Усі 400 тайлів: тротуар на дорозі 53,7 -> 1,9 м2/км, земля над асфальтом
+  556 -> 7,6 м2/км, перепади на краю понад 30 см 44,6 -> 8,9 на км.
+- Паркани йдуть по землі й мають товщину; автобусні зупинки стоять біля дороги.
+- Вічне зависання під час трафіку: ребра навграфа нульової довжини зациклювали
+  `graphpath.getRandomPathG` під час респавну. Виправлено в генераторі й `navBuild`.
+- Сторож зависань пише стек Lua у `e2r-hang.txt`; `test_world.py` під'єднує
+  моди жорсткими посиланнями.
+- Подробиці: `docs/NATIVE_MODS.md`, розділи «Якість доріг» і «Трафік і зависання».

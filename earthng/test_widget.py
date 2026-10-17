@@ -34,10 +34,10 @@ class WidgetTests(unittest.TestCase):
           local function up(fn, name)
             for i=1,100 do local n,v=debug.getupvalue(fn,i); if n==name then return v end end
           end
-          local draw=up(mod.onUpdate,'drawWindow')
+          local side=up(up(up(mod.onUpdate,'drawWindow'),'drawPicker'),'drawSidebar')
           up(mod.tick,'S').status=status
-          local inPackage, out = up(draw,'presetInPackage'), {}
-          for _, p in ipairs(up(draw,'PRESETS')) do if inPackage(p) then out[#out+1]=p[1] end end
+          local inPackage, out = up(side,'presetInPackage'), {}
+          for _, p in ipairs(up(side,'PRESETS')) do if inPackage(p) then out[#out+1]=p[1] end end
           return table.concat(out, ',')
         end''')
         # Wales' box overlaps Bristol and Liverpool; only Welsh buttons
@@ -59,6 +59,123 @@ class WidgetTests(unittest.TestCase):
         other = shown(lua.table_from({'area': 'kyiv', 'packageBox': lua.table_from([30.2, 50.2, 30.8, 50.6])}))
         self.assertEqual(other.split(','), ['Оболонь', 'Поділ', 'Хрещатик', 'Печерськ', 'Голосіїв', 'Біличі', 'Ірпінь', 'Бровари'])
 
+    def native_widget(self, basemap=True):
+        """world.lua in native mode with the real planetMap, a fake native and the built base map."""
+        import json
+        root = Path(__file__).resolve().parents[1]
+        base = root / 'out/basemap'
+        found = sorted((d for d in base.glob('*') if (d / 'index.json').exists()), key=lambda d: int(d.name)) if base.exists() else []
+        if basemap and not found:
+            self.skipTest('no base map: run earthng/build_basemap.py')
+        lua = LuaRuntime()
+        files = {}
+        if basemap:
+            files['/earthng/planet/basemap/index.json'] = found[-1] / 'index.json'
+            files['/earthng/planet/basemap/labels.json'] = found[-1] / 'labels.json'
+
+        def read_json(path):
+            return lua.table_from(json.loads(files[path].read_text(encoding='utf8')), recursive=True)
+        lua.globals().py_exists = lambda path: path in files
+        lua.globals().py_json = read_json
+        lua.globals().planet_src = (root / 'mod/lua/ge/extensions/e2r/planetMap.lua').read_text(encoding='utf8')
+        lua.execute('''
+          ui_imgui = setmetatable({ArrayChar=function(n) return require('ffi').new('char[?]', n) end,
+            Button=function(label) return label == clicked end,
+            Selectable1=function(label) return label == clicked end,
+            GetIO=function() return {MouseWheel=0} end,
+            GetMousePos=function() return {x=-100,y=-100} end,
+            GetItemRectMin=function() return {x=0,y=0} end,
+            IsItemHovered=function() return false end,
+            IsMouseDown=function() return false end,
+            CalcTextSize=function(t) return {x=7*#t,y=13} end,
+            GetStyle=function() return {ItemSpacing={x=4}} end,
+            ImVec2=function(x, y) return {x=x, y=y} end,
+            GetFontSize=function() return 13 end,
+            GetFont=function() return nil end,
+            GetContentRegionAvailWidth=function() return 280 end,
+            GetContentRegionAvail=function() return {x=1100, y=640} end,
+            GetFrameHeightWithSpacing=function() return 26 end,
+            WindowFlags_NoCollapse=1, WindowFlags_AlwaysAutoResize=2, WindowFlags_NoScrollbar=4,
+            WindowFlags_NoScrollWithMouse=8},
+            {__index=function() return function() end end})
+          FS={fileExists=function(_, path) return py_exists(path) end}
+          jsonReadFile=function(path) return py_json(path) end
+          hptimer=function() return {stopAndReset=function() return 1 end, stop=function() return 1 end} end
+          countries={
+            {id='ukraine', title='Україна', available=true, landing={lat=50.45, lon=30.52}},
+            {id='zanzibar', title='Zanzibar', available=true, landing={lat=-6.16, lon=39.19}}}
+          status={countries=countries, errors={}, packageBox={22, -6.5, 40.3, 52.4},
+            coverage={{30.0, 50.0, 30.6, 50.3}, {30.5, 50.2, 31.0, 50.6}, {39.1, -6.4, 39.6, -5.7}},
+            regions={{country='ukraine', coverage={{22, 44.3, 40.3, 52.4}}}, {country='zanzibar', coverage={{39.1, -6.4, 39.6, -5.7}}}}}
+          fakeNative={status=function() return status end, refresh=function() end,
+            mapRoads=function() return {} end,
+            at=function(lat, lon)
+              for _, r in ipairs(status.regions) do
+                local c = r.coverage[1]
+                if lon >= c[1] and lon <= c[3] and lat >= c[2] and lat <= c[4] then
+                  for _, k in ipairs(countries) do if k.id == r.country then return k end end
+                end
+              end
+            end}
+          local realRequire = require
+          require=function(name)
+            if name == 'ge/extensions/e2r/native' then return fakeNative end
+            if name == 'ge/extensions/e2r/planetMap' then return loadstring(planet_src)() end
+            if name == 'ui/imguiUtils' then return {texObj=function(path) return {texId=1, path=path} end} end
+            if name == 'ffi' then return realRequire('ffi') end
+            return {}
+          end
+          function up(fn, name)
+            for i=1,200 do
+              local n,v=debug.getupvalue(fn,i)
+              if not n then break end
+              if n==name then return v end
+            end
+            error('missing upvalue '..name)
+          end''')
+        src = (root / 'mod/lua/ge/extensions/e2r/world.lua').read_text(encoding='utf8')
+        lua.globals().mod = lua.execute(src)
+        lua.execute('''
+          S=up(mod.tick,'S'); draw=up(mod.onUpdate,'drawWindow')
+          picker=up(draw,'drawPicker'); side=up(picker,'drawSidebar'); drawMap=up(picker,'drawMap')
+          S.status=status; S.coverage=status.coverage; S.state='pick'; S.now=10''')
+        return lua
+
+    def test_landing_zones_do_not_overlap(self):
+        lua = self.native_widget(basemap=False)
+        rects = lua.eval('up(drawMap, "mergedCoverage")(status.coverage)')
+        rects = [tuple(r.values()) for r in rects.values()]
+        for i, a in enumerate(rects):
+            for b in rects[i + 1:]:
+                overlap = min(a[2], b[2]) - max(a[0], b[0]) > 1e-9 and min(a[3], b[3]) - max(a[1], b[1]) > 1e-9
+                self.assertFalse(overlap, (a, b))
+        area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects)
+        # two Kyiv boxes overlapping by 0.1 x 0.1, and Zanzibar
+        expected = 0.6 * 0.3 + 0.5 * 0.4 - 0.1 * 0.1 + 0.5 * 0.7  # (on the 0.005 grid already)
+        self.assertAlmostEqual(area, expected, places=6)
+
+    def test_picker_lists_packs_and_flies_to_one(self):
+        lua = self.native_widget()
+        lua.execute('S.fitAll=true; clicked=nil; draw()')
+        self.assertEqual(lua.eval('S.zoom'), lua.eval('S.zoom'))   # the window draws without errors
+        self.assertGreater(lua.eval('S.center.lat'), -7)          # both packs in view
+        lua.execute("clicked='Zanzibar##pack_zanzibar'; draw()")
+        self.assertEqual(lua.eval('S.selectedPack'), 'zanzibar')
+        self.assertAlmostEqual(lua.eval('S.center.lat'), -6.05, places=2)
+        self.assertGreaterEqual(lua.eval('S.zoom'), 8)
+        # the selected pack lists its own presets, which land at the place
+        lua.execute("clicked='Stone Town##preset1'; draw()")
+        self.assertAlmostEqual(lua.eval('S.marker.lat'), -6.163, places=3)
+
+    def test_search_finds_cities_in_any_case(self):
+        lua = self.native_widget()
+        planet = lua.eval("require('ge/extensions/e2r/planetMap')")
+        self.assertEqual(planet.lower('КИЇВ Ґанок Єнакієве Іршава'), 'київ ґанок єнакієве іршава')
+        lua.globals().planet = planet
+        first = lua.eval("planet.search('київ', 'uk', 5)[1]")
+        self.assertAlmostEqual(first.lat, 50.43, places=1)
+        self.assertEqual(lua.eval("planet.search('LVIV', 'en', 5)[1].name"), 'Lviv')
+
     def map_ui_flow(self, lang, labels):
         lua = LuaRuntime()
         lua.execute('''
@@ -73,7 +190,10 @@ class WidgetTests(unittest.TestCase):
             GetStyle=function() return {ItemSpacing={x=4}} end,
             ImVec2=function(x, y) return {x=x, y=y} end,
             GetContentRegionAvailWidth=function() return 360 end,
-            WindowFlags_NoCollapse=1, WindowFlags_AlwaysAutoResize=2},
+            GetContentRegionAvail=function() return {x=1100, y=640} end,
+            GetFrameHeightWithSpacing=function() return 26 end,
+            WindowFlags_NoCollapse=1, WindowFlags_AlwaysAutoResize=2, WindowFlags_NoScrollbar=4,
+            WindowFlags_NoScrollWithMouse=8},
             {__index=function() return function() end end})
           require=function() return {} end
           FS={fileExists=function() return false end}

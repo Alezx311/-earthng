@@ -103,11 +103,124 @@ class GeneratorTests(unittest.TestCase):
         ground_points = [p for triangle in self.triangles(left, 'e2rf_ground') for p in triangle]
         pulled = [p[2] for p in ground_points if p[0] == 250 and p[1] == 250]
         self.assertTrue(pulled)
-        self.assertTrue(all(abs(z - 12.5) < 1e-7 for z in pulled))
+        # the ground lies at least groundDrop (0.25 m) under the road's profile, as in the Python
+        # generator, and lower where the high DEM beside the road would lift it through the asphalt
+        self.assertTrue(all(z <= 12.25 + 1e-7 for z in pulled))
         distant = [p[2] for p in ground_points if p[1] == 0]
-        self.assertTrue(all(abs(z - 100) < 1e-7 for z in distant))
+        self.assertTrue(all(abs(z - 99.75) < 1e-7 for z in distant))
         for _, mesh in self.meshes(left, 'e2rf_road'):
             self.assertTrue(all(n.z == 1 for n in mesh.normals.values()))
+
+    def surface_at(self, triangles, x, y):
+        """The highest of the triangles over (x, y), or None."""
+        best = None
+        for a, b, c in triangles:
+            den = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(den) < 1e-12:
+                continue
+            u = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / den
+            v = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / den
+            if u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9:
+                z = u * a[2] + v * b[2] + (1 - u - v) * c[2]
+                best = z if best is None else max(best, z)
+        return best
+
+    def test_sidewalks_stay_off_the_other_street_at_a_crossing(self):
+        # two streets crossing at (250, 250); the old ribbons ran their sidewalks over each other
+        roads = [{'id': 'ns', 'nodes': ['a', 'b'], 'width': 8, 'tags': {'highway': 'residential'},
+                  'points': [[250, 0, 10], [250, 500, 10]]},
+                 {'id': 'ew', 'nodes': ['c', 'd'], 'width': 8, 'tags': {'highway': 'residential'},
+                  'points': [[0, 250, 10], [500, 250, 10]]}]
+        road = self.build([{'roads': roads}])[0]
+        walks = list(self.triangles(road, 'e2rf_sidewalk')) + list(self.triangles(road, 'e2rf_curb'))
+        self.assertTrue(walks)
+        for tri in walks:
+            self.assertTrue(all(abs(p[2] - 10.1) < 1e-6 for p in tri))  # flush with the road
+        # no sidewalk anywhere on either carriageway near the crossing
+        for x in range(200, 301, 2):
+            for y in (246.5, 250, 253.5):
+                self.assertIsNone(self.surface_at(walks, x + .25, y), (x, y))
+                self.assertIsNone(self.surface_at(walks, y, x + .25), (y, x))
+
+    def test_ground_never_reaches_the_asphalt_in_a_dip(self):
+        # the road's profile dips 1.5 m between two 25 m lattice nodes (an underpass approach): the
+        # ground, pulled to the profile at the nodes only, used to come up through the asphalt
+        cell = {'roads': [{'id': 'r', 'nodes': ['a', 'b'], 'width': 7, 'tags': {'highway': 'tertiary', 'sidewalk': 'no'},
+                           'points': [[0, 237, 10], [250, 250, 10], [262.5, 250.65, 8.5], [275, 251.3, 10], [500, 263, 10]]}],
+                'terrain': {'rect': [0, 0, 500, 500], 'nx': 2, 'ny': 2, 'heights': [10] * 4}}
+        road = self.build([cell])[0]
+        ground = list(self.triangles(road, 'e2rf_ground'))
+        asphalt = list(self.triangles(road, 'e2rf_road'))
+        for k in range(200, 320):
+            x = float(k)
+            y = 237 + 26 * x / 500
+            for off in (-3.4, 0, 3.4):
+                top = self.surface_at(asphalt, x, y + off)
+                low = self.surface_at(ground, x, y + off)
+                self.assertIsNotNone(top)
+                if low is not None:
+                    self.assertLess(low, top - .05, (x, off))
+
+    def test_junction_is_derived_from_road_ends_without_source_junctions(self):
+        # a T of three graph segments meeting at node 'n' (500, 250), no junction feature: the
+        # roads stop 0.8 x the widest (10 m) = 8 m short of the node, a fan from the node fills
+        # the mouths, and both tiles round the node draw the same fan
+        roads = [{'id': 'w', 'nodes': ['a', 'n'], 'width': 10, 'tags': {'highway': 'residential'},
+                  'points': [[300, 250, 10], [500, 250, 10]]},
+                 {'id': 'e', 'nodes': ['n', 'b'], 'width': 10, 'tags': {'highway': 'residential'},
+                  'points': [[500, 250, 10], [700, 250, 10]]},
+                 {'id': 's', 'nodes': ['n', 'c'], 'width': 6, 'tags': {'highway': 'residential'},
+                  'points': [[500, 250, 10], [500, 50, 10]]}]
+        left, right = self.build([{'roads': roads}], i=0)[0], self.build([{'roads': roads}], i=1)[0]
+        for manifest, x0 in ((left, 400), (right, 500)):
+            asphalt = list(self.triangles(manifest, 'e2rf_road'))
+            # every point of the three carriageways near the node is asphalt at road height
+            for x in [x0 + k + .5 for k in range(0, 100, 2)]:
+                for y in (245.5, 250, 254.5):
+                    if abs(x - 500) < 60:
+                        z = self.surface_at(asphalt, x, y)
+                        self.assertIsNotNone(z, (x, y))
+                        self.assertAlmostEqual(z, 10.1, places=6)
+            for y in [200 + k + .5 for k in range(0, 45, 2)]:
+                for x in (497.5, 502.5):
+                    if x0 <= x <= x0 + 100:
+                        self.assertIsNotNone(self.surface_at(asphalt, x, y), (x, y))
+        # the strips stop at the cut: no strip vertex between the node and 8 m out on the west road
+        strip_x = [p[0] for tri in self.triangles(left, 'e2rf_road') for p in tri if abs(p[1] - 245) < 1e-6]
+        self.assertFalse([x for x in strip_x if 492 + 1e-6 < x < 500 - 1e-6])
+        # the fan is the same on both sides of the tile border x = 500
+        border = [sorted((round(p[1], 4), round(p[2], 4)) for tri in self.triangles(m, 'e2rf_road')
+                         for p in tri if abs(p[0] - 500) < 1e-7) for m in (left, right)]
+        self.assertEqual(set(border[0]), set(border[1]))
+
+    def test_fences_follow_the_ground_and_have_thickness(self):
+        # one 400 m wall over a 6 m hump: its ends alone on the ground buried the middle
+        heights = [0, 0, 0, 6, 0, 0, 0, 0, 0]
+        cell = {'lines': [{'id': 'w', 'kind': 'fence', 'tags': {'barrier': 'wall'},
+                           'points': [[50, 250, 0], [450, 250, 0]]}],
+                'terrain': {'rect': [0, 0, 500, 500], 'nx': 3, 'ny': 3, 'heights': heights}}
+        road, scene = self.build([cell])[:2]
+        ground = list(self.triangles(road, 'e2rf_ground'))
+        wall = list(self.triangles(scene, 'e2rf_fence_wall'))
+        ys = {round(p[1], 4) for tri in wall for p in tri}
+        self.assertEqual(ys, {249.9, 250.1})  # 0.2 m thick
+        for x in range(60, 441, 10):
+            g = self.surface_at(ground, x, 250)
+            top = max(p[2] for tri in wall for p in tri if abs(p[0] - x) < 2.01)
+            self.assertGreater(top - g, 1.9, x)    # a 2 m wall stands over the hump
+            self.assertLess(top - g, 2.2, x)
+
+    def test_bus_stop_on_the_carriageway_stands_beside_the_road(self):
+        road = {'id': 'r', 'nodes': ['a', 'b'], 'width': 8, 'tags': {'highway': 'residential'},
+                'points': [[0, 250, 0], [500, 250, 0]]}
+        stop = {'id': 's', 'kind': 'stop', 'tags': {'highway': 'bus_stop'}, 'pos': [200, 250.5, 0]}
+        scene = self.build([{'roads': [road], 'points': [stop]}])[1]
+        shelters = [it for it in scene['items'].values() if it['kind'] == 'static' and 'busstop' in it['shape']]
+        self.assertEqual(len(shelters), 1)
+        pos = shelters[0]['pos']
+        # right of the eastward road: beyond its 4 m half width, the 2 m sidewalk and 1.4 m more
+        self.assertAlmostEqual(pos[2], 250 - 7.4)  # a Lua table: x, y, z at 1, 2, 3
+        self.assertAlmostEqual(pos[1], 200.0)
 
     def test_building_hole_roof_and_collision_walls(self):
         rings = [[[100, 100, 0], [140, 100, 0], [140, 140, 0], [100, 140, 0]],
@@ -144,6 +257,21 @@ class GeneratorTests(unittest.TestCase):
         coordinates = [[s[k], s[k + 1], s[k + 2]] for k in range(8, len(s) + 1, 3)]
         self.assertTrue(all(math.dist(a[:2], b[:2]) <= 80 for a, b in zip(coordinates, coordinates[1:])))
         self.assertTrue(manifest.drivable)
+
+    def test_navigation_has_no_zero_length_edges(self):
+        # repeated source points made zero-length navgraph edges; the game's random route walk
+        # (traffic respawns) never got its length on them and froze the game
+        road = {'id': 'r', 'nodes': ['a', 'b'], 'width': 7, 'tags': {'highway': 'residential'},
+                'points': [[0, 250, 5], [100, 250, 5], [100, 250, 5], [100.1, 250, 5], [200, 250, 5]]}
+        flat = {'id': 'dot', 'nodes': ['c', 'd'], 'width': 7, 'tags': {'highway': 'residential'},
+                'points': [[300, 300, 5], [300, 300, 5]]}
+        nav = self.build([{'roads': [road, flat]}])[3]
+        segments = [nav.segments[k] for k in range(1, len(nav.segments) + 1)]
+        self.assertEqual([s[1] for s in segments], ['r'])
+        s = segments[0]
+        points = [(s[k], s[k + 1]) for k in range(8, len(s) + 1, 3)]
+        self.assertTrue(all(math.dist(p, q) >= .5 for p, q in zip(points, points[1:])))
+        self.assertEqual(points[-1], (200, 250))
 
     def test_mesh_pieces_are_bounded_and_generation_yields(self):
         calls = []
@@ -269,6 +397,27 @@ class GeneratorTests(unittest.TestCase):
         scene = self.build(source, terrainStep=100)[1]
         self.assertEqual(list(self.triangles(scene, 'e2rf_roof_tile')), [])
         self.assertAlmostEqual(sum(map(area, self.triangles(scene, 'e2rf_roof'))), 1200)
+
+    def test_sea_below_zero_gets_a_water_plane_only_where_ground_dips(self):
+        def cell(heights):
+            return {'terrain': {'rect': [0, 0, 1000, 1000], 'nx': 2, 'ny': 2, 'heights': heights}}
+        for far in (False, True):
+            with self.subTest(far=far):
+                _, scene, farScene, _ = self.build([cell([20, 20, 20, 20])], far=far, seaLevel=20)
+                scene = farScene if far else scene
+                water = list(self.triangles(scene, 'e2rf_water'))
+                self.assertEqual(len(water), 2)  # open sea: one quad for the whole tile
+                self.assertTrue(all(p[2] == 20.3 for t in water for p in t))
+                self.assertAlmostEqual(sum(map(area, water)), 500 * 500)
+                _, scene, farScene, _ = self.build([cell([30, 30, 30, 30])], far=far, seaLevel=20)
+                self.assertEqual(list(self.triangles(farScene if far else scene, 'e2rf_water')), [])
+        # a coast (west under the sea, east on land): water over the western quads only
+        _, scene, *_ = self.build([cell([20, 30, 20, 30])], seaLevel=20)
+        water = list(self.triangles(scene, 'e2rf_water'))
+        self.assertGreater(len(water), 2)
+        self.assertLess(max(p[0] for t in water for p in t), 500)
+        _, scene, *_ = self.build([cell([20, 20, 20, 20])])  # no seaLevel (v1 data): no sea
+        self.assertEqual(list(self.triangles(scene, 'e2rf_water')), [])
 
     def test_far_woodland_has_sparse_decorative_canopy(self):
         source = [{'areas': [{'id': 'wood', 'kind': 'forest',
