@@ -3,4 +3,6 @@ data/
 __pycache__/
 *.pyc
 launcher.json
+country_setup.json
+.venv/
 .venv-linux/

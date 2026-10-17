@@ -9,6 +9,15 @@
 `codex/official-mod-packages`; старий шлях нижче лишається для порівняння (`--legacy`).
 Старі архіви з Python треба перезібрати, вони не є пакетами країн нового формату.
 
+**Пак будь-якої країни:** `Country.bat` (`earthng/country_ui.py`). Готовий `earthng_<країна>.zip`
+можна покласти в `mods`, якщо він уже є на диску або в `earthng/ready_packs.json`.
+Інакше вікно качає витяг регіону з Geofabrik і висоти Terrarium та збирає пак саме.
+Блок ассетів обирається за країною (пострадянські панелі, жовта розмітка США, хвойні
+півночі). Асфальт, розмітку, узбіччя, фасади без тега, дерева й вуличні моделі можна
+змінити до збірки. У пак пишуться ці ідентифікатори. Дороги й рельєф входять завжди.
+«Refresh planet code» підміняє Lua і матеріали в уже зібраному `earthng_planet.zip`,
+щоб гра прочитала вигляд. Моделі лишаються в пакеті планети і в установленій грі.
+
 ## Попередній шлях з компаньйоном
 
 **Пакет для тестувальників (уся Україна, генератор fast):** `earthng/package.py` збирає
@@ -39,9 +48,10 @@ BeamNG-експортер). EarthNG — усе, що потрібно для с�
 
 ## Запуск
 
-**`EarthNG.bat`** — вікно запуску (`earthng/launcher.py`, Tk): тека профілю BeamNG, шлях до Earth2Road, пакет
-тайлів OSM, генератор `fast`/`v2`, процеси генерації, далекий план (`EARTHNG_FAR_R`), радіус тайлів `v2`,
-запуск гри й перезбирання мода. Налаштування — у `launcher.json` (не в git), журнал компаньйона — у вікні,
+**`EarthNG.bat`** — вікно запуску (`earthng/launcher.py`, Tk) на Python з `.venv` цього репозиторія:
+тека профілю BeamNG, пакет тайлів OSM, генератор `fast`/`v2`, процеси генерації, далекий план
+(`EARTHNG_FAR_R`), радіус тайлів `v2`, запуск гри й перезбирання мода. Шлях до Earth2Road з’являється
+лише коли обрано старий генератор `v2`. Налаштування — у `launcher.json` (не в git), журнал компаньйона — у вікні,
 «Зупинити» або закриття вікна гасять компаньйон разом зі збирачами. У пакеті для тестувальників те саме вікно
 відкриває `EarthNG.bat` у корені пакета.
 
@@ -56,9 +66,9 @@ Freeroam → «Earth2Road - Планета». Вікно скрипта трим
 (гра вже відкрита), `-Workers N` (процеси-збирачі тайлів, типово 8), `-Earth2Road <шлях>`.
 
 **Linux (експериментально):** `bash run_world.sh` — те саме для BeamNG нативно або під Proton (профіль
-шукається в обох, `--userfolder` / `BEAMNG_USERFOLDER` — вручну). Python — `.venv` Earth2Road, якщо є
-(`--earth2road`, `EARTH2ROAD`, типово `~/Earth2Road`), інакше `.venv-linux/` з `requirements-fast.txt`: генератору
-`fast` Earth2Road не потрібен, `v2` — лише з ним. Тайли й DEM у `data/` (не в git) — як для Windows.
+шукається в обох, `--userfolder` / `BEAMNG_USERFOLDER` — вручну). Python для `fast` — `.venv-linux/`
+з `requirements-fast.txt`. Генератор `v2` досі потребує checkout Earth2Road (`--earth2road`, `EARTH2ROAD`,
+типово `~/Earth2Road`). Тайли й DEM у `data/` (не в git) — як для Windows.
 Параметри: `--tiles`, `--workers`, `--generator fast|v2`, `--nogame`, `--help`. У пакеті для тестувальників —
 `start.sh`. Вікно запуску (`launcher.py`) поки лише Windows.
 
@@ -73,14 +83,16 @@ C:/js/Earth2Road/.venv/Scripts/python.exe earthng/region.py --pbf <ukraine-26091
 (roadgen v2, шви між тайлами збігаються — див. `docs/BEAMNG_STREAMING.md`, «Тайли без швів»).
 Згенеровані тайли лишаються в `e2r_stream/` профілю гри: повторний приїзд миттєвий.
 
-## Залежність від Earth2Road
+## Python
 
-- Python — з `.venv` Earth2Road; шлях до checkout — змінна `EARTH2ROAD` (типово
-  `C:\js\Earth2Road`), див. `earthng/paths.py`.
-- EarthNG використовує необов'язкові гачки в ядрі Earth2Road, які поки лише в його робочому
-  дереві (не закомічені): `context.skip_surface_audit`, `context.region` і `context.stop_after`
-  (`akadem_maps/core/prepare.py`) та `export_map(..., sink=...)`
-  (`akadem_maps/adapters/beamng/export_beamng.py`).
+Вікно країни (`Country.bat`), вікно запуску і генератор `fast` беруть інтерпретатор з цього
+репозиторія: `python\python.exe` у пакеті для тестувальників або `.venv` (його немає в git).
+Створити його: `py -3.13 -m venv .venv`, потім `.venv\Scripts\python.exe -m pip install -r requirements-fast.txt`.
+На Linux те саме робить `run_world.sh` у `.venv-linux/`.
+
+Старий генератор `v2` досі читає Earth2Road (`earthng/paths.py`, `-Generator v2`): необов'язкові
+гачки `context.skip_surface_audit`, `context.region`, `context.stop_after` і `export_map(..., sink=...)`
+лежать у його робочому дереві. Для пака країни і для `fast` цей checkout не потрібен.
 
 ## Структура
 

@@ -35,16 +35,19 @@ sys.path.insert(0, str(ROOT / 'out/test-tools'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lupa.luajit21 import LuaRuntime
 import country_format as binary
+import nature
 
 LUA = ROOT / 'mod/lua/ge/extensions/e2r'
 RES = .25          # m per raster pixel
 EDGE = .3          # footprint inset: rounding at the very edge is not a defect
 STEP = .05         # m: a jump inside the asphalt between neighbouring pixels
-CARRIAGEWAY = {'e2rf_road', 'e2rf_road_major'}
+CARRIAGEWAY = {'e2rf_road', 'e2rf_road_major', 'e2rf_road_worn', 'e2rf_road_gravel',
+               'e2rf_road_dirt', 'e2rf_road_broken', 'e2rf_road_track'}
 WALK = {'e2rf_sidewalk', 'e2rf_curb'}
-GROUND = {'e2rf_ground'}
+GROUND = {'e2rf_ground'} | {'e2rf_' + k for k in nature.NATURAL}
 # ground cover from the scene layer: it lies on the ground and shows through the asphalt as well
 COVER = {'e2rf_paved', 'e2rf_park', 'e2rf_forest', 'e2rf_water', 'e2rf_footway', 'e2rf_footway_asphalt', 'e2rf_trodden'}
+COVER |= {'e2rf_' + k for k in nature.NATURAL}
 
 BUILD = '''
 local generator, cellformat, data, slots, i, j, size, cellSize, sea, tune, cover, repeats = ...

@@ -461,6 +461,32 @@ local function completeLanding()
   active.prioritiesDirty = true
 end
 
+-- Debug-panel radii and vegetation caps. Nil until the player applies a tune,
+-- so a fresh landing keeps the generator defaults.
+local pendingTune
+
+local function clampTune(tune)
+  local function clamp(value, default, lo, hi)
+    local n = tonumber(value)
+    if n == nil then n = default end
+    return math.floor(math.max(lo, math.min(hi, n)) + 0.5)
+  end
+  tune = type(tune) == 'table' and tune or {}
+  local out = {
+    nearM = clamp(tune.nearM, 1000, 400, 4000),
+    farM = clamp(tune.farM, 3000, 800, 8000),
+    maxTrees = clamp(tune.maxTrees, 2400, 0, 2400),
+    maxFarTrees = clamp(tune.maxFarTrees, 800, 0, 1200),
+    maxGrass = clamp(tune.maxGrass, 4000, 0, 4800),
+    maxRocks = clamp(tune.maxRocks, 80, 0, 200),
+    forestSpacing = clamp(tune.forestSpacing, 5, 4, 24),
+    groundSpacing = clamp(tune.groundSpacing, 6, 4, 30),
+    groundTrees = tune.groundTrees ~= false and tune.groundTrees ~= 0,
+  }
+  if out.farM < out.nearM then out.farM = out.nearM end
+  return out
+end
+
 local function land(req)
   ensure()
   req = type(req) == 'table' and req or {}
@@ -484,6 +510,11 @@ local function land(req)
     building = 0, queued = 0, failed = active.failed, built = 0, rebuilds = 0, horizonBuilt = 0, horizonRebuilds = 0,
     meanBuildSeconds = 0, loadRadius = 1000, farRadius = 3000, farFast = 25,
     horizonRadius = HORIZON_RADIUS, horizonDem = true}
+  if pendingTune then
+    active.tune = pendingTune
+    state.stream.loadRadius = pendingTune.nearM
+    state.stream.farRadius = pendingTune.farM
+  end
   state.job.region, state.job.country, state.job.tileSize = descriptor.id, country.id, r.data.tileSize
   state.job.generator = state.stream.generator
   return state.job
@@ -497,8 +528,9 @@ local function priorities()
   local ahead = math.min(speed * 3, 2000)
   local ax, ay = p.x + (speed > 0 and (p.vx or 0) / speed * ahead or 0),
     p.y + (speed > 0 and (p.vy or 0) / speed * ahead or 0)
-  local radius, farRadius = 1000, 3000
-  st.loadRadius = radius
+  local tune = a.tune or {}
+  local radius, farRadius = tune.nearM or 1000, tune.farM or 3000
+  st.loadRadius, st.farRadius = radius, farRadius
   for i = math.floor(math.min(p.x - farRadius, ax - radius) / t), math.floor(math.max(p.x + farRadius, ax + radius) / t) do
     for j = math.floor(math.min(p.y - farRadius, ay - radius) / t), math.floor(math.max(p.y + farRadius, ay + radius) / t) do
       local cx, cy = (i + 0.5) * t, (j + 0.5) * t
@@ -684,12 +716,18 @@ local function buildTile(key, wanted)
     for j = math.floor((y0 - pad) / s), math.ceil((y0 + size + pad) / s) - 1 do addCell(i, j, false) end
   end
   local center = active.landing and {active.landing.x, active.landing.y} or nil
+  local tune = active.tune or {}
   local road, scene, far, nav = generator.build(cells, wanted.i, wanted.j,
     {tileSize = size, regionId = r.descriptor.id, center = center, pause = active.pause,
       materials = '/earthng/planet/materials.json', packs = '/e2r_stream/fast-art/v10/packs.json',
       far = wanted.far, horizon = wanted.horizon, farDecor = wanted.decor and true or false,
       farStep = 100, horizonStep = wanted.step or 100,
-      seaLevel = finite(r.data.seaLevel) and r.data.seaLevel or nil})
+      latitude = r.data.geo and r.data.geo[4], nature = r.data.nature,
+      look = r.data.look,
+      seaLevel = finite(r.data.seaLevel) and r.data.seaLevel or nil,
+      maxTrees = tune.maxTrees, maxFarTrees = tune.maxFarTrees, maxGrass = tune.maxGrass,
+      maxRocks = tune.maxRocks, forestSpacing = tune.forestSpacing, groundSpacing = tune.groundSpacing,
+      groundTrees = tune.groundTrees})
   if type(road) ~= 'table' or type(road.items) ~= 'table' or type(road.mats) ~= 'table'
     or type(scene) ~= 'table' or type(scene.items) ~= 'table' then error('generator returned an invalid tile manifest') end
   if wanted.far and (type(far) ~= 'table' or type(far.items) ~= 'table') then error('generator returned an invalid far manifest') end
@@ -1066,7 +1104,24 @@ M.update = update
 M.pose = pose
 M.manifest = manifest
 M.release = release
+local function setTune(tune)
+  ensure()
+  local out = clampTune(tune)
+  pendingTune = out
+  if active then
+    active.tune = out
+    active.prioritiesDirty = true
+  end
+  if state.stream then
+    state.stream.loadRadius = out.nearM
+    state.stream.farRadius = out.farM
+    state.stream.tune = out
+  end
+  return out
+end
+
 M.unload = unload
+M.setTune = setTune
 M.localPoint = function(lat, lon) if active then return localPoint(active.region, lat, lon) end end
 M.nav = function(key) local entry = active and active.tiles[key]; return entry and entry.nav end
 M.status = function() ensure(); state.heartbeat = os.time(); return state end

@@ -3,8 +3,7 @@
 # The Linux counterpart of run_world.ps1:
 #   bash run_world.sh [--tiles DIR] [--userfolder DIR] [--workers N] [--generator fast|v2] [--earth2road DIR] [--nogame]
 # In the game: Freeroam -> the "Earth2Road" planet level. Keep this terminal open while playing.
-# Python: Earth2Road's .venv when it is there, else .venv-linux here with requirements-fast.txt.
-# The fast generator needs no Earth2Road; v2 does (its .venv and SUMO).
+# Python: this checkout's .venv-linux (requirements-fast.txt). Generator v2 still needs Earth2Road.
 # BeamNG runs natively or under Proton; the profile is looked up in both, BEAMNG_USERFOLDER overrides.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,15 +31,15 @@ done
 case "$generator" in fast|v2) ;; *) echo '--generator must be fast or v2' >&2; exit 1 ;; esac
 case "$workers" in ''|*[!0-9]*) echo '--workers must be a positive number' >&2; exit 1 ;; esac
 
-# python
-if [ -x "$earth2road/.venv/bin/python" ]; then
-	py="$earth2road/.venv/bin/python"
-	export EARTH2ROAD="$earth2road"
-else
-	if [ "$generator" = v2 ]; then
+# python: own venv. v2 is the only mode that still runs Earth2Road's interpreter.
+if [ "$generator" = v2 ]; then
+	if [ ! -x "$earth2road/.venv/bin/python" ]; then
 		echo "--generator v2 needs Earth2Road with its .venv: not found at $earth2road (--earth2road DIR)" >&2
 		exit 1
 	fi
+	py="$earth2road/.venv/bin/python"
+	export EARTH2ROAD="$earth2road"
+else
 	venv="$root/.venv-linux"
 	if [ ! -x "$venv/bin/python" ]; then
 		command -v python3 >/dev/null || { echo 'python3 not found: install it (Debian/Ubuntu: sudo apt install python3 python3-venv)' >&2; exit 1; }

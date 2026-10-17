@@ -4,8 +4,9 @@
     <python>/pythonw.exe earthng/launcher.py
 
 Replaces run_world.ps1 / package start.ps1 for everyday use (they stay as console fallbacks).
-Works in both layouts: the repository (Python and the generator from Earth2Road's .venv, the mod
+Works in both layouts: the repository (its own .venv from requirements-fast.txt; the mod
 is rebuilt from mod/) and the tester package (its own python/, the ready mod/earthng_planet.zip).
+The old v2 generator still needs an Earth2Road checkout. fast and the country window do not.
 Settings are kept in launcher.json next to earthng/. The companion's output goes to the log pane;
 closing the window stops the companion and its tile builders. The window speaks the language of the
 tile package (lang.py): Ukrainian for Ukraine, English for the UK and California.
@@ -113,8 +114,12 @@ class Launcher:
         start.columnconfigure(1, weight=1)
         self.path_row(start, 0, T('Тека профілю BeamNG', 'BeamNG user folder'), 'userfolder')
         r = 1
+        self.e2r = None
         if not PACKAGED:
-            self.path_row(start, r, T('Earth2Road (його .venv)', 'Earth2Road (its .venv)'), 'earth2road')
+            self.e2r = ttk.Frame(start)
+            self.e2r.grid(row=r, column=0, columnspan=3, sticky='ew')
+            self.e2r.columnconfigure(1, weight=1)
+            self.path_row(self.e2r, 0, T('Earth2Road, лише для v2', 'Earth2Road, only for v2'), 'earth2road')
             r += 1
         ttk.Checkbutton(start, text=T('Запустити BeamNG.drive через Steam', 'Start BeamNG.drive via Steam'), variable=self.v['launch_game']).grid(
             row=r, column=0, columnspan=3, sticky='w', pady=(4, 0))
@@ -203,6 +208,11 @@ class Launcher:
         fast = self.v['generator'].get() == 'fast'
         self.far_spin.configure(state='normal' if fast else 'disabled')
         self.radius_spin.configure(state='disabled' if fast else 'normal')
+        if self.e2r is not None:
+            if fast:
+                self.e2r.grid_remove()
+            else:
+                self.e2r.grid()
 
     def settings(self):
         out = {}
@@ -239,14 +249,14 @@ class Launcher:
         threading.Thread(target=self.run, args=(s,), daemon=True).start()
 
     def python(self, s):
-        if PACKAGED:
-            return ROOT / 'python' / 'python.exe'
+        if PACKAGED or s['generator'] != 'v2':
+            return ROOT / 'python' / 'python.exe' if PACKAGED else ROOT / '.venv' / 'Scripts' / 'python.exe'
         return Path(s['earth2road']) / '.venv' / 'Scripts' / 'python.exe'
 
     def environment(self, s):
         env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
                    EARTHNG_FAR_R=str(s['far_radius']))
-        if PACKAGED:
+        if PACKAGED or s['generator'] != 'v2':
             env.update(EARTH2ROAD=str(ROOT / 'none'), PYTHONNOUSERSITE='1')
             env.pop('PYTHONPATH', None)
         else:

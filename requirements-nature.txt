@@ -1,0 +1,3 @@
+# Optional authoring-only import of local ESA WorldCover class GeoTIFFs.
+-r requirements-fast.txt
+rasterio>=1.3,<2

@@ -23,6 +23,8 @@ AMBER = (221, 169, 94)
 PALETTE = (INK, SLATE, BLUE, CREAM, SAND, CLAY, SAGE, MOSS, AMBER)
 SURFACES = {
     'road': SLATE, 'road_major': INK, 'footway_asphalt': SLATE,
+    'road_worn': (96, 90, 82), 'road_gravel': SAND, 'road_dirt': CLAY,
+    'road_broken': (120, 96, 70), 'road_track': MOSS,
     'sidewalk': SAND, 'footway': SAND, 'paved': SAND, 'mark': CREAM,
     'curb': CREAM, 'ground': SAGE, 'park': SAGE, 'forest': MOSS,
     'water': BLUE, 'roof': SLATE, 'roof_tile': CLAY, 'roof_metal': MOSS,
@@ -123,6 +125,16 @@ def surface(kind):
     return im.resize((1024, 1024), Image.Resampling.NEAREST)
 
 
+def pixel_source(kind):
+    """Every kind needs a png. Natural classes reuse an authored pixel surface."""
+    alias = {'meadow': 'ground', 'orchard': 'park', 'scrub': 'forest', 'heath': 'ground',
+             'farmland': 'trodden', 'vineyard': 'trodden', 'bare_rock': 'paved',
+             'scree': 'trodden', 'beach': 'trodden', 'wetland': 'forest',
+             'glacier': 'mark', 'bare_ground': 'trodden', 'mark_yellow': 'mark'}
+    source = alias.get(kind, kind)
+    return source if source in SURFACES else 'ground'
+
+
 def build(root):
     import fast
     out = root / 'pixel'
@@ -130,8 +142,8 @@ def build(root):
     for kind in style.KINDS:
         if kind.startswith('wall_'):
             facade(kind[5:]).save(out / f'{kind}.color.png')
-        elif kind in SURFACES:
-            surface(kind).save(out / f'{kind}.color.png')
+        else:
+            surface(pixel_source(kind)).save(out / f'{kind}.color.png')
     # The decorative cars share an atlas: preserve its cells and glass/tyre indices.
     cars = Image.new('RGB', (32 * fast.CAR_ATLAS, 32), INK)
     d = ImageDraw.Draw(cars)
@@ -147,8 +159,16 @@ def fields(base):
     out = {}
     for kind in style.KINDS:
         f = {key: '' for key in ('baseColorMap', 'normalMap', 'roughnessMap', 'ambientOcclusionMap', 'emissiveMap', 'opacityMap')}
-        f.update(baseColorMap=f'{base}/pixel/{kind}.color.png', baseColorFactor='1 1 1 1',
+        # New nature classes reuse authored pixel surfaces. Never reference an
+        # image that build() does not generate (including existing art caches).
+        texture = {'meadow': 'ground', 'orchard': 'park', 'scrub': 'forest', 'heath': 'ground',
+                   'farmland': 'trodden', 'vineyard': 'trodden', 'bare_rock': 'paved',
+                   'scree': 'trodden', 'beach': 'trodden', 'wetland': 'forest',
+                   'glacier': 'mark', 'bare_ground': 'trodden', 'mark_yellow': 'mark'}.get(kind, kind)
+        f.update(baseColorMap=f'{base}/pixel/{texture}.color.png', baseColorFactor='1 1 1 1',
                  emissiveFactor='0 0 0', roughnessFactor=.9, metallicFactor=0)
+        if kind == 'mark_yellow':
+            f['baseColorFactor'] = '0.95 0.75 0.12 1'
         if kind == 'fence_mesh':
             f['opacityMap'] = f'{base}/real/chainlink_o.data.png'
         out['e2rf_' + kind] = f

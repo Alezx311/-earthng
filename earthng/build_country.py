@@ -27,6 +27,8 @@ import shapely
 
 import country_format as binary
 import fast_sources as sources
+import looks
+import nature
 
 
 FORMAT = 'earthng-features-v2'
@@ -186,7 +188,7 @@ def _scenery(store, rect, depth=0):
             for record in _scenery(store, part, depth + 1)]
 
 
-def compile_cell(store, rect):
+def compile_cell(store, rect, include=None):
     """Source records with a halo; all XY and Z share the source index's frame."""
     padded = [rect[0]-HALO, rect[1]-HALO, rect[2]+HALO, rect[3]+HALO]
     cell = {name: [] for name in ('roads', 'junctions', 'buildings', 'areas', 'lines', 'points')}
@@ -208,7 +210,7 @@ def compile_cell(store, rect):
     seen.clear()
     pending, points = [], []
     for fid, kind, data, geometry in _scenery(store, padded):
-        if (kind, fid) in seen:
+        if (kind, fid) in seen or not looks.keep_scenery(kind, include):
             continue
         seen.add((kind, fid))
         tags = data.get('tags', {})
@@ -237,6 +239,21 @@ def compile_cell(store, rect):
     _sample_pending(store, pending)
     for feature in points:
         feature['pos'] = feature['pos'][0]
+    cell['areas'] = nature.partition(cell['areas'])
+    cover = getattr(store, 'landcover', None)
+    if cover is not None and (not include or include.get('cover', True) or include.get('water', True)):
+        # Detailed mapped footprints win over satellite classes. Raster areas
+        # carry no sampled Z: runtime drapes them on the shared final surface.
+        overrides = [shapely.Polygon(f['rings'][0], f['rings'][1:])
+                     for f in cell['areas'] + cell['buildings'] if f.get('rings')]
+        for n, (kind, geometry, tags) in enumerate(cover.areas(rect, overrides)):
+            if not looks.keep_scenery(kind, include):
+                continue
+            for k, part in enumerate(_parts(geometry, 'Polygon')):
+                rings = [[[float(p[0]), float(p[1]), 0.] for p in ring.coords]
+                         for ring in [part.exterior, *part.interiors]]
+                cell['areas'].append({'id': f'wc:{int(rect[0])}:{int(rect[1])}:{n}:{k}',
+                                      'kind': kind, 'tags': tags, 'rings': rings})
     for features in cell.values():
         features.sort(key=lambda feature: feature['id'])
     xs = np.arange(rect[0], rect[2]+GRID, GRID, dtype=float)
@@ -298,13 +315,13 @@ def _write_json(archive, path, value):
     _write(archive, path, _encode(value))
 
 
-def compile_block(store, cells):
+def compile_block(store, cells, include=None):
     """Encoded payloads {slot: bytes} and road counts {slot: n} of the given (i, j) cells."""
     payloads, roads = {}, {}
     for i, j in cells:
         rect = [i*CELL, j*CELL, (i+1)*CELL, (j+1)*CELL]
         try:
-            cell = compile_cell(store, rect)
+            cell = compile_cell(store, rect, include)
         except FileNotFoundError as exc:
             if 'no_dem' not in str(exc):
                 raise
@@ -324,13 +341,17 @@ def _despike(store):
     return store
 
 
-def _worker_open(directory):
+def _worker_open(directory, landcover=(), include=None):
     _WORKER['store'] = _despike(sources.Store(directory))
+    _WORKER['include'] = include
+    if landcover:
+        from landcover import WorldCover
+        _WORKER['store'].landcover = WorldCover(landcover, _WORKER['store'].frame)
 
 
 def _worker_block(task):
     key, cells = task
-    return key, compile_block(_WORKER['store'], cells)
+    return key, compile_block(_WORKER['store'], cells, _WORKER.get('include'))
 
 
 def _region_spec(region):
@@ -383,7 +404,8 @@ def _landing(present, roads, frame, core):
     return best and best[1]
 
 
-def _export_region(archive, country_id, region, bbox, emit, jobs=1):
+def _export_region(archive, country_id, region, bbox, emit, jobs=1, landcover=(), cover_meta=None, vegetation=None,
+                   include=None, look=None):
     directory, core, region_id = _region_spec(region)
     meta = _source_meta(directory)
     region_id = region_id or meta['id'].replace('_', '-')
@@ -392,6 +414,9 @@ def _export_region(archive, country_id, region, bbox, emit, jobs=1):
         core = [float(v) for v in _bounds(list(core), f'{region_id}: core box')]
     store = _despike(sources.Store(directory))
     try:
+        if landcover:
+            from landcover import WorldCover
+            store.landcover = WorldCover(landcover, store.frame)
         provenance = _provenance(meta, getattr(store, 'source_index', {}))
         frame = store.frame
         if bbox is not None:
@@ -416,10 +441,11 @@ def _export_region(archive, country_id, region, bbox, emit, jobs=1):
         pool = None
         if jobs > 1 and len(tasks) > 1:
             import multiprocessing
-            pool = multiprocessing.get_context('spawn').Pool(min(jobs, len(tasks)), _worker_open, (str(directory),))
+            pool = multiprocessing.get_context('spawn').Pool(
+                min(jobs, len(tasks)), _worker_open, (str(directory), landcover, include))
             results = pool.imap(_worker_block, tasks)
         else:
-            results = ((key, compile_block(store, cells)) for key, cells in tasks)
+            results = ((key, compile_block(store, cells, include)) for key, cells in tasks)
         manifest_blocks, present, roads, done = {}, set(), {}, 0
         try:
             for (bi, bj), (payloads, counts) in results:
@@ -470,20 +496,44 @@ def _export_region(archive, country_id, region, bbox, emit, jobs=1):
                     'seaLevel': sources.LIFT, 'cellCount': len(present), 'blocks': manifest_blocks, **provenance}
         if landing is not None:
             manifest['landing'] = landing
+        manifest['natureVersion'] = nature.VERSION
+        if vegetation:
+            manifest['nature'] = vegetation
+        if cover_meta:
+            manifest['landcover'] = cover_meta
+        if look:
+            manifest['look'] = look
+        if include:
+            manifest['include'] = include
         path = f'{base}/manifest.json'
         _write_json(archive, path, manifest)
         return {'id': region_id, 'manifest': '/' + path, 'coverage': coverage, **provenance}
     finally:
+        if getattr(store, 'landcover', None) is not None:
+            store.landcover.close()
         store.db.close()
 
 
-def build_country(country_id, title, version, regions, out, bbox=None, emit=print, jobs=1, landing=None):
+def build_country(country_id, title, version, regions, out, bbox=None, emit=print, jobs=1, landing=None, landcover=(), vegetation=None,
+                  look=None, include=None):
     """Stream source blocks to ZIP64 and atomically replace the completed archive."""
     _identifier(country_id, 'country id')
     if not isinstance(title, str) or not title.strip() or not isinstance(version, str) or not version.strip():
         raise ValueError('country title and version must be nonempty strings')
     if not regions:
         raise ValueError('at least one --region or --sources package is required')
+    for key, value in (vegetation or {}).items():
+        if key not in ('treeLine', 'coniferStart') or not math.isfinite(value) or not 0 <= value <= 6000:
+            raise ValueError('vegetation heights must be finite metres above sea level in 0..6000')
+    if look is not None:
+        look = looks.canonical(look)
+    if include is not None:
+        include = looks.canonical_include(include)
+    cover_meta = None
+    if landcover:
+        from landcover import provenance
+        landcover = tuple(str(Path(p).resolve()) for p in landcover)
+        cover_meta = provenance(landcover)
     if bbox is not None:
         _bounds(bbox, 'local export bbox')
     identifiers = []
@@ -502,7 +552,7 @@ def build_country(country_id, title, version, regions, out, bbox=None, emit=prin
             entries = []
             for region in regions:
                 try:
-                    entries.append(_export_region(archive, country_id, region, bbox, emit, jobs))
+                    entries.append(_export_region(archive, country_id, region, bbox, emit, jobs, landcover, cover_meta, vegetation, include, look))
                 except ValueError as exc:
                     # A grid box of open sea or a border sliver: the rest of the country stays.
                     if len(regions) == 1 or not isinstance(region, dict) or 'no ' not in str(exc):
@@ -523,6 +573,13 @@ def build_country(country_id, title, version, regions, out, bbox=None, emit=prin
                         'regions': entries, **provenance}
             if landing is not None:
                 manifest['landing'] = {'lat': float(landing[0]), 'lon': float(landing[1])}
+            manifest['natureVersion'] = nature.VERSION
+            if cover_meta:
+                manifest['landcover'] = cover_meta
+            if look:
+                manifest['look'] = look
+            if include:
+                manifest['include'] = include
             _write_json(archive, f'earthng/countries/{country_id}/manifest.json', manifest)
         os.replace(temporary, target)
     finally:
@@ -580,6 +637,10 @@ def main():
     parser.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument('--landing', type=float, nargs=2, metavar=('LAT', 'LON'),
                         help='where the country button lands (inside the export)')
+    parser.add_argument('--landcover', action='append', default=[], metavar='GEOTIFF',
+                        help='local ESA WorldCover 2021 v200 Map GeoTIFF; repeat for adjacent tiles (optional)')
+    parser.add_argument('--tree-line', type=float, help='regional forest limit in metres above sea level')
+    parser.add_argument('--conifer-start', type=float, help='altitude at which untagged forest begins mixing conifers')
     args = parser.parse_args()
     try:
         regions = list(args.region)
@@ -587,8 +648,9 @@ def main():
             if args.dem is None or args.work is None:
                 parser.error('--sources requires --dem and --work')
             regions += grid_regions(args.sources, args.dem, args.work, args.grid)
+        vegetation = {k: v for k, v in (('treeLine', args.tree_line), ('coniferStart', args.conifer_start)) if v is not None}
         result = build_country(args.id, args.title, args.version, regions, args.out, args.bbox,
-                               jobs=args.jobs, landing=args.landing)
+                               jobs=args.jobs, landing=args.landing, landcover=args.landcover, vegetation=vegetation)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     print(result)

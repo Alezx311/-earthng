@@ -264,6 +264,9 @@ def pack_fields(pack, base):
             if kind in style.PHOTO_GROUND:
                 f.update(style.real_stage(kind))
                 f['baseColorFactor'] = '1 1 1 1'
+            elif kind in style.nature.NATURAL:
+                f.update(style.real_stage(kind))
+                f['baseColorFactor'] = colour([c * 255 for c in style.TINT[kind][:3]])
             elif tex:
                 f.update(style.TEXTURES[tex])
                 f['baseColorFactor'] = colour([c * 255 for c in style.TINT.get(kind, [1, 1, 1])[:3]])

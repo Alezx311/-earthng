@@ -286,7 +286,209 @@ local function binMeshes(path, pause)
   return meshes
 end
 
-local function spawnItem(it, group, pause)
+-- One Forest for the whole level. BeamNG gives every Forest global bounds, so a
+-- Forest per tile is never culled: each one runs its own cell walk and render
+-- submission on the main thread every frame, and the GPU waits. That is a full
+-- frame at ~20 FPS with the CPU near one core and the GPU near a third busy.
+-- Collidable stays off: deleting a Forest whose items sit in static collision
+-- hangs the game, and a colliding population makes every later add cost the
+-- engine tick. The object is never deleted; the level unload drops it.
+local plantData, sharedForestId = {}, nil
+local FOREST_ADDS, FOREST_REMOVES = 80, 80
+-- rebuildForestManagerInstanceData reuploads every crown. Once a frame it
+-- stalls the GPU and stops the tile queue. Twice a second is enough for crowns
+-- to show up, and the upload stays off the mesh frames in between.
+local FOREST_REBUILD_S = 0.4
+
+local function shapeKey(shape)
+  local h = 17
+  for i = 1, #shape do h = (h * 131 + shape:byte(i)) % 2147483647 end
+  return h
+end
+
+-- Trees and bushes only. Grass and rocks stay TSStatic: a Forest item with an
+-- alpha tuft was not drawing, so open slopes stayed a flat sheet.
+local function vegetationShape(shape)
+  return type(shape) == 'string' and not shape:find('3d_grass', 1, true) and not shape:find('/rocks/', 1, true)
+    and (shape:find('/trees/', 1, true) or shape:find('trees_library', 1, true) or shape:find('scots_pine', 1, true))
+end
+
+-- BeamNG 0.39 registers the datablock as ForestItemData. TSForestItemData does
+-- not exist: createObject logged "unknown class" once per tree and every crown
+-- fell back to a TSStatic, which is why the canopy popped while the camera sat still.
+local function newForestItemData()
+  if worldEditorCppApi and worldEditorCppApi.createObject then
+    local ok, created = pcall(worldEditorCppApi.createObject, 'ForestItemData')
+    if ok and created then return created end
+  end
+  local ok, created = pcall(createObject, 'ForestItemData')
+  if ok and created then return created end
+end
+
+local function setPlantField(obj, field, value)
+  if pcall(function() obj:setField(field, '', value) end) then return end
+  obj:setField(field, 0, value)
+end
+
+local function plantDataFor(shape)
+  if S.forestOff then return nil end
+  local known = plantData[shape]
+  if known ~= nil then return known or nil end
+  local name = 'e2rPlant_' .. tostring(shapeKey(shape))
+  local d = scenetree.findObject(name)
+  if not d then
+    local created = newForestItemData()
+    if not created then
+      if not S.forestOff then log('W', logTag, 'ForestItemData unavailable, vegetation stays TSStatic') end
+      S.forestOff = true
+      result.forest = 'static'
+      return nil
+    end
+    setPlantField(created, 'shapeFile', shape)
+    setPlantField(created, 'collidable', '0')
+    setPlantField(created, 'windScale', '0.35')
+    setPlantField(created, 'branchAmp', '0.08')
+    setPlantField(created, 'detailAmp', '0.15')
+    local registered = pcall(function() created:registerObject('') end)
+      or pcall(function() created:registerObject(name) end)
+    if not registered then
+      plantData[shape] = false
+      return nil
+    end
+    pcall(function() created:setName(name) end)
+    pcall(function() created:setInternalName(name) end)
+    pcall(function()
+      local group = scenetree.findObject('dataBlockGroup')
+      if group then group:addObject(created) end
+    end)
+    pcall(function()
+      if Sim and Sim.getDataBlockSet then Sim.getDataBlockSet():addObject(created) end
+    end)
+    d = created
+  end
+  plantData[shape] = d
+  return d
+end
+
+local function forestFor(tile)
+  if S.forestOff then return nil end
+  local f = sharedForestId and scenetree.findObjectById(sharedForestId)
+  if not f then
+    sharedForestId = nil
+    f = scenetree.findObject('e2rForest')
+    if f then sharedForestId = f:getID() end
+  end
+  if not f then
+    local ok, created = pcall(createObject, 'Forest')
+    if not ok or not created then
+      if not S.forestOff then log('W', logTag, 'Forest unavailable, vegetation stays TSStatic') end
+      S.forestOff = true
+      result.forest = 'off'
+      return nil
+    end
+    created.canSave = false
+    -- Reflections redraw the forest. A high scalar drops that pass to billboards.
+    pcall(function() created.lodReflectScalar = 8 end)
+    if not pcall(function() created:registerObject('e2rForest') end) then
+      S.forestOff = true
+      result.forest = 'off'
+      return nil
+    end
+    if scenetree.MissionGroup then scenetree.MissionGroup:addObject(created) end
+    f = created
+    sharedForestId = f:getID()
+  end
+  if tile then tile.forestId = sharedForestId end
+  -- 'on' means a crown was accepted. The container alone used to report 'on'
+  -- while every item fell back to a TSStatic.
+  if result.forest ~= 'on' and result.forest ~= 'static' then result.forest = 'object' end
+  return f
+end
+
+local function yawOf(rot)
+  return 2 * math.atan2(rot and rot[3] or 0, rot and rot[4] or 1)
+end
+
+local function spawnForestItem(it, tile)
+  if S.forestOff or not tile then return false end
+  local f = forestFor(tile)
+  if not f then return false end
+  local data = f:getData()
+  local kind = data and plantDataFor(it.shape)
+  if not data or not kind or not MatrixF then return false end
+  local m = MatrixF(true)
+  m:setFromEuler(vec3(0, 0, yawOf(it.rot)))
+  m:setPosition(vec3(it.pos[1], it.pos[2], it.pos[3]))
+  local ok, item = pcall(function() return data:createNewItem(kind, m, it.scale or 1) end)
+  if not ok or not item then
+    S.forestFails = (S.forestFails or 0) + 1
+    if S.forestFails >= 3 then
+      S.forestOff = true
+      result.forest = 'off'
+      log('W', logTag, 'Forest item create failed, vegetation stays TSStatic')
+    end
+    return false
+  end
+  tile.forestItems = tile.forestItems or {}
+  tile.forestItems[#tile.forestItems + 1] = item
+  S.forestBurst = (S.forestBurst or 0) + 1
+  S.forestDirty = true
+  result.forest = 'on'
+  result.forestItems = (result.forestItems or 0) + 1
+  return true
+end
+
+local function retireForest(tile)
+  if not tile or not tile.forestId then return end
+  S.forestRetire = S.forestRetire or {}
+  S.forestRetire[#S.forestRetire + 1] = {id = tile.forestId, items = tile.forestItems or {}}
+  tile.forestId, tile.forestItems = nil, nil
+end
+
+local function digForests()
+  local jobs = S.forestRetire
+  if not jobs or #jobs == 0 then return end
+  local left = FOREST_REMOVES
+  while left > 0 and #jobs > 0 do
+    local job = jobs[1]
+    local f = job.id and scenetree.findObjectById(job.id)
+    local data = f and f.getData and f:getData()
+    while left > 0 and job.items and #job.items > 0 do
+      local item = table.remove(job.items)
+      if data then
+        if pcall(function() data:removeItem(item) end) then S.forestDirty = true end
+      end
+      left = left - 1
+    end
+    if not job.items or #job.items == 0 then
+      table.remove(jobs, 1)
+    else
+      break
+    end
+  end
+end
+
+local function resetForests()
+  sharedForestId, plantData = nil, {}
+  S.forestRetire, S.forestOff, S.forestFails, S.forestBurst, S.forestDirty = nil, nil, nil, nil, nil
+  S.forestRebuildAt = nil
+end
+
+local function refreshForest()
+  if not S.forestDirty then return end
+  if (S.now or 0) - (S.forestRebuildAt or -10) < FOREST_REBUILD_S then return end
+  S.forestDirty = nil
+  S.forestRebuildAt = S.now
+  if not (worldEditorCppApi and worldEditorCppApi.rebuildForestManagerInstanceData) then return end
+  local timer = hptimer()
+  pcall(worldEditorCppApi.rebuildForestManagerInstanceData)
+  local ms = timer:stop()
+  result.forestRebuildMs = ms
+  if ms > (result.forestRebuildMaxMs or 0) then result.forestRebuildMaxMs = ms end
+  result.forestRebuilds = (result.forestRebuilds or 0) + 1
+end
+
+local function spawnItem(it, group, pause, tile)
   if it.kind == 'proc' then
     local meshes = it.meshes or binMeshes(it.shape, pause)
     if not meshes then error('missing mesh: ' .. tostring(it.shape)) end
@@ -302,7 +504,12 @@ local function spawnItem(it, group, pause)
     local ms = t:stop()
     if ms > (result.createMeshMs or 0) then result.createMeshMs, result.createMeshItem = ms, it.name end
   else
+    if tile and vegetationShape(it.shape) and spawnForestItem(it, tile) then return end
     local obj = createObject('TSStatic')
+    local itemName = it.name or ''
+    if vegetationShape(it.shape) then result.staticTrees = (result.staticTrees or 0) + 1
+    elseif itemName:find('grass', 1, true) then result.grassSpawned = (result.grassSpawned or 0) + 1
+    elseif itemName:find('rock', 1, true) then result.rockSpawned = (result.rockSpawned or 0) + 1 end
     obj:setField('shapeName', 0, it.shape)
     obj:setField('collisionType', 0, it.collision or 'Collision Mesh')
     obj:setField('decalType', 0, it.decal or 'None')
@@ -407,12 +614,33 @@ end
 -- --- tile streaming ------------------------------------------------------------------------------
 -- S.stream: the companion's stream status (region, tile size, ready tiles). S.tiles[key]:
 -- {state = 'loading'|'loaded', i, j, manifest, group}. S.queue: items of loading tiles, in order.
+-- Free flight used to keep the near bubble on the parked car, so the lens sat
+-- in the far ring: fences and trees popped at the nose. Past this gap the
+-- bubble follows the camera and look-ahead stays off.
+local CAM_HANDOFF_M = 100
+-- Cockpit and hood stay on the car. Every other camera past the gap owns the
+-- bubble, so a free-flight name other than "free" or "orbit" still leaves the far ring.
+local DRIVE_CAM = {driver = true, ['onboard.driver'] = true, cockpit = true, hood = true,
+  driver_in = true, ['driver.driver'] = true, passenger = true}
+
 local function focus()
   if S.replayPose then return S.replayPose.p, S.replayPose.v end
   if S.state == 'driving' then
     local veh = getPlayerVehicle(0)
     if veh then
       local p, v = veh:getPosition(), veh:getVelocity()
+      local okName, name = pcall(function() return core_camera.getActiveCamName(0) end)
+      local okPos, cam = pcall(function() return core_camera.getPosition() end)
+      local dist
+      if okPos and cam and p then
+        local dx, dy, dz = cam.x - p.x, cam.y - p.y, cam.z - p.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+      end
+      S.camName = okName and name or nil
+      S.camDist = dist
+      if okPos and cam and dist and dist > CAM_HANDOFF_M and not (okName and DRIVE_CAM[name]) then
+        return vec3(cam.x, cam.y, cam.z), vec3(0, 0, 0)
+      end
       return p, v
     end
   end
@@ -728,6 +956,7 @@ local function updateTiles()
     local cx, cy = tileCentre(tile.i, tile.j)
     local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
     if d > unloadR or behind(cx, cy, d) then
+      retireForest(tile)
       dropGroup('E2RT_' .. key); buryGroup('E2RD_' .. key)
       S.tiles[key] = nil
       if NATIVE then native.unload(key) end
@@ -779,7 +1008,13 @@ local function updateTiles()
       local cx, cy = tileCentre(far.i, far.j)
       local d = math.sqrt((cx - p.x) ^ 2 + (cy - p.y) ^ 2)
       local near = S.tiles[key]
+      -- The far canopy used to stay up until the near scene finished, so the same
+      -- trees were drawn twice and z-fought for the whole spawn. Drop the far
+      -- forest as soon as the near scene starts; its ground mesh stays until the
+      -- near ground has replaced it.
+      if near and near.sceneStarted then retireForest(far) end
       if d > farR + 500 or (near and near.sceneComplete) then
+        retireForest(far)
         buryGroup('E2RF_' .. key)
         far.dropped = true
         S.far[key] = nil
@@ -789,6 +1024,7 @@ local function updateTiles()
     for key, token in pairs(st.far or {}) do
       local spawned = S.far[key]
       if spawned and type(token) == 'number' and spawned.serial ~= token then
+        retireForest(spawned)
         buryGroup('E2RF_' .. key)
         spawned.dropped = true
         S.far[key] = nil
@@ -798,7 +1034,7 @@ local function updateTiles()
       local bestF, bestFD
       for key in pairs(st.far or {}) do
         local near = S.tiles[key]
-        if not S.far[key] and not (near and near.sceneComplete) then
+        if not S.far[key] and not (near and (near.sceneStarted or near.sceneComplete)) then
           local i, j = key:match('^(-?%d+)_(-?%d+)$')
           i, j = tonumber(i), tonumber(j)
           local cx, cy = tileCentre(i, j)
@@ -866,18 +1102,33 @@ local function updateTiles()
     local horizonCount = 0
     for _ in pairs(S.horizon) do horizonCount = horizonCount + 1 end
     result.horizonResident = horizonCount
-    -- Reprioritize pending work when direction changes; no scene object can block roads, no far
-    -- object a scene.
-    -- Roads and scenes go by the car's arrival (wanted, s), a scene SCENE_LAG s after its road:
-    -- the buildings by the car come before the roads of a tile a kilometre ahead.
+    -- Reprioritize pending work when direction changes. Ground meshes of every
+    -- tile come before any plant: a nearer tile's crowns used to sit ahead of
+    -- the next tile's road and the bubble painted at the forest cap.
+    -- Among meshes, roads and scenes go by the car's arrival (wanted, s), a
+    -- scene SCENE_LAG s after its road: the buildings by the car come before
+    -- the roads of a tile a kilometre ahead.
     local wanted = st.wanted or {}
     local function rank(job) return job.horizon and 2 or (job.far and 1 or 0) end
     local function due(job) return (wanted[job.key] or 1e6) + (job.scene and SCENE_LAG or 0) end
+    -- Ground, then grass and rocks, then trees. A tile of 1800 crowns used to
+    -- fill the frame budget before a single tuft or stone was spawned.
+    local function decorRank(job)
+      local it = job.item
+      if it and it.kind == 'proc' then return 0 end
+      local name = it and it.name or ''
+      if name:find('grass', 1, true) or name:find('rock', 1, true) then return 1 end
+      return 2
+    end
     table.sort(S.queue, function(a, b)
+      local dra, drb = decorRank(a), decorRank(b)
+      local pa, pb = dra == 0, drb == 0
+      if pa ~= pb then return pa end
       local ra, rb = rank(a), rank(b)
       if ra ~= rb then return ra < rb end
       local da, db = due(a), due(b)
       if da ~= db then return da < db end
+      if dra ~= drb then return dra < drb end
       return (a.scene and 1 or 0) < (b.scene and 1 or 0)
     end)
   end
@@ -885,6 +1136,9 @@ end
 
 local function stepQueue()
   local frame = hptimer()
+  S.forestBurst = 0
+  -- Retires queued by updateTiles this frame start before new crowns are added.
+  digForests()
   local function over() return frame:stop() >= BUDGET_MS end
   local function pause() if over() then coroutine.yield() end end
   if S.co and S.job and S.job.tile.dropped then S.co, S.job = nil, nil end
@@ -895,7 +1149,7 @@ local function stepQueue()
       if not job then break end
       S.job = job
       local group = ((job.far or job.horizon) and job.tile.group) or (job.item.decor and job.tile.decor) or job.tile.group
-      S.co = coroutine.create(function(p) spawnItem(job.item, group, p) end)
+      S.co = coroutine.create(function(p) spawnItem(job.item, group, p, job.tile) end)
     end
     -- a resume far over the budget: is it the collector (Lua heap shrinks inside it)?
     local kb0, t0 = collectgarbage('count'), hptimer()
@@ -947,7 +1201,8 @@ local function stepQueue()
       end
       if S.job.scene and not tile.dropped then S.collisionDirty = true; tile.sceneDirty = true end
     end
-  until over()
+  until over() or (S.forestBurst or 0) >= FOREST_ADDS
+  refreshForest()
 end
 
 -- be:reloadCollision rebuilds the static collision of the whole loaded world; the call returns in
@@ -1346,8 +1601,14 @@ local function beginArrival(job)
   local manifest = type(job.manifest) == 'table' and job.manifest or jsonReadFile(job.manifest)
   if not manifest then return end
   -- leave the previous region
-  for key, tile in pairs(S.tiles) do dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true end
-  for key, far in pairs(S.far) do dropGroup('E2RF_' .. key); far.dropped = true end
+  for key, tile in pairs(S.tiles) do
+    retireForest(tile)
+    dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true
+  end
+  for key, far in pairs(S.far) do
+    retireForest(far)
+    dropGroup('E2RF_' .. key); far.dropped = true
+  end
   for key, horizon in pairs(S.horizon or {}) do
     dropGroup(horizon.groupName or ('E2RH_' .. key:gsub('[^%w_]', '_')))
     horizon.dropped = true
@@ -1362,6 +1623,18 @@ local function beginArrival(job)
   S.landing = manifest
   S.knownMats = {}
   S.lamps = {}
+  -- Stock conifers are level assets. Load their definitions from the user's
+  -- installation; no game geometry or material file is distributed with EarthNG.
+  -- Stock shapes stay in the player's install. Load their materials or the mesh is orange.
+  local stockMaterials = {'/levels/italy/art/shapes/trees/trees_italy/main.materials.json',
+    '/levels/east_coast_usa/art/shapes/trees/trees_oak/main.materials.json',
+    '/levels/east_coast_usa/art/shapes/trees/trees_beech/main.materials.json',
+    '/levels/east_coast_usa/art/shapes/trees/trees_aspen/main.materials.json',
+    '/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/main.materials.json',
+    '/levels/east_coast_usa/art/shapes/rocks/main.materials.json'}
+  for _, path in ipairs(stockMaterials) do
+    if FS:fileExists(path) then loadJsonMaterialsFile(path) end
+  end
   loadNewMaterials(manifest.materials)
   if manifest.spawn and job.horizonZ then pcall(makeHorizon, job.horizonZ, manifest.spawn.pos[1], manifest.spawn.pos[2]) end
   if manifest.packs and FS:fileExists(manifest.packs) then
@@ -1430,14 +1703,15 @@ local function beginArrival(job)
                       material = mat}}})
     obj:setPosition(vec3(sp[1] + (k % 12) * 4 - 24, sp[2] + math.floor(k / 12) * 4 - 24, sp[3] + 3))
   end
-  -- one instance of every streamed shape (trees), 40 m under the start for the whole session:
-  -- the shape loads now, not under the first tree while driving
+  -- Render each shape during loading so its materials/shaders are uploaded as well as
+  -- its mesh. Keep the instances underground afterwards to retain the loaded resources.
   local shapes = tileGroup('E2RWorldShapes')
   for k, shape in ipairs(manifest.warmShapes or {}) do
     local obj = createObject('TSStatic')
     obj:setField('shapeName', 0, shape)
     obj:setField('collisionType', 0, 'None')
-    obj:setPosRot(sp[1] + k * 3, sp[2], sp[3] - 40, 0, 0, 0, 1)
+    obj:setPosRot(sp[1] - CAM_HIGH * 0.35 + 20 + (k - 4) * 8,
+                  sp[2] - CAM_HIGH * 0.55 + 35, sp[3] + CAM_HIGH - 65, 0, 0, 0, 1)
     obj:registerObject('e2r_shape_' .. k)
     shapes:addObject(obj)
   end
@@ -1449,12 +1723,15 @@ end
 -- Called after the landing tile is loaded and its collision rebuilt (teleporting in the same frame
 -- as reloadCollision dropped the car through the new roads, world-test-04).
 local function touchDown()
+  local timer = hptimer()
   local veh = getPlayerVehicle(0)
   local s = S.landing.spawn
   if veh then
     spawn.safeTeleport(veh, vec3(s.pos[1], s.pos[2], s.pos[3] + 0.5), quat(0, 0, math.sin(s.yaw / 2), math.cos(s.yaw / 2)))
   end
+  result.teleportMs = timer:stopAndReset()
   commands.setGameCamera()
+  result.cameraSwitchMs = timer:stop()
   S.state, S.phaseAt = 'driving', S.now
   S.driveAcc = newAcc()
   result.landedAt = S.now
@@ -2422,6 +2699,136 @@ local function drawPicker()
   im.End()
 end
 
+-- Live density and draw distance. Defaults match the generator. Apply drops
+-- resident near and far tiles so they rebuild; the horizon stays.
+local TUNE_DEFAULT = {nearM = 1000, farM = 3000, maxTrees = 2400, maxFarTrees = 800,
+  maxGrass = 4000, maxRocks = 80, forestSpacing = 5, groundSpacing = 6, groundTrees = true}
+local tunePtr = {}
+
+local function ensureTune()
+  if S.tune then return end
+  S.tune = {}
+  for k, v in pairs(TUNE_DEFAULT) do S.tune[k] = v end
+end
+
+local function applyTune()
+  ensureTune()
+  if not NATIVE or not native.setTune then return end
+  local applied = native.setTune(S.tune)
+  if type(applied) == 'table' then
+    S.tune = applied
+    for key, ptr in pairs(tunePtr) do
+      if key == 'groundTrees' then ptr[0] = applied.groundTrees and true or false
+      elseif applied[key] then ptr[0] = applied[key] end
+    end
+  end
+  local keep = {}
+  for _, job in ipairs(S.queue or {}) do
+    if job.horizon then keep[#keep + 1] = job else job.tile.dropped = true end
+  end
+  S.queue = keep
+  if S.job and not S.job.horizon then S.co, S.job = nil, nil end
+  for key, tile in pairs(S.tiles) do
+    retireForest(tile)
+    dropGroup('E2RT_' .. key)
+    buryGroup('E2RD_' .. key)
+    tile.dropped = true
+    native.unload(key)
+  end
+  for key, far in pairs(S.far) do
+    retireForest(far)
+    buryGroup('E2RF_' .. key)
+    far.dropped = true
+    native.unload(key, 'far')
+  end
+  S.tiles, S.far = {}, {}
+  S.collisionDirty = true
+  result.tuneApplied = S.now
+  result.forestItems, result.staticTrees, result.grassSpawned, result.rockSpawned = 0, 0, 0, 0
+  S.appliedTune = {}
+  for k, v in pairs(S.tune) do S.appliedTune[k] = v end
+end
+
+local function tuneSlider(key, lo, hi, uk, en)
+  local tune = S.tune
+  if not tunePtr[key] then tunePtr[key] = im.FloatPtr(tune[key]) end
+  im.Text(L(uk, en))
+  if im.SetNextItemWidth then im.SetNextItemWidth(-1) end
+  local ok, changed = pcall(im.SliderFloat, '##' .. key, tunePtr[key], lo, hi, '%.0f')
+  if ok then
+    -- Copy even when the binding does not return true. Rebuild only on release,
+    -- otherwise a drag would drop every tile on every frame.
+    local value = tonumber(tunePtr[key][0])
+    if value then tune[key] = math.floor(value + 0.5) end
+    if im.IsItemDeactivatedAfterEdit and im.IsItemDeactivatedAfterEdit() then S.tuneApplyNow = true end
+  else
+    im.SameLine()
+    if im.Button('-##' .. key) then tune[key] = math.max(lo, tune[key] - math.max(1, (hi - lo) / 20)); S.tuneApplyNow = true end
+    im.SameLine()
+    if im.Button('+##' .. key) then tune[key] = math.min(hi, tune[key] + math.max(1, (hi - lo) / 20)); S.tuneApplyNow = true end
+    im.SameLine()
+    im.Text(string.format('%.0f', tune[key]))
+  end
+end
+
+local function tuneDiffers()
+  local base = S.appliedTune or TUNE_DEFAULT
+  for key, value in pairs(S.tune) do
+    if value ~= base[key] then return true end
+  end
+  return false
+end
+
+local function drawTune()
+  ensureTune()
+  local nearN, farN = 0, 0
+  for _ in pairs(S.tiles) do nearN = nearN + 1 end
+  for _ in pairs(S.far) do farN = farN + 1 end
+  local cam = S.camName and tostring(S.camName) or '?'
+  local dist = S.camDist and string.format('%.0f m', S.camDist) or '?'
+  local applied = S.appliedTune or TUNE_DEFAULT
+  im.Text(string.format(L('Камера: %s, до авто %s', 'Camera: %s, to the car %s'), cam, dist))
+  im.Text(string.format(L('Ліс: %s, крон %d, запасних %d, перезбірка %d мс',
+    'Forest: %s, crowns %d, fallback %d, rebuild %d ms'),
+    tostring(result.forest or '?'), result.forestItems or 0, result.staticTrees or 0,
+    math.floor(result.forestRebuildMs or 0)))
+  im.Text(string.format(L('Поставлено: трава %d, каміння %d. Тайли %d/%d, черга %d',
+    'Spawned: grass %d, rocks %d. Tiles %d/%d, queue %d'),
+    result.grassSpawned or 0, result.rockSpawned or 0, nearN, farN, #(S.queue or {})))
+  im.Text(string.format(L('У світі: ближня %d м, далека %d м, дерева %d/%d, трава %d, каміння %d',
+    'In the world: near %d m, far %d m, trees %d/%d, grass %d, rocks %d'),
+    applied.nearM or 0, applied.farM or 0, applied.maxTrees or 0, applied.maxFarTrees or 0,
+    applied.maxGrass or 0, applied.maxRocks or 0))
+  if im.Button(L('Застосувати і перебудувати', 'Apply and rebuild')) then applyTune() end
+  tuneSlider('nearM', 400, 4000, 'Ближній радіус, м', 'Near radius, m')
+  tuneSlider('farM', 800, 8000, 'Далекий радіус, м', 'Far radius, m')
+  tuneSlider('maxTrees', 0, 2400, 'Дерева на ближній тайл', 'Trees per near tile')
+  tuneSlider('maxFarTrees', 0, 1200, 'Дерева на далекий тайл', 'Trees per far tile')
+  tuneSlider('forestSpacing', 4, 24, 'Крок лісу, м', 'Forest spacing, m')
+  tuneSlider('groundSpacing', 4, 30, 'Крок на відкритому ґрунті, м', 'Open-ground spacing, m')
+  tuneSlider('maxGrass', 0, 4800, 'Трава на ближній тайл', 'Grass per near tile')
+  tuneSlider('maxRocks', 0, 200, 'Каміння на ближній тайл', 'Rocks per near tile')
+  if not tunePtr.groundTrees then tunePtr.groundTrees = im.BoolPtr(S.tune.groundTrees and true or false) end
+  local okBox, flipped = pcall(im.Checkbox, L('Дерева на відкритому ґрунті', 'Trees on open ground'), tunePtr.groundTrees)
+  if okBox then
+    S.tune.groundTrees = tunePtr.groundTrees[0] and true or false
+    if flipped then S.tuneApplyNow = true end
+  end
+  if not okBox and im.Button(L(S.tune.groundTrees and 'Відкритий ґрунт: дерева є' or 'Відкритий ґрунт: без дерев',
+      S.tune.groundTrees and 'Open ground: trees on' or 'Open ground: trees off')) then
+    S.tune.groundTrees = not S.tune.groundTrees
+    S.tuneApplyNow = true
+  end
+  if tuneDiffers() then
+    im.TextColored(im.ImVec4(1, 0.7, 0.2, 1), L('Відпустіть повзунок — світ перебудується.',
+      'Release the slider and the world rebuilds.'))
+  end
+  im.TextColored(theme.muted, L('Трава лише в ближньому радіусі. Горизонт без рослин. Далекі крони рідші, щоб тримати кадр.',
+    'Grass is inside the near radius only. The horizon has no plants. Far crowns are sparser so the frame holds.'))
+  if S.tuneApplyNow and tuneDiffers() then applyTune() end
+  S.tuneApplyNow = nil
+end
+
 local function drawWindow()
   pushTheme()
   if S.widgetHidden then
@@ -2464,6 +2871,7 @@ local function drawWindow()
     if S.packs then drawPacks() end
     drawTraffic()
     if im.CollapsingHeader1(L('Статистика', 'Statistics'), im.TreeNodeFlags_DefaultOpen) then drawStats(st, p, v) end
+    if im.CollapsingHeader1(L('Щільність і дистанція', 'Density and distance'), im.TreeNodeFlags_DefaultOpen) then drawTune() end
     im.End()
     popTheme()
     return
@@ -2512,9 +2920,13 @@ local function refreshCountries()
   -- A removed/disabled pack must stop contributing geometry as well as map coverage.
   if S.stream then
     for key, tile in pairs(S.tiles) do
+      retireForest(tile)
       dropGroup('E2RT_' .. key); dropGroup('E2RD_' .. key); tile.dropped = true
     end
-    for key, far in pairs(S.far) do dropGroup('E2RF_' .. key); far.dropped = true end
+    for key, far in pairs(S.far) do
+      retireForest(far)
+      dropGroup('E2RF_' .. key); far.dropped = true
+    end
     for key, band in pairs(S.horizon or {}) do
       dropGroup(band.groupName or ('E2RH_' .. key:gsub('[^%w_]', '_')))
       band.dropped = true
@@ -2566,6 +2978,7 @@ function M.onExtensionUnloaded() restorePackState() end
 
 function M.onClientEndMission()
   restorePackState()
+  resetForests()
   if NATIVE then native.refresh() end
   S.stream, S.co, S.job, S.landing, S.state = nil, nil, nil, nil, 'off'
   S.tiles, S.far, S.horizon, S.queue, S.nav, S.navPending = {}, {}, {}, {}, {}, {}
@@ -2947,6 +3360,7 @@ function M.onUpdate(dtReal)
     return
   end
   S.now, S.dt = S.now + dtReal, dtReal
+  digForests()
   local frameMs = frameTimer:stopAndReset()
   table.insert(S.frames, frameMs)
   S.recentAt = (S.recentAt or 0) % 240 + 1        -- the widget's FPS: the last 240 frames
@@ -3046,6 +3460,11 @@ function M.tick(dt)
     result.warmupFrames = frameStats(S.frames)
     dropGroup('E2RWorldWarmup')
     dropGroup('E2RWorldPacks')
+    local sp = S.landing.spawn.pos
+    for k in ipairs(S.landing.warmShapes or {}) do
+      local obj = scenetree.findObject('e2r_shape_' .. k)
+      if obj then obj:setPosRot(sp[1] + k * 3, sp[2], sp[3] - 40, 0, 0, 0, 1) end
+    end
     S.state, S.frames, S.phaseAt = 'spawning', {}, S.now
   end
   if S.stream and (S.state == 'spawning' or S.state == 'driving') then

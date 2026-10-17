@@ -3,6 +3,7 @@ surface kind, and a facade per building. No textures are shipped; all paths are 
 /assets (resolved to their .dds). Kinds are the Mesh face groups; material = 'e2rf_' + kind."""
 import math
 import zlib
+import nature
 
 TEXTURES = {
     'asphalt': {
@@ -119,6 +120,7 @@ KINDS = {
     'road_major':  ('asphalt_major', [.16, .17, .18, 1], 'ASPHALT', 6.0, 'plan'),
     'sidewalk':    ('sidewalk',      [.55, .55, .52, 1], 'ASPHALT', 3.0, 'plan'),
     'mark':        (None,            [.92, .91, .86, 1], 'ASPHALT', 1.0, 'plan'),
+    'mark_yellow': (None,            [.93, .74, .12, 1], 'ASPHALT', 1.0, 'plan'),
     'ground':      ('grass',         [.29, .36, .22, 1], 'GRASS',   8.0, 'plan'),
     'paved':       ('concrete',      [.45, .45, .43, 1], 'ASPHALT', 6.0, 'plan'),
     'water':       (None,            [.12, .29, .38, 1], 'MUD',     8.0, 'plan'),
@@ -169,6 +171,46 @@ KINDS['park'] = ('grass', [.30, .40, .22, 1], 'GRASS', _photo.GROUND_M, 'plan')
 # baseColorFactor per kind: the game's grass is dry West Coast grass; Kyiv's is green
 TINT = {'ground': [.55, .85, .42, 1], 'forest': [.36, .58, .28, 1], 'paved': [.62, .62, .60, 1]}
 
+# Stock PBR textures: referenced in the installed game, never copied into the mod.
+for _name, _path in {
+    'rock': 'rock/macro_rocky/t_macro_rocky',
+    'scree': 'rock/terrain_dirt_rocky/t_dirt_rocky',
+    'sand': 'sand/t_sand/t_sand',
+}.items():
+    _base = '/assets/materials/terrain/' + _path
+    TEXTURES[_name] = {'baseColorMap': _base + '_b.color.dds',
+                       'normalMap': _base + '_nm.normal.dds',
+                       'roughnessMap': _base + '_r.data.dds'}
+
+# Macrocolour comes from mapped land use; fine grain uses existing tileable PBR.
+for _kind, _tex, _tint, _ground, _scale in (
+    ('meadow', 'grass', [.72, .83, .48, 1], 'GRASS', 24),
+    ('farmland', 'dirt', [.68, .60, .36, 1], 'DIRT', 12),
+    ('orchard', 'grass', [.59, .72, .38, 1], 'GRASS', 24),
+    ('vineyard', 'dirt', [.70, .65, .46, 1], 'DIRT', 12),
+    ('scrub', 'grass', [.57, .64, .37, 1], 'GRASS', 24),
+    ('heath', 'grass', [.68, .62, .43, 1], 'GRASS', 24),
+    ('bare_rock', 'rock', [.87, .87, .84, 1], 'ROCK', 12),
+    ('scree', 'scree', [.85, .82, .76, 1], 'GRAVEL', 12),
+    ('beach', 'sand', [1, .96, .85, 1], 'SAND', 12),
+    ('wetland', 'dirt', [.40, .44, .32, 1], 'MUD', 12),
+    ('glacier', None, [.88, .92, .95, 1], 'SNOW', 24),
+    ('bare_ground', 'dirt', [.86, .78, .62, 1], 'DIRT', 12),
+):
+    KINDS[_kind] = (_tex, _tint, _ground, _scale, 'plan')
+    TINT[_kind] = _tint
+
+# Country carriageways, worst last. groundType is what the tyres feel.
+for _kind, _tex, _tint, _ground, _scale in (
+    ('road_worn', 'asphalt', [.55, .52, .46, 1], 'ASPHALT', 6),
+    ('road_gravel', 'scree', [.78, .74, .68, 1], 'GRAVEL', 4),
+    ('road_dirt', 'dirt', [.70, .58, .40, 1], 'DIRT', 4),
+    ('road_broken', 'dirt', [.58, .52, .36, 1], 'DIRT', 3),
+    ('road_track', 'grass', [.62, .68, .40, 1], 'DIRT', 4),
+):
+    KINDS[_kind] = (_tex, _tint, _ground, _scale, 'plan')
+    TINT[_kind] = _tint
+
 # OSM areas that change the ground under them (anything else stays grass)
 PAVED = {'industrial', 'commercial', 'retail', 'railway', 'garages', 'construction', 'depot'}
 WOODS = {'forest', 'wood'}
@@ -187,7 +229,7 @@ def ground_kind(tags):
         return 'park'
     if tags.get('landuse') == 'residential':
         return 'residential'          # yards: trees between the blocks, ground stays grass
-    return None
+    return nature.ground_kind(tags)
 
 
 PATHS = {'footway': 2.0, 'path': 1.2, 'pedestrian': 4.0, 'cycleway': 2.0, 'steps': 2.0, 'bridleway': 1.5,
@@ -270,6 +312,9 @@ PHOTO_GROUND = ('ground', 'park', 'forest')
 def real_stage(kind):
     """Stage-0 maps of a kind in the 'real' pack."""
     tex, colour, _, _, _ = KINDS[kind]
+    if kind in nature.NATURAL and tex == 'grass':
+        return {'baseColorMap': f'{ART}/real/ground_ground.color.png',
+                'normalMap': f'{ART}/real/ground_ground.normal.png', 'roughnessFactor': .95}
     if kind.startswith('wall_') and kind[5:] in _photo.PHOTO_WALLS:
         w = kind[5:]
         stage = {'baseColorMap': f'{ART}/real/{w}.color.png'}
@@ -295,6 +340,10 @@ def material(kind):
     stage = real_stage(kind)
     if kind in TINT and kind not in PHOTO_GROUND:
         stage['baseColorFactor'] = TINT[kind]
+    if kind == 'road_worn':
+        stage['roughnessFactor'] = .96
+    elif kind in ('road_gravel', 'road_dirt', 'road_broken', 'road_track'):
+        stage['roughnessFactor'] = .98
     return {'name': 'e2rf_' + kind, 'mapTo': 'e2rf_' + kind, 'class': 'Material', 'version': 1.5,
             'groundType': ground, 'Stages': [stage, {}, {}, {}], 'doubleSided': False, **EXTRA.get(kind, {})}
 

@@ -300,19 +300,43 @@ class GeneratorTests(unittest.TestCase):
                                   'rings': [[[100, 100], [300, 100], [300, 300], [100, 300]]]}]}]
         first = self.build(source, terrainStep=100)[1]
         second = self.build(source, terrainStep=100)[1]
-        trees = [item for item in first['items'].values() if item.kind == 'static']
-        self.assertEqual(len(trees), 900)
-        self.assertTrue(all(not (100 < item.pos[1] < 300 and 100 < item.pos[2] < 300) for item in trees))
+        statics = [item for item in first['items'].values() if item.kind == 'static']
+        trees = [item for item in statics if 'grass' not in item.shape and 'rock' not in item.shape and '_bush_' not in item.shape]
+        self.assertEqual(len(trees), 2400)
+        self.assertTrue(any('grass' in item.shape for item in statics))
+        self.assertTrue(any('_bush_' in item.shape for item in statics))
+        self.assertTrue(all(not (100 < item.pos[1] < 300 and 100 < item.pos[2] < 300) for item in statics))
         self.assertEqual(self.plain(first), self.plain(second))
 
     def test_street_lamps_come_from_road_lighting_without_source_points(self):
         road = {'id': 'street', 'width': 7, 'points': [[0, 250, 10], [500, 250, 10]],
                 'tags': {'highway': 'residential', 'lit': 'yes'}}
         scene = self.build([{'roads': [road]}], terrainStep=100)[1]
-        lamps = [item for item in scene['items'].values() if item.kind == 'static']
+        lamps = [item for item in scene['items'].values() if item.kind == 'static' and item.shape.endswith('lamp1.dae')]
         self.assertEqual(len(lamps), 16)
         self.assertTrue(all(item.shape == '/art/shapes/objects/lamp1.dae' for item in lamps))
         self.assertTrue(all(item.decor and abs(item.pos[3] - 10.2) < 1e-8 for item in lamps))
+
+    def test_country_look_selects_worn_asphalt_brick_and_skips_lamps(self):
+        road = {'id': 'street', 'width': 7, 'points': [[0, 250, 10], [500, 250, 10]],
+                'tags': {'highway': 'residential', 'lit': 'yes', 'sidewalk': 'no'}}
+        building = {'id': 'house', 'height': 12,
+                    'rings': [[[100, 100], [140, 100], [140, 140], [100, 140]]]}
+        look = {'block': 'postsoviet', 'asphalt': 'worn', 'buildings': 'brick', 'statics': 'none',
+                'markings': 'none', 'verge': 'dirt', 'trees': 'regional'}
+        road_manifest, scene = self.build([{'roads': [road], 'buildings': [building]}],
+                                          terrainStep=100, look=look)[:2]
+        materials = {mesh.material for _item, mesh in self.meshes(road_manifest)}
+        self.assertIn('e2rf_road_worn', materials)
+        self.assertNotIn('e2rf_mark', materials)
+        self.assertIn('e2rf_bare_ground', materials)
+        walls = [mesh.material for _item, mesh in self.meshes(scene)
+                 if str(mesh.material).startswith('e2rf_wall_')]
+        self.assertTrue(walls)
+        self.assertTrue(all(material.startswith('e2rf_wall_brk_') for material in walls))
+        lamps = [item for item in scene['items'].values()
+                 if item.kind == 'static' and str(item.shape).endswith('lamp1.dae')]
+        self.assertEqual(len(lamps), 0)
 
     def test_photo_loggia_facades_use_33_metre_uv_repeat(self):
         source = [{'buildings': [{'id': 'a', 'height': 33, 'tags': {'building:material': 'concrete'},
@@ -525,9 +549,18 @@ class GeneratorTests(unittest.TestCase):
                               'rings': [[[0, 0], [500, 0], [500, 500], [0, 500]]]}]}]
         far = self.build(source, far=True)[2]
         trees = [item for item in far['items'].values() if item.kind == 'static']
-        self.assertGreater(len(trees), 0)
-        self.assertLessEqual(len(trees), 40)
+        self.assertGreater(len(trees), 40)
+        self.assertLessEqual(len(trees), 800)
         self.assertTrue(all(item.decor and item.layer == 'far' for item in trees))
+
+    def test_far_tiles_keep_fences_and_horizon_does_not(self):
+        cell = {'lines': [{'id': 'w', 'kind': 'fence', 'tags': {'barrier': 'wall'},
+                           'points': [[50, 250, 0], [450, 250, 0]]}]}
+        far = self.build([cell], far=True)[2]
+        self.assertTrue(list(self.triangles(far, 'e2rf_fence_wall')))
+        self.assertFalse(list(self.triangles(far, 'e2rf_footway')))
+        horizon = self.build([cell], horizon=True)[2]
+        self.assertFalse(list(self.triangles(horizon, 'e2rf_fence_wall')))
 
 
 if __name__ == '__main__':

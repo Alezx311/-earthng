@@ -414,6 +414,7 @@ def fields(pack, base, real):
     if pack in ('rain', 'cyber'):
         put('road', roughnessMap=f'{base}/rain/wet_road.data.png', baseColorFactor='0.55 0.55 0.58 1')
         put('road_major', roughnessMap=f'{base}/rain/wet_road.data.png', baseColorFactor='0.55 0.55 0.58 1')
+        put('road_worn', roughnessMap=f'{base}/rain/wet_road.data.png', baseColorFactor='0.48 0.46 0.42 1')
         put('footway_asphalt', roughnessMap=f'{base}/rain/wet_road.data.png', baseColorFactor='0.55 0.55 0.58 1')
         put('sidewalk', roughnessMap=f'{base}/rain/wet_sidewalk.data.png', baseColorFactor='0.62 0.62 0.64 1')
         put('paved', roughnessMap=f'{base}/rain/wet_sidewalk.data.png')
@@ -436,7 +437,7 @@ def fields(pack, base, real):
             baseColorFactor='1 1 1 1')
         put('footway', baseColorMap=f'{art}/path.color.png', normalMap=f'{art}/path.normal.png', baseColorFactor='1 1 1 1')
         put('trodden', baseColorMap=f'{art}/trodden.color.png', normalMap=f'{art}/trodden.normal.png', baseColorFactor='1 1 1 1')
-        for k in ('road', 'road_major', 'footway_asphalt'):
+        for k in ('road', 'road_major', 'road_worn', 'footway_asphalt'):
             put(k, roughnessMap=f'{art}/slush.data.png', baseColorFactor='0.95 0.96 1 1')
         put('curb', baseColorFactor=_colour((.93, .95, 1)))
         put('parapet', baseColorFactor=_colour((.88, .9, .95)))

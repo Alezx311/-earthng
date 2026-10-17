@@ -15,15 +15,58 @@ local TUNE = {roadLift = ROAD_LIFT, groundDrop = .25, pullFull = 12, pullZero = 
   terrainStep = 25, sidewalk = 2, curb = .25, vergeCut = 1, vergeSink = 0, pressEven = 1, mitre = 2,
   simplifyXY = 0, simplifyZ = .02, fenceStep = 4, wallThick = .2, fenceThick = .08}
 -- Covers that take a whole ground triangle over (lower rank wins where they overlap).
-local CLAIM = {paved = 1, water = 2, forest = 3, park = 4}
+local CLAIM = {paved = 1, water = 2, glacier = 3, bare_rock = 4, scree = 5, beach = 6,
+  wetland = 7, orchard = 8, vineyard = 9, farmland = 10, meadow = 11, heath = 12,
+  scrub = 13, forest = 14, park = 15, bare_ground = 16}
+local COVER_SCALE = {ground = 24, forest = 24, park = 24, meadow = 24, orchard = 24,
+  scrub = 24, heath = 24, glacier = 24, farmland = 12, vineyard = 12, bare_rock = 12,
+  scree = 12, beach = 12, wetland = 12, bare_ground = 12}
 local ABIN = 12.5      -- m: bins of asphalt pieces that sidewalks and verges are cut by
 local SEA_ABOVE = 0.3   -- the sea plane over the DEM's flat sea surface (no z-fighting)
-local TREE = '/assets/meshes/foliage/trees_library/oak/tree_oak_sml_a.dae'
+local ECA_TREE = '/levels/east_coast_usa/art/shapes/trees/'
 local LAMP = '/art/shapes/objects/lamp1.dae'
 local BUS_STOP = '/art/shapes/objects/s_busstop_jri.dae'
-local TREES = {TREE, '/assets/meshes/foliage/trees_library/beech/tree_beech_small_b.dae',
-  '/assets/meshes/foliage/trees_library/birch/tree_aspen_small_b.dae',
-  '/assets/meshes/foliage/trees_library/oak/tree_oak_forest_a.dae'}
+-- East Coast shapes have billboard LODs, so a crown stays up past the mesh pop.
+-- The foliage-library oak is the last slot: it still draws if a level mesh is missing.
+local TREES = {
+  ECA_TREE .. 'trees_oak/tree_oak_sml_a.dae',
+  ECA_TREE .. 'trees_oak/tree_oak_forest_a.dae',
+  ECA_TREE .. 'trees_oak/tree_oak_large_b.dae',
+  ECA_TREE .. 'trees_beech/tree_beech_small_c.dae',
+  ECA_TREE .. 'trees_beech/tree_beech_forest_a.dae',
+  ECA_TREE .. 'trees_aspen/tree_aspen_small_a.dae',
+  ECA_TREE .. 'trees_aspen/tree_aspen_forest_b.dae',
+  '/assets/meshes/foliage/trees_library/oak/tree_oak_sml_a.dae'}
+-- A single OSM tree node (not the forest lattice). The first East Coast oak has a billboard.
+local TREE = TREES[1]
+local CONIFERS = {'/levels/italy/art/shapes/trees/trees_italy/scots_pine.dae',
+  '/levels/italy/art/shapes/trees/trees_italy/scots_pine_filler.dae'}
+local BUSHES = {
+  ECA_TREE .. 'trees_beech/tree_beech_bush_b.dae',
+  ECA_TREE .. 'trees_oak/tree_oak_bush_c.dae',
+  '/assets/meshes/foliage/trees_library/beech/tree_beech_bush_a.dae',
+  '/assets/meshes/foliage/trees_library/birch/tree_aspen_bush_a.dae'}
+-- Stock tufts and stones from the player's install. GroundCover needs a TerrainBlock,
+-- so near scatter uses these meshes. Nothing is copied into the mod.
+local GRASS = {'/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/s_grass_green_short_01.dae',
+  '/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/s_grass_green_short_02.dae',
+  '/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/s_grass_green_short_03.dae',
+  '/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/s_grass_green_long_01.dae',
+  '/levels/east_coast_usa/art/shapes/groundcover/3d_grass_test/s_grass_green_long_02.dae'}
+-- Native blade span and the lowest vertex, both in metres, from the position
+-- arrays. A shared scale of 9 made the long meshes several metres tall.
+local GRASS_MESH = {
+  [GRASS[1]] = {span = 0.265, bottom = -0.038},
+  [GRASS[2]] = {span = 0.258, bottom = -0.033},
+  [GRASS[3]] = {span = 0.255, bottom = -0.019},
+  [GRASS[4]] = {span = 0.514, bottom = -0.023},
+  [GRASS[5]] = {span = 0.530, bottom = -0.046},
+}
+local ROCKS = {'/levels/east_coast_usa/art/shapes/rocks/eca_rock_small.dae',
+  '/levels/east_coast_usa/art/shapes/rocks/eca_rock_small_2.dae',
+  '/levels/east_coast_usa/art/shapes/rocks/eca_rock_small_3.dae',
+  '/levels/east_coast_usa/art/shapes/rocks/eca_rock_small_4.dae',
+  '/levels/east_coast_usa/art/shapes/rocks/eca_rock_medium_1.dae'}
 
 local function hash(value)
   local h = 17
@@ -205,6 +248,39 @@ local function trimLine(points, a, b)
   return out
 end
 
+-- Metres of centre-line rise and fall. Grade 0–1 stays on the surveyed profile so a worn
+-- city street does not grow new vertices. Grade 2–5 samples every 8 m; the first and last
+-- 6 m of each span stay put so a junction mouth still meets the fan.
+local WEAR_AMP = {0, 0, .06, .10, .14, .18}
+local function densifyWear(points, grade)
+  if grade < 2 or #points < 2 then return points end
+  local amp, step = WEAR_AMP[grade + 1] or 0, 8
+  local out = {points[1]}
+  local function push(p)
+    local q = out[#out]
+    if not q or math.abs(q[1] - p[1]) + math.abs(q[2] - p[2]) > 1e-3 then out[#out + 1] = p end
+  end
+  for k = 1, #points - 1 do
+    local a, b = points[k], points[k + 1]
+    local dx, dy = b[1] - a[1], b[2] - a[2]
+    local dz = (b[3] or 0) - (a[3] or 0)
+    local length = math.sqrt(dx * dx + dy * dy)
+    local n = math.max(1, math.ceil(length / step))
+    for s = 1, n - 1 do
+      local t = s / n
+      local along = math.min(t, 1 - t) * length
+      local p = {a[1] + dx * t, a[2] + dy * t, (a[3] or 0) + dz * t}
+      if along > 6 then
+        local wobble = (hash('wear:' .. floor(p[1] + .5) .. ':' .. floor(p[2] + .5)) % 1000 / 1000 - .5) * 2 * amp
+        p[3] = p[3] + wobble
+      end
+      push(p)
+    end
+    push(b)
+  end
+  return out
+end
+
 -- Douglas-Peucker in plan and height: a knot stays when dropping it moves the line more than
 -- xy metres sideways or z metres up or down (the sources carry a profile knot every few metres).
 local function simplify(points, xy, z)
@@ -274,6 +350,47 @@ end
 local function number(value, default)
   return tonumber(tostring(value or ''):match('^%s*([%d%.%-]+)')) or default
 end
+
+-- 0 smooth asphalt, 1 worn asphalt, 2 gravel, 3 dirt, 4 broken, 5 overgrown.
+-- Explicit surface wins over the highway class. tracktype and a bad smoothness
+-- only make a minor road worse. Motorway–secondary ignore smoothness alone.
+local function roadGrade(tags)
+  tags = tags or {}
+  local highway = (tags.highway or ''):gsub('_link$', '')
+  local surface, grade = tags.surface, 0
+  if surface == 'asphalt' or surface == 'concrete' or surface == 'paved' or surface == 'chipseal' then
+    grade = 0
+  elseif surface == 'cobblestone' or surface == 'sett' or surface == 'paving_stones' or surface == 'unhewn_cobblestone' then
+    grade = 1
+  elseif surface == 'gravel' or surface == 'fine_gravel' or surface == 'pebblestone' or surface == 'compacted' then
+    grade = 2
+  elseif surface == 'dirt' or surface == 'ground' or surface == 'earth' or surface == 'unpaved'
+      or surface == 'mud' or surface == 'soil' or surface == 'sand' then
+    grade = 3
+  elseif surface == 'grass' or surface == 'grass_paver' then
+    grade = 5
+  elseif highway == 'track' then
+    grade = 3
+  end
+  local track = tags.tracktype
+  if track == 'grade1' then grade = math.max(grade, 1)
+  elseif track == 'grade2' then grade = math.max(grade, 2)
+  elseif track == 'grade3' then grade = math.max(grade, 3)
+  elseif track == 'grade4' then grade = math.max(grade, 4)
+  elseif track == 'grade5' then grade = 5 end
+  local smooth = tags.smoothness
+  local major = highway == 'motorway' or highway == 'trunk' or highway == 'primary' or highway == 'secondary'
+  if not major and grade == 0 and (smooth == 'bad' or smooth == 'very_bad' or smooth == 'horrible'
+      or smooth == 'very_horrible' or smooth == 'impassable') then
+    grade = 1
+  end
+  if highway == 'track' and (smooth == 'horrible' or smooth == 'very_horrible') then grade = math.max(grade, 4) end
+  if highway == 'track' and smooth == 'impassable' then grade = 5 end
+  return grade
+end
+
+local ROAD_GRADE_MAT = {'road_worn', 'road_gravel', 'road_dirt', 'road_broken', 'road_track'}
+local TRACK_WIDTH = {4.0, 3.8, 3.5, 3.2, 2.8, 2.5}
 
 local function collector(rect, key, layer, pause)
   local origin = {(rect[1] + rect[3]) * 0.5, (rect[2] + rect[4]) * 0.5, 0}
@@ -345,9 +462,14 @@ local function collector(rect, key, layer, pause)
     end
     return index
   end
-  local function corner(mesh, p, n, scale)
+  local function corner(mesh, p, n, scale, axis)
     local v = vertexIndex(mesh, p)
-    local u = uvIndex(mesh, p[4] or p[1] / scale, p[5] or p[2] / scale)
+    local pu, pv = p[1], p[2]
+    -- Dominant-axis box projection for rock; world-locked and independent of
+    -- tile origin. It uses ordinary mesh UVs, no undocumented shader API.
+    if axis == 'x' then pu, pv = p[2], p[3] or 0
+    elseif axis == 'y' then pu, pv = p[1], p[3] or 0 end
+    local u = uvIndex(mesh, p[4] or pu / scale, p[5] or pv / scale)
     local key = (v * 8192 + n) * 8192 + u
     local face = mesh.fmap[key]
     if not face then face = {v = v, n = n, u = u}; mesh.fmap[key] = face end
@@ -375,7 +497,7 @@ local function collector(rect, key, layer, pause)
     end
     local scale = scales[kind]
     if not scale then
-      scale = kind == 'ground' and 24 or 6
+      scale = COVER_SCALE[kind] or 6
       if kind == 'sidewalk' or kind:find('wall_', 1, true) == 1 then scale = 3 end
       scales[kind] = scale
     end
@@ -389,9 +511,14 @@ local function collector(rect, key, layer, pause)
       return n
     end
     -- BeamNG ProceduralMesh expects clockwise face indices and zero-based indices.
-    corner(mesh, a, cornerNormal(a), scale)
-    corner(mesh, c, cornerNormal(c), scale)
-    corner(mesh, b, cornerNormal(b), scale)
+    local axis
+    if kind == 'bare_rock' or kind == 'scree' then
+      local ax, ay, az = math.abs(nx), math.abs(ny), math.abs(nz)
+      if ax > az and ax >= ay then axis = 'x' elseif ay > az then axis = 'y' end
+    end
+    corner(mesh, a, cornerNormal(a), scale, axis)
+    corner(mesh, c, cornerNormal(c), scale, axis)
+    corner(mesh, b, cornerNormal(b), scale, axis)
     triangles, operations = triangles + 1, operations + 1
     if operations % 64 == 0 then pause() end
   end
@@ -463,6 +590,7 @@ end
 -- tagged otherwise; one carriageway of a divided road only on its right.
 local WALKS = {primary = true, secondary = true, tertiary = true, residential = true, living_street = true, unclassified = true}
 local function walkSides(tags)
+  if roadGrade(tags) >= 2 then return {} end
   if not WALKS[tags.highway] then return {} end
   local v = tags.sidewalk
   if v == nil and (tags.oneway == 'yes' or tags.oneway == '1') then return {[-1] = true} end
@@ -472,12 +600,13 @@ local function walkSides(tags)
   return {[1] = true, [-1] = true}
 end
 
-local function wallMaterial(building)
+local function wallMaterial(building, look)
   local tags = building.tags or {}
   local h = hash(tostring(building.id or ''))
   local height = building.height or number(tags.height, number(tags['building:levels'], 3) * 3)
   local material = tags['building:material'] or tags['facade:material']
   local b = tags.building
+  look = type(look) == 'table' and look or NONE
   if b == 'industrial' or b == 'warehouse' or b == 'garages' or b == 'garage' or b == 'shed' or b == 'factory' then return 'wall_block' end
   if material == 'glass' or b == 'office' or b == 'commercial' or b == 'retail' or b == 'hotel' or tags.office then
     local family = height > 20 and {'off_blue', 'off_green', 'off_grey', 'off_ribbon'} or {'off_ribbon', 'off_ribbon_dark'}
@@ -491,6 +620,9 @@ local function wallMaterial(building)
   if material == 'brick' then family = brick
   elseif material == 'panel' or material == 'concrete' or material == 'reinforced_concrete' then family = height >= 26 and h % 3 ~= 0 and loggia or panel
   elseif material == 'plaster' or material == 'stucco' then family = plaster
+  elseif look.buildings == 'panel' then family = height >= 26 and (h % 3 ~= 0 and loggia or panel) or panel
+  elseif look.buildings == 'brick' then family = brick
+  elseif look.buildings == 'plaster' then family = plaster
   elseif height >= 26 then family = h % 9 < 4 and loggia or panel
   elseif height >= 14 then family = h % 20 < 8 and panel or h % 20 < 15 and brick or plaster
   else family = h % 5 < 3 and plaster or brick end
@@ -604,6 +736,21 @@ local function collect(cells, pause)
     end
     pause()
   end
+  -- highway=track is stored as a path line. Draw it as a drivable ribbon. A bridge or
+  -- tunnel stays a thin path: its deck is not the ground profile.
+  local lines = {}
+  for _, line in ipairs(lists.lines) do
+    local tags = line.tags or {}
+    local highway = (tags.highway or ''):gsub('_link$', '')
+    if line.kind == 'path' and highway == 'track' and tags.bridge ~= 'yes' and tags.tunnel ~= 'yes' and tags.area ~= 'yes' then
+      local grade = roadGrade(tags)
+      lists.roads[#lists.roads + 1] = {id = 'track:' .. tostring(line.id), points = line.points,
+        width = number(tags.width, TRACK_WIDTH[grade + 1] or 3.2), tags = tags}
+    else
+      lines[#lines + 1] = line
+    end
+  end
+  lists.lines = lines
   for _, list in pairs(lists) do
     local ids = {}
     for _, feature in ipairs(list) do ids[feature] = tostring(feature.id or '') end
@@ -637,6 +784,27 @@ local function build(cells, i, j, options)
   local roadDecor, sceneDecor = collector(rect, key .. '_marks', 'road', pause), collector(rect, key .. '_cars', 'scene', pause)
   -- mark(name): the stage that just ended (the road quality bench times them)
   local mark = options.mark or function() end
+  local look = type(options.look) == 'table' and options.look or NONE
+  local function lookOf(slot)
+    local value = look[slot]
+    return type(value) == 'string' and value or nil
+  end
+  local asphalt = lookOf('asphalt')
+  local minorRoad, majorRoad = 'road', 'road_major'
+  if asphalt == 'worn' then minorRoad, majorRoad = 'road_worn', 'road'
+  elseif asphalt == 'fresh' then minorRoad, majorRoad = 'road_major', 'road_major' end
+  local vergeKind = 'ground'
+  local vergeChoice = lookOf('verge')
+  if vergeChoice == 'dirt' then vergeKind = 'bare_ground'
+  elseif vergeChoice == 'dry' then vergeKind = 'heath'
+  elseif vergeChoice == 'gravel' then vergeKind = 'scree' end
+  local markChoice = lookOf('markings')
+  local markKind = 'mark'
+  if markChoice == 'yellow' then markKind = 'mark_yellow'
+  elseif markChoice == 'none' then markKind = nil end
+  local staticChoice = lookOf('statics')
+  local wantLamps = staticChoice ~= 'sparse' and staticChoice ~= 'none'
+  local wantStops = staticChoice ~= 'none'
   local tune = {}
   for name, value in pairs(TUNE) do tune[name] = value end
   if options.terrainStep then tune.terrainStep = options.terrainStep end
@@ -816,7 +984,11 @@ local function build(cells, i, j, options)
     if demAt(x, y) == nil then return nil end
     return ground(x, y)
   end
+  local normalCache -- enabled only after road pressing has finished
   local function groundNormal(x, y)
+    local key = normalCache and (string.format('%.6f:%.6f', x, y))
+    local cached = key and normalCache[key]
+    if cached then return cached[1], cached[2], cached[3] end
     local function slope(dx, dy)
       local zp, zm, z0 = heightAt(x + dx, y + dy), heightAt(x - dx, y - dy), heightAt(x, y)
       if zp and zm then return (zp - zm) / (2 * step) end
@@ -826,7 +998,51 @@ local function build(cells, i, j, options)
     end
     local nx, ny, nz = -slope(step, 0), -slope(0, step), 1
     local len = math.sqrt(nx * nx + ny * ny + nz * nz)
-    return nx / len, ny / len, nz / len
+    nx, ny, nz = nx / len, ny / len, nz / len
+    if key then normalCache[key] = {nx, ny, nz} end
+    return nx, ny, nz
+  end
+  -- Spatially indexed mapped cover, shared by terrain and vegetation at all LODs.
+  -- Explicit OSM wins over WorldCover. Tie-breaking never depends on load order.
+  local coverBins = {}
+  for _, area in ipairs(lists.areas) do
+    if CLAIM[area.kind] or area.kind == 'residential' then
+      local b = ringBounds(area.rings)
+      local rank = (CLAIM[area.kind] or 50) + (((area.tags or NONE).source or ''):find('worldcover', 1, true) and 100 or 0)
+      for gx = floor(math.max(rect[1], b[1]) / 100), floor(math.min(rect[3], b[3]) / 100) do
+        for gy = floor(math.max(rect[2], b[2]) / 100), floor(math.min(rect[4], b[4]) / 100) do
+          local k = gx .. ':' .. gy
+          local bin = coverBins[k] or {}; coverBins[k] = bin
+          bin[#bin + 1] = {area = area, rank = rank}
+        end
+      end
+      pause()
+    end
+  end
+  local function coverAt(x, y)
+    local best, rank
+    for _, entry in ipairs(coverBins[floor(x / 100) .. ':' .. floor(y / 100)] or NONE) do
+      if (not rank or entry.rank < rank or (entry.rank == rank and tostring(entry.area.id) < tostring(best.id)))
+          and inside(entry.area.rings, x, y) then best, rank = entry.area, entry.rank end
+    end
+    return best and best.kind or 'ground', best
+  end
+  local function surfaceKind(x, y, kind)
+    kind = kind or coverAt(x, y)
+    if kind == 'residential' then return 'ground' end
+    if kind == 'forest' or kind == 'meadow' or kind == 'scrub' or kind == 'heath' or kind == 'bare_ground' then
+      local _, _, nz = groundNormal(x, y)
+      if nz < .64 then return 'bare_rock' end
+      if kind == 'bare_ground' and nz < .85 then return 'scree' end
+    end
+    return kind
+  end
+  local function backgroundKind(x, y)
+    local kind, area = coverAt(x, y)
+    -- Satellite classes are already a coarse raster. Sample the base lattice
+    -- instead of triangulating every staircase/OSM cut-out a second time.
+    if area and ((area.tags or NONE).source or ''):find('worldcover', 1, true) then return kind end
+    return 'ground'
   end
   mark('lattice')
   -- Roads as continuous strips: a knot's normal is the mean of its two segments' directions, so
@@ -926,13 +1142,17 @@ local function build(cells, i, j, options)
     local points = {}
     for _, p in ipairs(raw) do
       local q = points[#points]
-      if not q or math.abs(q[1] - p[1]) + math.abs(q[2] - p[2]) > 1e-4 then points[#points + 1] = p end
+      if not q or math.abs(q[1] - p[1]) + math.abs(q[2] - p[2]) > 1e-4 then
+        points[#points + 1] = {p[1], p[2], p[3] or 0}
+      end
     end
     -- the road stops at its junction mouths; the junction's own surface is between
     local cuts, full = cutsOf[road], points
     if cuts and #points >= 2 and (cuts[1] > 0 or cuts[2] > 0) then points = trimLine(points, cuts[1], cuts[2]) end
     if tune.simplifyXY > 0 then points = simplify(points, tune.simplifyXY, tune.simplifyZ) end
     if #points >= 2 and boundsTouch(rect, ringBounds({points}), width / 2 + stripReach) then
+      local grade = roadGrade(tags)
+      points = densifyWear(points, grade)
       local normals, hw = {}, width / 2
       for k = 1, #points do
         local tx, ty = 0, 0
@@ -953,8 +1173,9 @@ local function build(cells, i, j, options)
       end
       local surfaceRoad = tags.bridge ~= 'yes' and tags.tunnel ~= 'yes' and tags.layer ~= '-1'
       local major = tags.highway == 'motorway' or tags.highway == 'trunk' or tags.highway == 'primary'
+      local material = grade == 0 and (major and majorRoad or minorRoad) or ROAD_GRADE_MAT[grade]
       local strip = {road = road, points = points, normals = normals, hw = hw, tags = tags,
-        surface = surfaceRoad, material = major and 'road_major' or 'road', sides = walkSides(tags)}
+        surface = surfaceRoad, material = material, grade = grade, sides = walkSides(tags)}
       strips[#strips + 1] = strip
       trimmed[road] = points
       -- A cut mouth's corridor back to its node, a centimetre under the junction fan: drawn only
@@ -977,7 +1198,11 @@ local function build(cells, i, j, options)
       end
       local function edge(k, offset, dz)
         local p, n = points[k], normals[k]
-        return {p[1] + n[1] * offset, p[2] + n[2] * offset, (p[3] or 0) + lift + (dz or 0)}
+        local widen = 1
+        if grade >= 4 and k > 1 and k < #points then
+          widen = 1 + (hash('edge:' .. floor(p[1] + .5) .. ':' .. floor(p[2] + .5)) % 1000 / 1000 - .5) * .34
+        end
+        return {p[1] + n[1] * offset * widen, p[2] + n[2] * offset * widen, (p[3] or 0) + lift + (dz or 0)}
       end
       strip.edge = edge
       for k = 1, #points - 1 do
@@ -1338,6 +1563,7 @@ local function build(cells, i, j, options)
       press((p[1] + q[1] + c[1]) / 3, (p[2] + q[2] + c[2]) / 3, (p[3] + q[3] + c[3]) / 3 - tune.margin)
     end
   end
+  normalCache = {} -- no more press() calls; covers repeatedly shade shared lattice corners
   -- Ground cover lies on the ground as drawn: cut by lattice cell and diagonal, so each piece is
   -- in one ground triangle and exactly parallel to it. The pressed ground keeps it under the
   -- asphalt, so carriageways need not be cut out (that shattered big squares into 24k pieces).
@@ -1422,8 +1648,13 @@ local function build(cells, i, j, options)
       else
         for _, half in ipairs(pieces[key]) do
           local out = {}
-          for n, q in ipairs(half) do out[n] = {q[1], q[2], ground(q[1], q[2]) + above} end
-          scene.polygon(kind, out, true)
+          local cx, cy = 0, 0
+          for n, q in ipairs(half) do
+            out[n] = {q[1], q[2], ground(q[1], q[2]) + above}
+            if kind ~= 'water' then out[n][6], out[n][7], out[n][8] = groundNormal(q[1], q[2]) end
+            cx, cy = cx + q[1], cy + q[2]
+          end
+          scene.polygon(surfaceKind(cx / #half, cy / #half, kind), out, true)
         end
       end
     end
@@ -1435,7 +1666,7 @@ local function build(cells, i, j, options)
         local outerA = {quad[3][1], quad[3][2], ground(quad[3][1], quad[3][2])}
         local outerB = {quad[4][1], quad[4][2], ground(quad[4][1], quad[4][2])}
         outerA[9], outerB[9] = 1, 1
-        emit(distant and scene or roads, 'ground', {quad[1], quad[2], outerA, outerB}, nil, true)
+        emit(distant and scene or roads, vergeKind, {quad[1], quad[2], outerA, outerB}, nil, true)
       end
     end
   end
@@ -1446,14 +1677,14 @@ local function build(cells, i, j, options)
       -- [9] marks the outer edge. The clip resamples it from ground() so both tiles agree.
       verge[2][9], verge[3][9] = 1, 1
       local groundMesh = distant and scene or roads
-      if tune.vergeCut > 0 then emit(groundMesh, 'ground', verge, item[2], true)
-      elseif visualRoads then roads.polygon('ground', verge, true)
-      elseif distant then scene.polygon('ground', verge, true) end
+      if tune.vergeCut > 0 then emit(groundMesh, vergeKind, verge, item[2], true)
+      elseif visualRoads then roads.polygon(vergeKind, verge, true)
+      elseif distant then scene.polygon(vergeKind, verge, true) end
     end
   end
 
   mark('verges')
-  if visualRoads then
+  if visualRoads and markKind then
     for _, road in ipairs(lists.roads) do
       local points, tags, width = road.points or {}, road.tags or {}, road.width or 7
       local one = tostring(tags.oneway or '')
@@ -1480,7 +1711,7 @@ local function build(cells, i, j, options)
               if finish - start <= EPS then return end
               local p, q = lerp(a, b, (start - distance) / length), lerp(a, b, (finish - distance) / length)
               local left, right = mark.offset - mark.width / 2, mark.offset + mark.width / 2
-              roadDecor.polygon('mark', {{p[1] + nx * left, p[2] + ny * left, (p[3] or 0) + lift + .008},
+              roadDecor.polygon(markKind, {{p[1] + nx * left, p[2] + ny * left, (p[3] or 0) + lift + .008},
                 {p[1] + nx * right, p[2] + ny * right, (p[3] or 0) + lift + .008},
                 {q[1] + nx * right, q[2] + ny * right, (q[3] or 0) + lift + .008},
                 {q[1] + nx * left, q[2] + ny * left, (q[3] or 0) + lift + .008}}, 'flat')
@@ -1526,7 +1757,7 @@ local function build(cells, i, j, options)
   mark('groundsea')
   for _, area in ipairs(distant and NONE or lists.areas) do
     local kind = area.kind
-    if (kind == 'water' or kind == 'paved' or kind == 'forest' or kind == 'park') and ringsTouch(area.rings, rect) then
+    if CLAIM[kind] and not (((area.tags or NONE).source or ''):find('worldcover', 1, true)) and ringsTouch(area.rings, rect) then
       drapeRings(kind, area.rings, .025)
     end
     pause()
@@ -1549,8 +1780,10 @@ local function build(cells, i, j, options)
       local a, b = vertex(x0, y0, ground(x0, y0)), vertex(x1, y0, ground(x1, y0))
       local c, d = vertex(x1, y1, ground(x1, y1)), vertex(x0, y1, ground(x0, y1))
       local gkey = ((cx + 32768) * 65536 + cy + 32768) * 2
-      roads.polygon(claims[gkey] or 'ground', {a, b, c}, true)
-      roads.polygon(claims[gkey + 1] or 'ground', {a, c, d}, true)
+      local tx, ty = (x0+x1+x1)/3, (y0+y0+y1)/3
+      roads.polygon(surfaceKind(tx, ty, claims[gkey] or backgroundKind(tx, ty)), {a, b, c}, true)
+      tx, ty = (x0+x1+x0)/3, (y0+y1+y1)/3
+      roads.polygon(surfaceKind(tx, ty, claims[gkey + 1] or backgroundKind(tx, ty)), {a, c, d}, true)
     end
     pause()
   end
@@ -1565,7 +1798,7 @@ local function build(cells, i, j, options)
     local x0, y0, x1, y1 = rect[1], rect[2], rect[3], rect[4]
     local function emitTri(a, b, c)
       if not a or not b or not c then return end
-      scene.triangle('ground', a, b, c, true)
+      scene.triangle(surfaceKind((a[1]+b[1]+c[1])/3, (a[2]+b[2]+c[2])/3), a, b, c, true)
     end
     local function at(x, y)
       local z = heightAt(x, y)
@@ -1723,7 +1956,7 @@ local function build(cells, i, j, options)
       if sourceCount > 0 then low = sourceLow end
       local height = math.max(2.5, math.min(250, building.height or number(tags.height, number(tags['building:levels'], 3) * 3)))
       local bottom = (building.minHeight or number(tags.min_height, 0)) > 0 and base + (building.minHeight or number(tags.min_height, 0)) or low - .3
-      local top, kind = base + height, wallMaterial(building)
+      local top, kind = base + height, wallMaterial(building, look)
       for _, raw in ipairs(rings) do
         local ring, along = cleanRing(raw), 0
         local signed = 0
@@ -1819,23 +2052,28 @@ local function build(cells, i, j, options)
     end
     pause()
   end
-  for _, line in ipairs(distant and NONE or lists.lines) do
+  -- Far tiles keep fences: the near scene used to be the only copy, so a wall
+  -- on a far tile vanished as the camera reached it. Paths stay near-only.
+  -- Horizon draws neither.
+  for _, line in ipairs(options.horizon and NONE or lists.lines) do
     local points, tags = line.points or {}, line.tags or {}
     if line.kind == 'fence' then fence(line) end
-    for index = 1, #points - 1 do
-      local a, b = points[index], points[index + 1]
-      local dx, dy = b[1] - a[1], b[2] - a[2]
-      local length = math.sqrt(dx * dx + dy * dy)
-      if length > EPS then
-        if line.kind == 'path' then
-          local width = number(tags.width, 2) / 2
-          local nx, ny = -dy / length * width, dx / length * width
-          local material = tags.surface == 'asphalt' and 'footway_asphalt' or tags.highway == 'path' and 'trodden' or 'footway'
-          local poly = {{a[1] + nx, a[2] + ny}, {a[1] - nx, a[2] - ny}, {b[1] - nx, b[2] - ny}, {b[1] + nx, b[2] + ny}}
-          drape(material, poly, .04)
+    if not distant then
+      for index = 1, #points - 1 do
+        local a, b = points[index], points[index + 1]
+        local dx, dy = b[1] - a[1], b[2] - a[2]
+        local length = math.sqrt(dx * dx + dy * dy)
+        if length > EPS then
+          if line.kind == 'path' then
+            local width = number(tags.width, 2) / 2
+            local nx, ny = -dy / length * width, dx / length * width
+            local material = tags.surface == 'asphalt' and 'footway_asphalt' or tags.highway == 'path' and 'trodden' or 'footway'
+            local poly = {{a[1] + nx, a[2] + ny}, {a[1] - nx, a[2] - ny}, {b[1] - nx, b[2] - ny}, {b[1] + nx, b[2] + ny}}
+            drape(material, poly, .04)
+          end
         end
+        if index % 32 == 0 then pause() end
       end
-      if index % 32 == 0 then pause() end
     end
     pause()
   end
@@ -1891,29 +2129,6 @@ local function build(cells, i, j, options)
       end
       if cars >= maxCars then break end
     end
-  elseif decor then
-    -- A sparse, stable canopy keeps distant woodland readable without regenerating
-    -- the dense near-tile lattice or adding detailed ground geometry.
-    local planted = 0
-    for _, area in ipairs(lists.areas) do
-      if (area.kind == 'forest' or area.kind == 'park') and ringsTouch(area.rings, rect) then
-        local box = ringBounds(area.rings)
-        for gy = math.floor(math.max(rect[2], box[2]) / 80), math.ceil(math.min(rect[4], box[4]) / 80) do
-          for gx = math.floor(math.max(rect[1], box[1]) / 80), math.ceil(math.min(rect[3], box[3]) / 80) do
-            local h = hash('far:' .. gx .. ':' .. gy)
-            local x, y = (gx + .3 + h % 400 / 1000) * 80, (gy + .3 + math.floor(h / 1000) % 400 / 1000) * 80
-            if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] and inside(area.rings, x, y) then
-              static('far_tree_' .. planted, TREES[h % #TREES + 1], x, y, rawHeight(x, y), h % 6283 / 1000, 1.2)
-              planted = planted + 1
-              if planted >= 40 then break end
-            end
-          end
-          pause()
-          if planted >= 40 then break end
-        end
-      end
-      if planted >= 40 then break end
-    end
   end
   mark('decor')
   roads.finish()
@@ -1964,15 +2179,15 @@ local function build(cells, i, j, options)
   end
   for _, point in ipairs(distant and NONE or lists.points) do
     local p = point.pos
-    if p and point.kind == 'stop' then
+    if p and point.kind == 'stop' and wantStops then
       shelter(point, p)
     elseif p and p[1] >= rect[1] and p[1] < rect[3] and p[2] >= rect[2] and p[2] < rect[4] then
-      local shape = point.kind == 'tree' and TREE or point.kind == 'lamp' and LAMP
+      local shape = point.kind == 'tree' and TREE or (point.kind == 'lamp' and wantLamps) and LAMP
       if shape then static('point_' .. tostring(point.id):gsub('[^%w_]', '_'), shape, p[1], p[2], ground(p[1], p[2]), 0) end
     end
     pause()
   end
-  if not distant then
+  if decor then
     local blockers = {}
     for _, building in ipairs(lists.buildings) do
       if ringsTouch(building.rings, rect) then blockers[#blockers + 1] = {rings = building.rings, bounds = ringBounds(building.rings)} end
@@ -1983,12 +2198,13 @@ local function build(cells, i, j, options)
       end
     end
     local blockedOps = 0
-    local function blocked(x, y)
+    local function blocked(x, y, pad)
+      pad = pad or 3.5
       local nearby = segmentBins[(floor(x / 50) + 32768) * 65536 + floor(y / 50) + 32768] or NONE
       for _, segment in ipairs(nearby) do
         local a = segment.a
         local t = math.max(0, math.min(1, ((x - a[1]) * segment.dx + (y - a[2]) * segment.dy) / segment.len2))
-        if (x - a[1] - t * segment.dx) ^ 2 + (y - a[2] - t * segment.dy) ^ 2 < (segment.width / 2 + 3.5) ^ 2 then return true end
+        if (x - a[1] - t * segment.dx) ^ 2 + (y - a[2] - t * segment.dy) ^ 2 < (segment.width / 2 + pad) ^ 2 then return true end
         blockedOps = blockedOps + 1
         if blockedOps % 512 == 0 then pause() end
       end
@@ -2000,40 +2216,288 @@ local function build(cells, i, j, options)
       end
       return false
     end
+    -- The same world lattice, eligibility and ordering are used for near/far.
+    -- Far takes the first N accepted plants, never a new seed or position.
     local candidates, positions = {}, {}
+    local function optNum(name, default, lo, hi)
+      local value = tonumber(options[name])
+      if not value then value = default end
+      return math.max(lo, math.min(hi, value))
+    end
+    local forestSpacing = optNum('forestSpacing', 5, 4, 24)
+    local groundSpacing = optNum('groundSpacing', 6, 4, 30)
+    -- Town yards stay a loose lattice. A 8 m step turned every courtyard into forest
+    -- and the extra crowns were what dropped the frame from 60 to the twenties.
+    local spacingOf = {forest = forestSpacing, park = 12, residential = 14, orchard = 12, scrub = 12, heath = 16}
     for _, area in ipairs(lists.areas) do
-      local spacing = area.kind == 'forest' and 9 or area.kind == 'park' and 14 or area.kind == 'residential' and 22
+      local spacing = spacingOf[area.kind]
       if spacing and ringsTouch(area.rings, rect) then
         local box = ringBounds(area.rings)
-        for gy = math.floor(math.max(rect[2], box[2]) / spacing) - 1, math.ceil(math.min(rect[4], box[4]) / spacing) do
-          for gx = math.floor(math.max(rect[1], box[1]) / spacing) - 1, math.ceil(math.min(rect[3], box[3]) / spacing) do
+        for gy = floor(math.max(rect[2], box[2]) / spacing) - 1, math.ceil(math.min(rect[4], box[4]) / spacing) do
+          for gx = floor(math.max(rect[1], box[1]) / spacing) - 1, math.ceil(math.min(rect[3], box[3]) / spacing) do
             local h = hash(tostring(gx) .. ':' .. tostring(gy) .. ':' .. spacing)
             local x = (gx + .5 + (h % 1000 / 1000 - .5) * .6) * spacing
-            local y = (gy + .5 + (math.floor(h / 1000) % 1000 / 1000 - .5) * .6) * spacing
+            local y = (gy + .5 + (floor(h / 1000) % 1000 / 1000 - .5) * .6) * spacing
             local position = string.format('%.3f:%.3f', x, y)
-            if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4]
-              and not positions[position] and inside(area.rings, x, y) then
-              positions[position] = true
-              candidates[#candidates + 1] = {x = x, y = y, hash = h, key = position}
+            if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] and not positions[position] then
+              local kind, owner = coverAt(x, y)
+              if owner and spacingOf[kind] == spacing then
+                positions[position] = true
+                -- Coherent patches make clearings, instead of uniformly filling polygons.
+                local cluster = hash('grove:' .. floor(x / 65) .. ':' .. floor(y / 65)) % 1000 / 1000
+                -- A low floor left whole 65 m groves almost empty, which read as a broken forest.
+                -- Parks and yards keep a lower chance so the town reads as lawns with trees, not canopy.
+                local townChance = {park = .7, residential = .4, orchard = .55}
+                local chance = kind == 'forest' and (.8 + .2 * cluster) or (townChance[kind] or 1)
+                if hash('density:' .. position) % 1000 / 1000 < chance then
+                  candidates[#candidates + 1] = {x=x, y=y, hash=h, key=position, kind=kind, tags=owner.tags or NONE}
+                end
+              end
             end
           end
           pause()
         end
       end
     end
-    -- Ranking by position spreads the 900-instance budget across a whole forest tile.
-    table.sort(candidates, function(a, b) return a.hash == b.hash and a.key < b.key or a.hash < b.hash end)
-    local planted, maxTrees = 0, math.max(0, math.min(900, options.maxTrees or 900))
-    for _, candidate in ipairs(candidates) do
-      if planted >= maxTrees then break end
-      if not blocked(candidate.x, candidate.y) then
-        local h = candidate.hash
-        static('tree_' .. planted, TREES[h % #TREES + 1], candidate.x, candidate.y, ground(candidate.x, candidate.y),
-          h % 6283 / 1000, .8 + math.floor(h / 1000) % 400 / 1000)
-        planted = planted + 1
+    -- Untagged hills in the country pack are kind 'ground'. Without this lattice
+    -- they stay a green sheet with a tree only where OSM drew a forest polygon.
+    local wantGround = options.groundTrees ~= false and options.groundTrees ~= 0
+    if wantGround then
+      for gy = floor(rect[2] / groundSpacing) - 1, math.ceil(rect[4] / groundSpacing) do
+        for gx = floor(rect[1] / groundSpacing) - 1, math.ceil(rect[3] / groundSpacing) do
+          local h = hash('open:' .. tostring(gx) .. ':' .. tostring(gy) .. ':' .. groundSpacing)
+          local x = (gx + .5 + (h % 1000 / 1000 - .5) * .6) * groundSpacing
+          local y = (gy + .5 + (floor(h / 1000) % 1000 / 1000 - .5) * .6) * groundSpacing
+          local position = string.format('%.3f:%.3f', x, y)
+          if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] and not positions[position]
+              and coverAt(x, y) == 'ground' then
+            positions[position] = true
+            local cluster = hash('grove:' .. floor(x / 65) .. ':' .. floor(y / 65)) % 1000 / 1000
+            if hash('density:' .. position) % 1000 / 1000 < (.94 + .06 * cluster) then
+              candidates[#candidates + 1] = {x = x, y = y, hash = h, key = position, kind = 'ground', tags = NONE}
+            end
+          end
+        end
+        pause()
       end
-      pause()
     end
+    table.sort(candidates, function(a, b) return a.hash == b.hash and a.key < b.key or a.hash < b.hash end)
+    local config = type(options.nature) == 'table' and options.nature or NONE
+    local treeChoice = lookOf('trees')
+    if treeChoice == 'regional' then treeChoice = nil end
+    local openPine = treeChoice == 'conifer' and .82 or treeChoice == 'broadleaf' and .12 or .4
+    local latitude = math.abs(tonumber(options.latitude) or 48)
+    -- A configurable regional heuristic, not a measured tree-line dataset.
+    -- Explicit OSM leaf_type overrides the biome mix, never slope/water exclusions.
+    local treeline = tonumber(config.treeLine) or (latitude > 65 and 800 or latitude > 55 and 1500 or latitude > 35 and 2200 or 3600)
+    local coniferStart = tonumber(config.coniferStart) or (latitude > 55 and 0 or 1000)
+    -- 0 is a real cap. `or` would also keep it (0 is truthy in Lua); optNum clamps it.
+    local maxTrees = optNum('maxTrees', 2400, 0, 2400)
+    if distant then maxTrees = math.min(maxTrees, optNum('maxFarTrees', 800, 0, 1200)) end
+    -- A global hash prefix spends the whole cap on whichever grove hashed lowest,
+    -- so the next street or hillside stays a green sheet. Round-robin gives every
+    -- 25 m cell a turn. Far stops earlier on that same sequence, so it stays a prefix.
+    local function spread(list, limit, cell, accept)
+      if limit <= 0 then return end
+      local buckets, ids = {}, {}
+      for index = 1, #list do
+        local item = list[index]
+        local id = (floor(item.x / cell) + 32768) * 65536 + floor(item.y / cell) + 32768
+        local bucket = buckets[id]
+        if not bucket then
+          bucket = {}
+          buckets[id] = bucket
+          ids[#ids + 1] = id
+        end
+        bucket[#bucket + 1] = item
+      end
+      table.sort(ids)
+      local cursor, planted, moving = {}, 0, true
+      while planted < limit and moving do
+        moving = false
+        for index = 1, #ids do
+          if planted >= limit then break end
+          local id = ids[index]
+          local bucket = buckets[id]
+          local at = (cursor[id] or 0) + 1
+          while at <= #bucket do
+            local item = bucket[at]
+            at = at + 1
+            if accept(item) then
+              planted = planted + 1
+              moving = true
+              break
+            end
+          end
+          cursor[id] = at - 1
+        end
+        pause()
+      end
+    end
+    spread(candidates, maxTrees, 25, function(candidate)
+      local x, y, h = candidate.x, candidate.y, candidate.hash
+      local z = ground(x, y)
+      local elevation = rawHeight(x, y) - (options.seaLevel or 20)
+      local _, _, nz = groundNormal(x, y)
+      local bush = candidate.kind == 'scrub' or candidate.kind == 'heath'
+      if not (nz >= (bush and .64 or .72) and elevation < treeline + (bush and 250 or 0)
+          and (not sea or z > sea) and not blocked(x, y)) then return false end
+      local leaf = candidate.tags.leaf_type or candidate.tags.wood
+      local needle = leaf == 'needleleaved' or leaf == 'coniferous'
+      if leaf ~= 'broadleaved' and leaf ~= 'deciduous' and not needle and candidate.kind == 'forest' then
+        local mix = leaf == 'mixed' and .5 or math.max(0, math.min(.85, (elevation-coniferStart)/700))
+        if treeChoice == 'conifer' then mix = math.max(mix, .7)
+        elseif treeChoice == 'broadleaf' and leaf ~= 'mixed' then mix = math.min(mix, .15) end
+        needle = hash('species:' .. candidate.key) % 1000 / 1000 < mix
+      end
+      -- Open hills have no leaf_type. A fixed share of pines keeps a Carpathian mix.
+      if candidate.kind == 'ground' then
+        needle = hash('species:' .. candidate.key) % 1000 / 1000 < openPine
+      end
+      local set = bush and BUSHES or needle and CONIFERS or TREES
+      local scale = .65 + hash('age:' .. candidate.key) % 900 / 1000
+      static('tree_' .. candidate.key:gsub('[^%w]', '_'), set[h % #set + 1], x, y, z,
+        h % 6283 / 1000, bush and scale * .8 or scale)
+      return true
+    end)
+    -- Grass, forest floor and loose stone. Far keeps only a ranked handful of rocks:
+    -- tufts do not read at the horizon, and the far list stays inside the near list.
+    local function scatter(prefix, spacingOf, chanceOf, shapes, cap, farCap, scaleMin, scaleMax, minNz, elevationOf)
+      local limit = cap
+      if distant then limit = farCap or 0 end
+      if limit <= 0 then return end
+      local candidates, positions = {}, {}
+      for _, area in ipairs(lists.areas) do
+        local spacing = spacingOf[area.kind]
+        if spacing and ringsTouch(area.rings, rect) then
+          local box = ringBounds(area.rings)
+          for gy = floor(math.max(rect[2], box[2]) / spacing) - 1, math.ceil(math.min(rect[4], box[4]) / spacing) do
+            for gx = floor(math.max(rect[1], box[1]) / spacing) - 1, math.ceil(math.min(rect[3], box[3]) / spacing) do
+              local h = hash(prefix .. ':' .. tostring(gx) .. ':' .. tostring(gy) .. ':' .. spacing)
+              local x = (gx + .5 + (h % 1000 / 1000 - .5) * .55) * spacing
+              local y = (gy + .5 + (floor(h / 1000) % 1000 / 1000 - .5) * .55) * spacing
+              local position = string.format('%.3f:%.3f', x, y)
+              if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] and not positions[position] then
+                local kind = coverAt(x, y)
+                if spacingOf[kind] == spacing and hash(prefix .. ':density:' .. position) % 1000 / 1000 < (chanceOf[kind] or 0) then
+                  positions[position] = true
+                  candidates[#candidates + 1] = {x = x, y = y, hash = h, key = position, kind = kind}
+                end
+              end
+            end
+            pause()
+          end
+        end
+      end
+      -- Kind 'ground' is the absence of a cover, so it has no area to walk.
+      -- The Ukraine pack's open hills are this kind: without the lattice they stay a flat sheet.
+      local openSpacing = spacingOf.ground
+      if openSpacing then
+        for gy = floor(rect[2] / openSpacing) - 1, math.ceil(rect[4] / openSpacing) do
+          for gx = floor(rect[1] / openSpacing) - 1, math.ceil(rect[3] / openSpacing) do
+            local h = hash(prefix .. ':open:' .. tostring(gx) .. ':' .. tostring(gy))
+            local x = (gx + .5 + (h % 1000 / 1000 - .5) * .55) * openSpacing
+            local y = (gy + .5 + (floor(h / 1000) % 1000 / 1000 - .5) * .55) * openSpacing
+            local position = string.format('%.3f:%.3f', x, y)
+            if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] and not positions[position] then
+              if coverAt(x, y) == 'ground' and hash(prefix .. ':density:' .. position) % 1000 / 1000 < (chanceOf.ground or 0) then
+                positions[position] = true
+                candidates[#candidates + 1] = {x = x, y = y, hash = h, key = position, kind = 'ground'}
+              end
+            end
+          end
+          pause()
+        end
+      end
+      table.sort(candidates, function(a, b) return a.hash == b.hash and a.key < b.key or a.hash < b.hash end)
+      spread(candidates, limit, 25, function(candidate)
+        local x, y, h = candidate.x, candidate.y, candidate.hash
+        local z = ground(x, y)
+        local elevation = rawHeight(x, y) - (options.seaLevel or 20)
+        local _, _, nz = groundNormal(x, y)
+        local elevationCap = elevationOf and elevationOf[candidate.kind]
+        local clearance = prefix == 'grass' and 2.2 or 3.5
+        if not (nz >= minNz and (not elevationCap or elevation < elevationCap) and (not sea or z > sea) and not blocked(x, y, clearance)) then
+          return false
+        end
+        local shape = shapes[h % #shapes + 1]
+        local scale
+        if prefix == 'grass' then
+          -- scaleMin/scaleMax are the blade height in metres, not a raw multiplier.
+          local mesh = GRASS_MESH[shape]
+          local span = mesh and mesh.span or 0.26
+          local want = scaleMin + (hash(prefix .. ':scale:' .. candidate.key) % 1000) / 1000 * (scaleMax - scaleMin)
+          scale = want / span
+          z = z - (mesh and mesh.bottom or 0) * scale
+        else
+          scale = scaleMin + (hash(prefix .. ':scale:' .. candidate.key) % 1000) / 1000 * (scaleMax - scaleMin)
+          if prefix == 'rock' and h % 5 == 0 then shape = shapes[#shapes]; scale = scale * .8 end
+        end
+        static(prefix .. '_' .. candidate.key:gsub('[^%w]', '_'), shape, x, y, z, h % 6283 / 1000, scale)
+        return true
+      end)
+    end
+    local function opt(name, default, cap)
+      local value = options[name]
+      if value == nil then value = default end
+      return math.max(0, math.min(cap, value))
+    end
+    local maxGrass = opt('maxGrass', 4000, 4800)
+    local maxRocks = opt('maxRocks', 80, 200)
+    local maxUnder = opt('maxUnderstory', 220, 400)
+    -- Town tiles spend the grass cap. Forest floor stays thin so those tufts are not
+    -- stolen by the woods, and so the TSStatic count stays off the frame time.
+    scatter('grass', {meadow = 3.2, farmland = 8, heath = 7, park = 2.6, forest = 12, residential = 2.6, orchard = 5, vineyard = 9, ground = 8},
+      {meadow = .94, farmland = .35, heath = .5, park = .98, forest = .2, residential = .98, orchard = .55, vineyard = .28, ground = .35},
+      GRASS, maxGrass, 0, 0.20, 0.30, .72, {forest = treeline + 80})
+    scatter('bush', {forest = 14, park = 18},
+      {forest = .4, park = .22},
+      BUSHES, maxUnder, 0, .85, 1.3, .72, {forest = treeline + 80})
+    scatter('rock', {bare_rock = 11, scree = 8}, {bare_rock = .72, scree = .84},
+      ROCKS, maxRocks, math.min(16, maxRocks), .55, 1.25, .45, nil)
+    -- Slopes too steep for trees still had no stones unless OSM tagged bare_rock or scree.
+    -- Same sorted lattice near and far, so the far handful stays inside the near list.
+    local function scatterSlopeRocks()
+      local limit = distant and math.min(16, maxRocks) or maxRocks
+      if limit <= 0 then return end
+      local spacing, candidates, positions = 16, {}, {}
+      for gy = floor(rect[2] / spacing) - 1, math.ceil(rect[4] / spacing) do
+        for gx = floor(rect[1] / spacing) - 1, math.ceil(rect[3] / spacing) do
+          local h = hash('slope:' .. tostring(gx) .. ':' .. tostring(gy))
+          local x = (gx + .5 + (h % 1000 / 1000 - .5) * .5) * spacing
+          local y = (gy + .5 + (floor(h / 1000) % 1000 / 1000 - .5) * .5) * spacing
+          if x >= rect[1] and x < rect[3] and y >= rect[2] and y < rect[4] then
+            local _, _, nz = groundNormal(x, y)
+            local kind = coverAt(x, y)
+            -- 0.94 is about 20°. Rounded Carpathian hills were steeper than flat ground
+            -- and gentler than 45°, so the old 0.7 gate never placed a stone on them.
+            if nz < .94 and nz >= .25 and kind ~= 'water' and kind ~= 'paved' and kind ~= 'residential' then
+              local position = string.format('%.3f:%.3f', x, y)
+              local steep = (.94 - nz) / .69
+              if not positions[position] and hash('slope:keep:' .. position) % 1000 / 1000 < (.45 + .55 * steep) then
+                positions[position] = true
+                candidates[#candidates + 1] = {x = x, y = y, hash = h, key = position}
+              end
+            end
+          end
+        end
+        pause()
+      end
+      table.sort(candidates, function(a, b) return a.hash == b.hash and a.key < b.key or a.hash < b.hash end)
+      spread(candidates, limit, 25, function(candidate)
+        local x, y, h = candidate.x, candidate.y, candidate.hash
+        local z = ground(x, y)
+        if not ((not sea or z > sea) and not blocked(x, y)) then return false end
+        local scale = .7 + (hash('slope:scale:' .. candidate.key) % 1000) / 1000 * .7
+        local shape = ROCKS[h % #ROCKS + 1]
+        if h % 5 == 0 then shape = ROCKS[#ROCKS]; scale = scale * .8 end
+        static('srock_' .. candidate.key:gsub('[^%w]', '_'), shape, x, y, z, h % 6283 / 1000, scale)
+        return true
+      end)
+    end
+    scatterSlopeRocks()
+  end
+  if wantLamps and not distant then
     local lamp = 0
     for _, road in ipairs(lists.roads) do
       local tags, points = road.tags or {}, road.points or {}
@@ -2072,7 +2536,9 @@ local function build(cells, i, j, options)
     return {version = 1, generator = 'earthng-lua-v1', source = options.regionId, layer = layer,
       tile = {i, j}, rect = rect, materials = options.materials or '/earthng/planet/materials.json',
       items = collector.items, mats = mats, triangles = total, packs = options.packs,
-      warmShapes = {TREES[1], TREES[2], TREES[3], TREES[4], LAMP, BUS_STOP}}
+      warmShapes = {TREES[1], TREES[2], TREES[3], TREES[4], TREES[5], TREES[6], TREES[7], TREES[8],
+        CONIFERS[1], CONIFERS[2], BUSHES[1], BUSHES[2], BUSHES[3], BUSHES[4],
+        GRASS[1], GRASS[4], ROCKS[1], ROCKS[5], LAMP, BUS_STOP}}
   end
   local roadManifest, sceneManifest = manifest(roads, 'road'), manifest(scene, 'scene')
   roadManifest.spawn = bestSpawn or {pos = {target[1], target[2], ground(target[1], target[2]) + ROAD_LIFT}, yaw = 0}
