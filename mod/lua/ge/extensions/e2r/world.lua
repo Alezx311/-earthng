@@ -13,7 +13,18 @@ local LANG = 'uk'   -- build_mod.py --lang en rewrites this line (the English pa
 local NATIVE = true   -- build_mod.py --legacy keeps the companion development workflow
 local native = NATIVE and require('ge/extensions/e2r/native') or nil
 local planetMap = NATIVE and require('ge/extensions/e2r/planetMap') or nil
-local function L(uk, en) return LANG == 'en' and en or uk end
+-- the UI language: the package's LANG until the player switches it (settings/earthng.json)
+local LANG_FILE = 'settings/earthng.json'
+local lang = LANG
+local function L(uk, en) return lang == 'en' and en or uk end
+local function loadLang()
+  local ok, cfg = pcall(jsonReadFile, LANG_FILE)
+  if ok and type(cfg) == 'table' and (cfg.lang == 'uk' or cfg.lang == 'en') then lang = cfg.lang end
+end
+local function setLang(l)
+  lang = l
+  pcall(jsonWriteFile, LANG_FILE, {lang = l}, true)
+end
 
 local W, H = 720, 440          -- map picture size, px
 local BUDGET_MS = 4            -- spawn work per frame
@@ -23,21 +34,22 @@ local SCENE_LAG = 3            -- s: a scene item queues as the road of a tile r
 local COLLISION_EVERY = 2.0          -- s between batched reloadCollision calls
 local LAMP_SHAPE = '/art/shapes/objects/lamp1.dae'   -- fast_style.LAMP
 local PRESETS = {
-  {'Оболонь', 50.5070, 30.4990, 'ukraine'}, {'Поділ', 50.4655, 30.5170, 'ukraine'},
-  {'Хрещатик', 50.4475, 30.5225, 'ukraine'}, {'Печерськ', 50.4280, 30.5410, 'ukraine'},
-  {'Голосіїв', 50.3920, 30.5080, 'ukraine'}, {'Біличі', 50.4775, 30.3600, 'ukraine'},
+  {'Оболонь', 50.5070, 30.4990, 'ukraine', 'Obolon'}, {'Поділ', 50.4655, 30.5170, 'ukraine', 'Podil'},
+  {'Хрещатик', 50.4475, 30.5225, 'ukraine', 'Khreshchatyk'}, {'Печерськ', 50.4280, 30.5410, 'ukraine', 'Pechersk'},
+  {'Голосіїв', 50.3920, 30.5080, 'ukraine', 'Holosiiv'}, {'Біличі', 50.4775, 30.3600, 'ukraine', 'Bilychi'},
+  -- (the 5th field: the English name; the rest of the presets are English already)
   -- Kyiv oblast towns (data/osm_tiles/ukraine-260918)
-  {'Ірпінь', 50.5210, 30.2500, 'ukraine'}, {'Бровари', 50.5110, 30.7900, 'ukraine'},
-  {'Бориспіль', 50.3520, 30.9550, 'ukraine'}, {'Фастів', 50.0780, 29.9180, 'ukraine'},
-  {'Біла Церква', 49.7960, 30.1150, 'ukraine'},
+  {'Ірпінь', 50.5210, 30.2500, 'ukraine', 'Irpin'}, {'Бровари', 50.5110, 30.7900, 'ukraine', 'Brovary'},
+  {'Бориспіль', 50.3520, 30.9550, 'ukraine', 'Boryspil'}, {'Фастів', 50.0780, 29.9180, 'ukraine', 'Fastiv'},
+  {'Біла Церква', 49.7960, 30.1150, 'ukraine', 'Bila Tserkva'},
   -- oblast centres (data/osm_tiles/ukraine-260918)
-  {'Львів', 49.8400, 24.0280, 'ukraine'}, {'Одеса', 46.4800, 30.7300, 'ukraine'},
-  {'Харків', 49.9900, 36.2300, 'ukraine'}, {'Дніпро', 48.4650, 35.0460, 'ukraine'},
-  {'Запоріжжя', 47.8390, 35.1400, 'ukraine'}, {'Вінниця', 49.2330, 28.4680, 'ukraine'},
-  {'Житомир', 50.2550, 28.6590, 'ukraine'}, {'Чернігів', 51.4980, 31.2890, 'ukraine'},
-  {'Полтава', 49.5880, 34.5510, 'ukraine'}, {'Черкаси', 49.4440, 32.0600, 'ukraine'},
-  {'Ужгород', 48.6210, 22.2880, 'ukraine'}, {'Чернівці', 48.2920, 25.9400, 'ukraine'},
-  {'Івано-Франківськ', 48.9230, 24.7110, 'ukraine'}, {'Луцьк', 50.7470, 25.3250, 'ukraine'},
+  {'Львів', 49.8400, 24.0280, 'ukraine', 'Lviv'}, {'Одеса', 46.4800, 30.7300, 'ukraine', 'Odesa'},
+  {'Харків', 49.9900, 36.2300, 'ukraine', 'Kharkiv'}, {'Дніпро', 48.4650, 35.0460, 'ukraine', 'Dnipro'},
+  {'Запоріжжя', 47.8390, 35.1400, 'ukraine', 'Zaporizhzhia'}, {'Вінниця', 49.2330, 28.4680, 'ukraine', 'Vinnytsia'},
+  {'Житомир', 50.2550, 28.6590, 'ukraine', 'Zhytomyr'}, {'Чернігів', 51.4980, 31.2890, 'ukraine', 'Chernihiv'},
+  {'Полтава', 49.5880, 34.5510, 'ukraine', 'Poltava'}, {'Черкаси', 49.4440, 32.0600, 'ukraine', 'Cherkasy'},
+  {'Ужгород', 48.6210, 22.2880, 'ukraine', 'Uzhhorod'}, {'Чернівці', 48.2920, 25.9400, 'ukraine', 'Chernivtsi'},
+  {'Івано-Франківськ', 48.9230, 24.7110, 'ukraine', 'Ivano-Frankivsk'}, {'Луцьк', 50.7470, 25.3250, 'ukraine', 'Lutsk'},
   -- California (data/osm_tiles/california-261013; an English package)
   {'Los Angeles', 34.0505, -118.2475, 'california'}, {'Hollywood', 34.1015, -118.3265, 'california'},
   {'Santa Monica', 34.0160, -118.4925, 'california'}, {'San Francisco', 37.7880, -122.4075, 'california'},
@@ -532,8 +544,8 @@ local NAV_R, NAV_MOVE = 1000, 250
 -- Agent Traffic mod (if installed): its light EU cars instead of the game's full vehicles
 local AGENT_GROUP = '/vehicleGroups/agentTraffic/agent_traffic_eu.vehGroup.json'
 -- 8 cars doubled the mean frame (12.7 -> 24.5 ms, traffic-05): each is a full soft-body vehicle
-local TRAFFIC_AMOUNTS = {{0, L('Вимк', 'Off')}, {4, L('Мало', 'Light')}, {8, L('Середньо', 'Medium')},
-  {14, L('Багато', 'Heavy')}}
+local TRAFFIC_AMOUNTS = {{0, 'Вимк', 'Off'}, {4, 'Мало', 'Light'}, {8, 'Середньо', 'Medium'},
+  {14, 'Багато', 'Heavy'}}
 
 local function navRead()
   local job = table.remove(S.navPending, 1)
@@ -671,7 +683,7 @@ local function setTraffic(amount)
       S.trafficSource = 'Agent Traffic EU'
     end
   end
-  if not options.vehGroup then S.trafficSource = L('машини гри', 'game cars') end
+  if not options.vehGroup then S.trafficSource = 'game cars' end
   result.trafficSource = S.trafficSource
   gameplay_traffic.setupTraffic(amount, options)
 end
@@ -688,7 +700,7 @@ local function drawTraffic()
       im.PushStyleColor2(im.Col_Button, im.ImVec4(0.15, 0.55, 0.3, 1))
       im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.2, 0.65, 0.35, 1))
     end
-    if im.Button(a[2] .. '##traffic_' .. a[1], im.ImVec2(width, 0)) and not active then setTraffic(a[1]) end
+    if im.Button(L(a[2], a[3]) .. '##traffic_' .. a[1], im.ImVec2(width, 0)) and not active then setTraffic(a[1]) end
     if active then im.PopStyleColor(2) end
   end
 end
@@ -934,14 +946,19 @@ end
 -- fields of the loaded materials in place; no tile is rebuilt or reloaded.
 -- Button names come from here first (the labels in packs.json are escaped JSON strings); a pack
 -- the table does not know shows its packs.json label or its id.
-local PACK_LABELS = LANG == 'en' and
+local PACK_LABELS_EN =
   {real = 'Realistic', toon = 'Cartoon', model = 'Mock-up', synth = 'Synthwave', pixel = 'Retro City',
-   night = 'Night', rain = 'Rain', cyber = 'Cyberpunk', winter = 'Winter', autumn = 'Autumn'} or
+   night = 'Night', rain = 'Rain', cyber = 'Cyberpunk', winter = 'Winter', autumn = 'Autumn'}
+local PACK_LABELS_UK =
   {real = 'Реальний', toon = 'Мультяшний', model = 'Макет', synth = 'Синтвейв', pixel = 'Ретро-місто',
    night = 'Ніч', rain = 'Дощ', cyber = 'Кіберпанк', winter = 'Зима', autumn = 'Осінь'}
+-- {id, packs.json label or nil}; the shown name is packLabel(), in the current language
 local PACK_NAMES = {}
 for _, name in ipairs({'real', 'toon', 'model', 'synth', 'pixel', 'night', 'rain', 'cyber', 'winter', 'autumn'}) do
-  table.insert(PACK_NAMES, {name, PACK_LABELS[name]})
+  table.insert(PACK_NAMES, {name})
+end
+local function packLabel(p)
+  return (lang == 'en' and PACK_LABELS_EN or PACK_LABELS_UK)[p[1]] or p[2] or p[1]
 end
 
 -- Street lights of a night pack: a pool of PointLights moved onto the lamps nearest the camera
@@ -1294,7 +1311,7 @@ local function beginArrival(job)
     if okP and packs and packs.order then
       PACK_NAMES = {}
       for _, name in ipairs(packs.order) do
-        table.insert(PACK_NAMES, {name, PACK_LABELS[name] or (packs.labels and packs.labels[name]) or name})
+        table.insert(PACK_NAMES, {name, packs.labels and packs.labels[name]})
       end
     end
     if okP and packs and packs.extra and not S.packsExtra then      -- the sun's material
@@ -1891,7 +1908,7 @@ local function drawMap(width, height, view, pick)
   -- cities and countries
   local placeHit
   if NATIVE then
-    placeHit = planetMap.drawLabels(im, dl, r0, width, height, view, merc, unmerc, col, LANG,
+    placeHit = planetMap.drawLabels(im, dl, r0, width, height, view, merc, unmerc, col, lang,
       hovered and mouse or nil, pick and 70 or 25)
     if not pick then placeHit = nil end
   end
@@ -2007,7 +2024,7 @@ end
 local function drawPacks()
   local current = S.pack or 'real'
   local label = current
-  for _, p in ipairs(PACK_NAMES) do if p[1] == current then label = p[2] end end
+  for _, p in ipairs(PACK_NAMES) do if p[1] == current then label = packLabel(p) end end
   im.Text(L('Стиль: ', 'Style: ') .. label)
   local spacing = im.GetStyle().ItemSpacing.x
   local width = math.floor((im.GetContentRegionAvailWidth() - 2 * spacing) / 3)
@@ -2018,7 +2035,7 @@ local function drawPacks()
       im.PushStyleColor2(im.Col_Button, im.ImVec4(0.15, 0.55, 0.3, 1))
       im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.2, 0.65, 0.35, 1))
     end
-    if im.Button(p[2] .. '##pack_' .. p[1], im.ImVec2(width, 0)) and not active then applyPack(p[1]) end
+    if im.Button(packLabel(p) .. '##pack_' .. p[1], im.ImVec2(width, 0)) and not active then applyPack(p[1]) end
     if active then im.PopStyleColor(2) end
   end
 end
@@ -2059,7 +2076,7 @@ local function drawStats(st, p, v)
   if trafficRunning() and gameplay_traffic.getTrafficAmount then
     local nav = S.navStats or {}
     im.Text(string.format(L('Трафік (%s): авто %d, граф %d вузлів, збірка %.0f мс',
-      'Traffic (%s): cars %d, graph %d nodes, build %.0f ms'), S.trafficSource or L('гра', 'game'),
+      'Traffic (%s): cars %d, graph %d nodes, build %.0f ms'), S.trafficSource == 'game cars' and L('машини гри', 'game cars') or S.trafficSource or L('гра', 'game'),
       gameplay_traffic.getTrafficAmount(), nav.nodes or 0, nav.ms or 0))
   end
   if st and not NATIVE then
@@ -2112,9 +2129,10 @@ end
 
 -- the packs in the side list by part of the world (their landing point)
 local GROUP_ORDER = {'europe', 'america', 'south', 'africa', 'asia', 'oceania', 'other'}
-local GROUP_TITLE = {europe = L('Європа', 'Europe'), america = L('Північна Америка', 'North America'),
-  south = L('Південна Америка', 'South America'), africa = L('Африка', 'Africa'), asia = L('Азія', 'Asia'),
-  oceania = L('Океанія', 'Oceania'), other = L('Інші', 'Other')}
+local GROUP_TITLE = {europe = {'Європа', 'Europe'}, america = {'Північна Америка', 'North America'},
+  south = {'Південна Америка', 'South America'}, africa = {'Африка', 'Africa'}, asia = {'Азія', 'Asia'},
+  oceania = {'Океанія', 'Oceania'}, other = {'Інші', 'Other'}}
+local function presetName(p) return lang == 'en' and p[5] or p[1] end
 local function packGroup(country)
   local l = country.landing
   if not l then return 'other' end
@@ -2134,9 +2152,10 @@ local function flowButtons(items, onClick)
   local avail = im.GetContentRegionAvailWidth()
   local used = 0
   for k, item in ipairs(items) do
-    local w = im.CalcTextSize(item[1]).x + 16
+    local name = presetName(item)
+    local w = im.CalcTextSize(name).x + 16
     if k > 1 and used + spacing + w <= avail then im.SameLine(); used = used + spacing + w else used = w end
-    if im.Button(item[1] .. '##preset' .. k) then onClick(item) end
+    if im.Button(name .. '##preset' .. k) then onClick(item) end
   end
 end
 
@@ -2155,14 +2174,15 @@ local function drawSidebar(mapW, mapH)
       end
     end
     -- the places of a query, with their pack check, once per query (native.at walks the boxes)
-    if not foundPlaces or foundPlaces.query ~= query or foundPlaces.status ~= S.status then
-      local places = {query = query, status = S.status}
+    if not foundPlaces or foundPlaces.query ~= query or foundPlaces.status ~= S.status or foundPlaces.lang ~= lang then
+      local places = {query = query, status = S.status, lang = lang}
       for _, p in ipairs(PRESETS) do
-        if planetMap.lower(p[1]):find(query, 1, true) and (not NATIVE or native.at(p[2], p[3])) then
-          places[#places + 1] = {name = p[1], lat = p[2], lon = p[3], zoom = 15, covered = true}
+        local hit = planetMap.lower(p[1]):find(query, 1, true) or (p[5] and planetMap.lower(p[5]):find(query, 1, true))
+        if hit and (not NATIVE or native.at(p[2], p[3])) then
+          places[#places + 1] = {name = presetName(p), lat = p[2], lon = p[3], zoom = 15, covered = true}
         end
       end
-      for _, p in ipairs(planetMap and planetMap.search(query, LANG, 25) or {}) do
+      for _, p in ipairs(planetMap and planetMap.search(query, lang, 25) or {}) do
         places[#places + 1] = {name = p.name, lat = p.lat, lon = p.lon, covered = not NATIVE or native.at(p.lat, p.lon) ~= nil}
       end
       foundPlaces = places
@@ -2200,7 +2220,7 @@ local function drawSidebar(mapW, mapH)
       if list then
         table.sort(list, function(a, b) return a.title < b.title end)
         im.Spacing()
-        im.TextColored(theme.accent, GROUP_TITLE[g])
+        im.TextColored(theme.accent, L(GROUP_TITLE[g][1], GROUP_TITLE[g][2]))
         im.Separator()
         for _, country in ipairs(list) do
           if country.available then
@@ -2273,12 +2293,23 @@ local function drawProblems()
   end
 end
 
+-- UA/EN beside "Hide": the whole widget and the map labels switch at once, remembered on disk
+local function drawLangButton()
+  im.SameLine()
+  if im.Button((lang == 'en' and 'UA' or 'EN') .. '##lang') then
+    setLang(lang == 'en' and 'uk' or 'en')
+    S.viewDirty = true
+  end
+  if im.IsItemHovered() then im.SetTooltip(L('Switch to English', 'Перемкнути на українську')) end
+end
+
 local function drawPicker()
   im.SetNextWindowSize(im.ImVec2(1180, 720), im.Cond_FirstUseEver)
   im.SetNextWindowSizeConstraints(im.ImVec2(820, 500), im.ImVec2(8000, 8000))
-  im.Begin(L('EarthNG - планета', 'EarthNG - Planet') .. '##planet', nil,
+  im.Begin(L('EarthNG - планета', 'EarthNG - Planet') .. '###planet', nil,
     im.WindowFlags_NoCollapse + im.WindowFlags_NoScrollbar + im.WindowFlags_NoScrollWithMouse)
   if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
+  drawLangButton()
   if S.pickerOpen then
     im.SameLine()
     if im.Button(L('Повернутися до їзди', 'Back to driving')) then S.pickerOpen = false end
@@ -2343,6 +2374,7 @@ local function drawWindow()
     if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
     im.SameLine()
     if im.Button(L('Обрати інше місце', 'Pick another place')) then S.pickerOpen = true; S.viewDirty = true end
+    drawLangButton()
     -- the mini map follows the car (an arrow along the heading); a drag frees it
     S.mini = S.mini or {center = {lat = S.center.lat, lon = S.center.lon}, zoom = 15, follow = true}
     drawMap(360, 220, S.mini)
@@ -2380,8 +2412,9 @@ local function drawWindow()
   end
   -- the landing under way: a small window of its own
   im.SetNextWindowSize(im.ImVec2(W, 0), im.Cond_Always)
-  im.Begin(L('EarthNG - висадка', 'EarthNG - Landing') .. '##progress', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
+  im.Begin(L('EarthNG - висадка', 'EarthNG - Landing') .. '###progress', nil, im.WindowFlags_NoCollapse + im.WindowFlags_AlwaysAutoResize)
   if im.Button(L('Приховати', 'Hide')) then S.widgetHidden = true end
+  drawLangButton()
   local job = S.status and S.status.job
   if job and job.seq == S.landSeq then
     im.Text(string.format(L('Генерація %.5f, %.5f', 'Generating %.5f, %.5f'), job.lat or 0, job.lon or 0))
@@ -3034,6 +3067,7 @@ end
 
 function M.onExtensionLoaded()
   setExtensionUnloadMode(M, 'manual')
+  loadLang()
   if NATIVE then native.refresh() end
   log('I', logTag, 'Earth2Road planet extension loaded')
 end
